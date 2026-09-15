@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Forma Residential → IFC</title>
+<style>
+<!--APP_CSS-->
+</style>
+</head>
+<body data-backend="<!--APP_MODE-->">
+<div id="app" class="app">
+  <header class="hdr">
+    <div class="hdr-id">
+      <h1 class="hdr-title">Forma Residential <span class="hdr-arrow">→</span> IFC</h1>
+      <p class="hdr-sub" id="subtitle">Loading…</p>
+    </div>
+    <div class="hdr-actions" id="hdr-actions">
+      <button class="btn btn-primary" id="btn-generate" type="button">Generate</button>
+      <button class="btn" id="btn-ifc" type="button">Download IFC</button>
+      <button class="btn" id="btn-report" type="button">Download report</button>
+      <button class="btn" id="btn-copy" type="button">Copy spec</button>
+      <button class="btn" id="btn-load" type="button">Load spec</button>
+      <input type="file" id="file-spec" accept=".json,application/json" hidden>
+    </div>
+  </header>
+
+  <aside class="sidebar" id="sidebar" aria-label="Building specification"></aside>
+
+  <main class="main">
+    <nav class="tabs" id="tabs" role="tablist"></nav>
+    <div class="panels" id="panels"></div>
+  </main>
+
+  <footer class="statusbar" id="statusbar"></footer>
+
+  <div class="spinner-wrap" id="spinner" hidden>
+    <div class="spinner"></div>
+    <div class="spinner-msg" id="spinner-msg">Generating…</div>
+  </div>
+</div>
+<noscript><p style="padding:2rem;font:14px system-ui">This tool needs JavaScript.</p></noscript>
+<script>
+<!--APP_JS-->
+</script>
+</body>
+</html>
