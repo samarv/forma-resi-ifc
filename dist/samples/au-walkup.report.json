@@ -1,0 +1,850 @@
+{
+  "generator": "forma-resi-ifc",
+  "preset": "au-walkup",
+  "spec": {
+    "name": "Carlton Court",
+    "seed": 5,
+    "region": "AU",
+    "displayUnits": "metric",
+    "typology": "garden-walkup",
+    "site": {
+      "width": 46,
+      "depth": 40,
+      "streetFacing": "N",
+      "context": "suburban",
+      "slopePercent": 0,
+      "parking": {
+        "type": "surface",
+        "ratio": 1.2,
+        "evShare": 0.2,
+        "bikeRatio": 1
+      }
+    },
+    "massing": {
+      "storeys": 3,
+      "footprintShape": "bar",
+      "buildingDepth": 14,
+      "floorToFloor": 3,
+      "groundFloorToFloor": 3,
+      "podiumStoreys": 0,
+      "podiumUse": "retail",
+      "basementStoreys": 0,
+      "corridorWidth": 1.5,
+      "roof": "flat",
+      "roofPitchDeg": 30,
+      "parapetHeight": 1.1,
+      "balconyDepth": 1.8
+    },
+    "floors": [
+      {
+        "index": 0,
+        "use": "lobby-residential",
+        "floorToFloor": 3,
+        "ceilingHeight": 2.55,
+        "unitMix": {
+          "1b1b": 2,
+          "2b1b": 3,
+          "2b2b": 2,
+          "studio": 1
+        },
+        "balconies": false,
+        "wwr": 0.35
+      },
+      {
+        "index": 1,
+        "use": "residential",
+        "floorToFloor": 3,
+        "ceilingHeight": 2.55,
+        "unitMix": {
+          "1b1b": 2,
+          "2b1b": 3,
+          "2b2b": 2,
+          "studio": 1
+        },
+        "balconies": true,
+        "wwr": 0.35
+      },
+      {
+        "index": 2,
+        "use": "residential",
+        "floorToFloor": 3,
+        "ceilingHeight": 2.55,
+        "unitMix": {
+          "1b1b": 2,
+          "2b1b": 3,
+          "2b2b": 2,
+          "studio": 1
+        },
+        "balconies": true,
+        "wwr": 0.35
+      }
+    ],
+    "unitMix": {
+      "1b1b": 2,
+      "2b1b": 3,
+      "2b2b": 2,
+      "studio": 1
+    },
+    "options": {
+      "furniture": true,
+      "site": true,
+      "structure": true,
+      "mechanical": true,
+      "plumbing": true,
+      "electrical": true,
+      "detail": "medium",
+      "ifcSchema": "IFC4"
+    }
+  },
+  "typology": {
+    "id": "garden-walkup",
+    "name": "Garden apartment walk-up"
+  },
+  "storeys": [
+    {
+      "id": "SITE",
+      "name": "Site",
+      "elevation": 0,
+      "height": 0,
+      "use": "site"
+    },
+    {
+      "id": "FND",
+      "name": "Foundation",
+      "elevation": -1.2,
+      "height": 1.2,
+      "use": "foundation"
+    },
+    {
+      "id": "L01",
+      "name": "Ground Floor",
+      "elevation": 0,
+      "height": 3,
+      "use": "lobby-residential"
+    },
+    {
+      "id": "L02",
+      "name": "1st Floor",
+      "elevation": 3,
+      "height": 3,
+      "use": "residential"
+    },
+    {
+      "id": "L03",
+      "name": "2nd Floor",
+      "elevation": 6,
+      "height": 3,
+      "use": "residential"
+    },
+    {
+      "id": "ROOF",
+      "name": "Roof",
+      "elevation": 9,
+      "height": 1.1,
+      "use": "roof"
+    }
+  ],
+  "metrics": [
+    {
+      "id": "gfa",
+      "rank": 1,
+      "name": "Gross floor area",
+      "value": 1680,
+      "display": "1680.0 m²",
+      "unit": "m²",
+      "status": "ok",
+      "breakdown": {
+        "L01": 560,
+        "L02": 560,
+        "L03": 560,
+        "ROOF": 560
+      }
+    },
+    {
+      "id": "nia",
+      "rank": 2,
+      "name": "Net internal area",
+      "value": 1135.2,
+      "display": "1135.2 m²",
+      "unit": "m²",
+      "status": "ok",
+      "breakdown": {
+        "dwellings": 24
+      }
+    },
+    {
+      "id": "efficiency",
+      "rank": 3,
+      "name": "Efficiency (net to gross)",
+      "value": 0.6757142857142857,
+      "display": "67.6%",
+      "unit": "%",
+      "status": "warn",
+      "note": "below the 70% net-to-gross most residential schemes target",
+      "breakdown": {
+        "nia": 1135.2,
+        "gia": 1680
+      }
+    },
+    {
+      "id": "far",
+      "rank": 4,
+      "name": "Floor area ratio",
+      "value": 0.9130434782608695,
+      "display": "0.91",
+      "unit": "ratio",
+      "status": "ok",
+      "breakdown": {
+        "gfa": 1680,
+        "siteArea": 1840
+      }
+    },
+    {
+      "id": "site-coverage",
+      "rank": 5,
+      "name": "Site coverage",
+      "value": 0.30434782608695654,
+      "display": "30.4%",
+      "unit": "%",
+      "status": "ok",
+      "breakdown": {
+        "footprint": 560,
+        "siteArea": 1840
+      }
+    },
+    {
+      "id": "density-dph",
+      "rank": 6,
+      "name": "Density",
+      "value": 130.43478260869566,
+      "display": "130 dph",
+      "unit": "dph",
+      "status": "ok",
+      "note": "typology range 60–120 dph",
+      "breakdown": {
+        "dwellings": 24,
+        "hectares": 0.184
+      }
+    },
+    {
+      "id": "unit-count",
+      "rank": 7,
+      "name": "Unit count",
+      "value": 24,
+      "display": "24",
+      "unit": "dwellings",
+      "status": "ok"
+    },
+    {
+      "id": "unit-mix",
+      "rank": 8,
+      "name": "Unit mix (family share)",
+      "value": 0.2916666666666667,
+      "display": "29.2%",
+      "unit": "%",
+      "status": "ok",
+      "note": "2-bed and larger share; breakdown = dwellings per template",
+      "breakdown": {
+        "1b1b": 17,
+        "2b1b": 7
+      }
+    },
+    {
+      "id": "avg-unit-area",
+      "rank": 9,
+      "name": "Average unit area",
+      "value": 47.300000000000004,
+      "display": "47.3 m²",
+      "unit": "m²",
+      "status": "ok"
+    },
+    {
+      "id": "bedspaces",
+      "rank": 10,
+      "name": "Bedspace density",
+      "value": 336.95652173913044,
+      "display": "337 bedspaces/ha",
+      "unit": "bedspaces/ha",
+      "status": "ok",
+      "breakdown": {
+        "bedspaces": 62,
+        "habitableRooms": 55,
+        "hectares": 0.184
+      }
+    },
+    {
+      "id": "building-height",
+      "rank": 11,
+      "name": "Building height",
+      "value": 10.1,
+      "display": "10.10 m",
+      "unit": "m",
+      "status": "ok",
+      "breakdown": {
+        "storeys": 3
+      }
+    },
+    {
+      "id": "floor-to-floor",
+      "rank": 12,
+      "name": "Floor-to-floor height",
+      "value": 3,
+      "display": "3.00 m",
+      "unit": "m",
+      "status": "ok",
+      "breakdown": {
+        "typical": 3,
+        "ground": 3,
+        "ceiling": 2.55
+      }
+    },
+    {
+      "id": "circulation-ratio",
+      "rank": 13,
+      "name": "Circulation ratio",
+      "value": 0.05879166666666667,
+      "display": "5.9%",
+      "unit": "%",
+      "status": "ok",
+      "breakdown": {
+        "circulationArea": 98.77000000000001,
+        "gia": 1680
+      }
+    },
+    {
+      "id": "wall-to-floor",
+      "rank": 14,
+      "name": "Wall-to-floor ratio",
+      "value": 0.6039285714285714,
+      "display": "0.60",
+      "unit": "ratio",
+      "status": "ok",
+      "breakdown": {
+        "externalWallArea": 1014.5999999999999,
+        "gia": 1680
+      }
+    },
+    {
+      "id": "wwr",
+      "rank": 15,
+      "name": "Window-to-wall ratio",
+      "value": 0.253,
+      "display": "25.3%",
+      "unit": "%",
+      "status": "ok",
+      "breakdown": {
+        "windowArea": 226.99,
+        "externalWallArea": 1014.5999999999999
+      }
+    },
+    {
+      "id": "dual-aspect",
+      "rank": 16,
+      "name": "Dual-aspect share",
+      "value": 0.5,
+      "display": "50.0%",
+      "unit": "%",
+      "status": "ok"
+    },
+    {
+      "id": "parking-ratio",
+      "rank": 17,
+      "name": "Parking ratio",
+      "value": 0.75,
+      "display": "0.75 spaces/dwelling",
+      "unit": "spaces/dwelling",
+      "status": "warn",
+      "note": "typology default 1.20 spaces/dwelling",
+      "breakdown": {
+        "spaces": 18,
+        "dwellings": 24
+      }
+    },
+    {
+      "id": "bike-ratio",
+      "rank": 17,
+      "name": "Cycle parking ratio",
+      "value": 0.625,
+      "display": "0.63 spaces/dwelling",
+      "unit": "spaces/dwelling",
+      "status": "warn",
+      "note": "typology default 1 spaces/dwelling",
+      "breakdown": {
+        "bikeSpaces": 15,
+        "dwellings": 24
+      }
+    },
+    {
+      "id": "open-space-per-unit",
+      "rank": 18,
+      "name": "Open space per unit",
+      "value": 23.68066666666667,
+      "display": "23.7 m²",
+      "unit": "m²",
+      "status": "ok",
+      "breakdown": {
+        "landscape": 483.1600000000001,
+        "balconies": 85.176,
+        "total": 568.3360000000001
+      }
+    },
+    {
+      "id": "egress-travel",
+      "rank": 19,
+      "name": "Egress travel distance",
+      "value": 3.63,
+      "display": "3.63 m",
+      "unit": "m",
+      "status": "ok",
+      "note": "sprinklered limit 76 m",
+      "breakdown": {
+        "limit": 76
+      }
+    },
+    {
+      "id": "electrical-service",
+      "rank": 20,
+      "name": "Electrical service size",
+      "value": 400,
+      "display": "400 A",
+      "unit": "A",
+      "status": "ok",
+      "note": "400Y/230 V 3ph, 3-phase",
+      "breakdown": {
+        "amps": 400,
+        "connectedVa": 627982,
+        "demandVa": 232025,
+        "perUnitVa": 20425
+      }
+    },
+    {
+      "id": "structural-tributary",
+      "rank": 21,
+      "name": "Structural tributary area",
+      "value": 0,
+      "display": "n/a",
+      "unit": "m²",
+      "status": "warn",
+      "note": "no columns (wall-bearing structure)"
+    },
+    {
+      "id": "plumbing-dfu",
+      "rank": 22,
+      "name": "Drainage fixture units",
+      "value": 270,
+      "display": "270 DFU",
+      "unit": "DFU",
+      "status": "ok",
+      "breakdown": {
+        "dfu": 270,
+        "wsfu": 175.4,
+        "fixtures": 387,
+        "serviceDiameter": 0.05
+      }
+    },
+    {
+      "id": "cooling-load",
+      "rank": 23,
+      "name": "Cooling load",
+      "value": 79.5,
+      "display": "79.5 kW",
+      "unit": "kW",
+      "status": "ok",
+      "breakdown": {
+        "kw": 79.5,
+        "tons": 22.6054275,
+        "wPerM2": 70,
+        "heatingKw": 34.1
+      }
+    },
+    {
+      "id": "embodied-carbon",
+      "rank": 24,
+      "name": "Embodied carbon",
+      "value": 131.83,
+      "display": "132 kgCO₂e/m²",
+      "unit": "kgCO₂e/m²",
+      "status": "ok",
+      "note": "structure A1–A5 estimate (modelled structural elements only)",
+      "breakdown": {
+        "intensity": 131.83,
+        "a1a3": 117.71,
+        "a1a5": 131.83,
+        "total": 197745.9,
+        "gia": 1680
+      }
+    },
+    {
+      "id": "eui",
+      "rank": 25,
+      "name": "Energy use intensity",
+      "value": 76.12,
+      "display": "76 kWh/m²/yr",
+      "unit": "kWh/m²/yr",
+      "status": "ok",
+      "note": "AU proxy 80 kWh/m²/yr adjusted for 25% glazing",
+      "breakdown": {
+        "base": 80,
+        "adjusted": 76.12,
+        "kBtuPerSfYr": 24.13004,
+        "wwr": 0.253
+      }
+    },
+    {
+      "id": "construction-cost",
+      "rank": 26,
+      "name": "Construction cost",
+      "value": 5712000,
+      "display": "A$5,712,000 (A$3400/m²)",
+      "unit": "AUD",
+      "status": "ok",
+      "note": "AUD benchmark rate × GIA",
+      "breakdown": {
+        "total": 5712000,
+        "ratePerM2": 3400,
+        "ratePerSf": 315.8706416819183,
+        "perDwelling": 238000
+      }
+    },
+    {
+      "id": "setback-compliance",
+      "rank": 27,
+      "name": "Setback compliance",
+      "value": 0,
+      "display": "0.00 m",
+      "unit": "m",
+      "status": "ok",
+      "note": "all setbacks met",
+      "breakdown": {
+        "front": 0,
+        "side": 0,
+        "rear": 0,
+        "requiredFront": 6,
+        "requiredSide": 3,
+        "requiredRear": 6
+      }
+    },
+    {
+      "id": "facade-area",
+      "rank": 28,
+      "name": "Facade area",
+      "value": 1014.5999999999999,
+      "display": "1014.6 m²",
+      "unit": "m²",
+      "status": "ok",
+      "breakdown": {
+        "opaque": 787.6099999999999,
+        "glazed": 226.99
+      }
+    },
+    {
+      "id": "storeys",
+      "rank": 29,
+      "name": "Storeys above grade",
+      "value": 3,
+      "display": "3",
+      "unit": "storeys",
+      "status": "ok",
+      "breakdown": {
+        "aboveGrade": 3,
+        "basements": 0,
+        "podium": 0
+      }
+    }
+  ],
+  "patterns": {
+    "registered": 101,
+    "applications": 758,
+    "byPattern": {
+      "SIT-01": 1,
+      "SIT-04": 1,
+      "SIT-09": 1,
+      "SIT-08": 1,
+      "XD-04": 3,
+      "SIT-02": 2,
+      "SIT-07": 1,
+      "SIT-11": 1,
+      "SIT-12": 1,
+      "SIT-10": 1,
+      "ARC-04": 1,
+      "ARC-32": 1,
+      "ARC-14": 24,
+      "XD-01": 26,
+      "ARC-21": 24,
+      "ARC-15": 24,
+      "ARC-19": 24,
+      "ARC-16": 24,
+      "ARC-18": 24,
+      "ARC-20": 24,
+      "ARC-26": 12,
+      "ARC-27": 24,
+      "ARC-30": 24,
+      "ARC-28": 24,
+      "XD-05": 25,
+      "ARC-36": 12,
+      "ARC-17": 8,
+      "ARC-35": 1,
+      "ARC-02": 1,
+      "ARC-07": 1,
+      "ARC-05": 1,
+      "ARC-06": 1,
+      "ARC-08": 1,
+      "ARC-31": 1,
+      "ARC-33": 1,
+      "STR-11": 1,
+      "STR-01": 1,
+      "STR-02": 1,
+      "STR-05": 1,
+      "STR-06": 1,
+      "STR-07": 1,
+      "STR-08": 1,
+      "STR-09": 1,
+      "XD-03": 1,
+      "MEC-12": 1,
+      "MEC-01": 25,
+      "MEC-04": 24,
+      "MEC-10": 24,
+      "MEC-03": 49,
+      "MEC-11": 24,
+      "MEC-09": 24,
+      "PLB-01": 22,
+      "PLB-03": 22,
+      "PLB-02": 22,
+      "PLB-04": 1,
+      "PLB-07": 1,
+      "PLB-08": 1,
+      "PLB-11": 3,
+      "PLB-05": 3,
+      "PLB-06": 1,
+      "PLB-09": 1,
+      "XD-02": 1,
+      "ELE-01": 1,
+      "ELE-02": 24,
+      "ELE-03": 24,
+      "ELE-04": 24,
+      "ELE-05": 24,
+      "ELE-06": 24,
+      "ELE-13": 24,
+      "ELE-08": 3,
+      "ELE-12": 3,
+      "ELE-09": 1,
+      "ELE-10": 1,
+      "ELE-11": 1
+    }
+  },
+  "elements": {
+    "total": 7778,
+    "written": 7778,
+    "byDiscipline": {
+      "site": 56,
+      "architecture": 1802,
+      "structure": 254,
+      "mechanical": 1077,
+      "plumbing": 2496,
+      "electrical": 2093
+    },
+    "byIfcType": {
+      "IfcSlab": 16,
+      "IfcSpace": 288,
+      "IfcFurnishingElement": 347,
+      "IfcGeographicElement": 20,
+      "IfcWall": 668,
+      "IfcDoor": 241,
+      "IfcWindow": 90,
+      "IfcElectricAppliance": 112,
+      "IfcSanitaryTerminal": 204,
+      "IfcStair": 12,
+      "IfcRailing": 24,
+      "IfcBuildingElementProxy": 2,
+      "IfcBeam": 174,
+      "IfcFooting": 38,
+      "IfcUnitaryEquipment": 79,
+      "IfcPipeSegment": 2171,
+      "IfcPipeFitting": 32,
+      "IfcUnitaryControlElement": 48,
+      "IfcAirToAirHeatRecovery": 24,
+      "IfcAirTerminal": 96,
+      "IfcDuctSegment": 444,
+      "IfcDuctFitting": 288,
+      "IfcFan": 28,
+      "IfcWasteTerminal": 5,
+      "IfcValve": 3,
+      "IfcTank": 24,
+      "IfcFlowMeter": 1,
+      "IfcFireSuppressionTerminal": 234,
+      "IfcOutlet": 979,
+      "IfcLightFixture": 469,
+      "IfcSwitchingDevice": 346,
+      "IfcSensor": 55,
+      "IfcAudioVisualAppliance": 25,
+      "IfcSolarDevice": 150,
+      "IfcTransformer": 1,
+      "IfcElectricDistributionBoard": 32,
+      "IfcCableCarrierSegment": 8
+    },
+    "byGeometryKind": {
+      "slab": 16,
+      "prism": 310,
+      "box": 3582,
+      "wall": 668,
+      "door-in-wall": 241,
+      "window-in-wall": 90,
+      "stair": 12,
+      "railing": 24,
+      "beam": 174,
+      "footing": 38,
+      "axis": 2623
+    },
+    "byStorey": {
+      "SITE": 65,
+      "L01": 2508,
+      "L02": 2449,
+      "L03": 2453,
+      "ROOF": 227,
+      "FND": 76
+    }
+  },
+  "ifc": {
+    "file": "au-walkup.ifc",
+    "schema": "IFC4",
+    "entityCount": 92715,
+    "fileSize": 6453878
+  },
+  "validation": {
+    "ok": true,
+    "errors": [],
+    "warnings": [],
+    "entityCount": 92715,
+    "byType": {
+      "IFCPERSON": 1,
+      "IFCORGANIZATION": 1,
+      "IFCPERSONANDORGANIZATION": 1,
+      "IFCAPPLICATION": 1,
+      "IFCOWNERHISTORY": 1,
+      "IFCCARTESIANPOINT": 3731,
+      "IFCDIRECTION": 18,
+      "IFCAXIS2PLACEMENT3D": 3608,
+      "IFCLOCALPLACEMENT": 8126,
+      "IFCGEOMETRICREPRESENTATIONCONTEXT": 1,
+      "IFCGEOMETRICREPRESENTATIONSUBCONTEXT": 2,
+      "IFCDIMENSIONALEXPONENTS": 1,
+      "IFCSIUNIT": 4,
+      "IFCUNITASSIGNMENT": 1,
+      "IFCCOLOURRGB": 137,
+      "IFCSURFACESTYLERENDERING": 137,
+      "IFCSURFACESTYLE": 137,
+      "IFCPROJECT": 1,
+      "IFCSITE": 1,
+      "IFCBUILDING": 1,
+      "IFCBUILDINGSTOREY": 6,
+      "IFCAXIS2PLACEMENT2D": 103,
+      "IFCRECTANGLEPROFILEDEF": 207,
+      "IFCEXTRUDEDAREASOLID": 8263,
+      "IFCSHAPEREPRESENTATION": 8119,
+      "IFCPRODUCTDEFINITIONSHAPE": 8119,
+      "IFCWALL": 668,
+      "IFCMATERIAL": 17,
+      "IFCMATERIALLAYER": 264,
+      "IFCMATERIALLAYERSET": 88,
+      "IFCPOLYLINE": 326,
+      "IFCARBITRARYCLOSEDPROFILEDEF": 326,
+      "IFCSLAB": 16,
+      "IFCSPACE": 288,
+      "IFCFURNISHINGELEMENT": 347,
+      "IFCGEOGRAPHICELEMENT": 20,
+      "IFCELECTRICAPPLIANCE": 112,
+      "IFCSANITARYTERMINAL": 204,
+      "IFCSTAIR": 12,
+      "IFCRAILING": 24,
+      "IFCBUILDINGELEMENTPROXY": 2,
+      "IFCOPENINGELEMENT": 341,
+      "IFCRELVOIDSELEMENT": 341,
+      "IFCBEAM": 174,
+      "IFCFOOTING": 38,
+      "IFCUNITARYEQUIPMENT": 79,
+      "IFCCIRCLEPROFILEDEF": 11,
+      "IFCPIPESEGMENT": 2171,
+      "IFCPIPEFITTING": 32,
+      "IFCUNITARYCONTROLELEMENT": 48,
+      "IFCAIRTOAIRHEATRECOVERY": 24,
+      "IFCAIRTERMINAL": 96,
+      "IFCDUCTSEGMENT": 444,
+      "IFCDUCTFITTING": 288,
+      "IFCFAN": 28,
+      "IFCWASTETERMINAL": 5,
+      "IFCVALVE": 3,
+      "IFCTANK": 24,
+      "IFCFLOWMETER": 1,
+      "IFCFIRESUPPRESSIONTERMINAL": 234,
+      "IFCOUTLET": 979,
+      "IFCLIGHTFIXTURE": 469,
+      "IFCSWITCHINGDEVICE": 346,
+      "IFCSENSOR": 55,
+      "IFCAUDIOVISUALAPPLIANCE": 25,
+      "IFCSOLARDEVICE": 150,
+      "IFCTRANSFORMER": 1,
+      "IFCELECTRICDISTRIBUTIONBOARD": 32,
+      "IFCCABLECARRIERSEGMENT": 8,
+      "IFCDOOR": 241,
+      "IFCRELFILLSELEMENT": 331,
+      "IFCWINDOW": 90,
+      "IFCDISTRIBUTIONSYSTEM": 19,
+      "IFCRELASSIGNSTOGROUP": 47,
+      "IFCRELSERVICESBUILDINGS": 19,
+      "IFCZONE": 24,
+      "IFCPROPERTYSINGLEVALUE": 26097,
+      "IFCPROPERTYSET": 3861,
+      "IFCRELDEFINESBYPROPERTIES": 3912,
+      "IFCQUANTITYAREA": 41,
+      "IFCELEMENTQUANTITY": 38,
+      "IFCQUANTITYVOLUME": 39,
+      "IFCQUANTITYLENGTH": 36,
+      "IFCSTYLEDITEM": 7922,
+      "IFCRELASSOCIATESMATERIAL": 100,
+      "IFCRELAGGREGATES": 3,
+      "IFCRELCONTAINEDINSPATIALSTRUCTURE": 6
+    },
+    "unresolvedRefs": 0,
+    "schema": "IFC4"
+  },
+  "warnings": {
+    "model": [
+      "[architecture] unit U-L01-03: through plan: bathroom 1.03 m (min 1.70 m), kitchen 1.39 m (min 2.30 m) — only 6.51 m available for 10.75 m of rooms",
+      "[architecture] unit U-L01-03: bedroom placed away from the façade: a through unit 7.38 m wide offers 7.38 m of end façade for 9.05 m of habitable rooms",
+      "[architecture] unit U-L01-03: Bathroom: fixtures run on the wall opposite the wet wall because the door swing covers it — branch length 1.03 m (XD-01 allows 3 m)",
+      "[architecture] unit U-L01-04: through plan: kitchen 1.39 m (min 2.30 m), bathroom 1.03 m (min 1.70 m) — only 6.51 m available for 10.75 m of rooms",
+      "[architecture] unit U-L01-04: bedroom placed away from the façade: a through unit 7.38 m wide offers 7.38 m of end façade for 9.05 m of habitable rooms",
+      "[architecture] unit U-L01-04: Bathroom: fixtures run on the wall opposite the wet wall because the door swing covers it — branch length 1.03 m (XD-01 allows 3 m)",
+      "[architecture] unit U-L01-05: through plan: kitchen 1.88 m (min 2.20 m), bathroom 1.45 m (min 1.70 m) — only 6.51 m available for 7.63 m of rooms",
+      "[architecture] unit U-L01-06: through plan: bathroom 1.03 m (min 1.70 m), kitchen 1.39 m (min 2.30 m) — only 6.51 m available for 10.75 m of rooms",
+      "[architecture] unit U-L01-06: bedroom placed away from the façade: a through unit 7.38 m wide offers 7.38 m of end façade for 9.05 m of habitable rooms",
+      "[architecture] unit U-L01-06: Bathroom: fixtures run on the wall opposite the wet wall because the door swing covers it — branch length 1.03 m (XD-01 allows 3 m)",
+      "[architecture] unit U-L02-03: through plan: bathroom 1.45 m (min 1.70 m), kitchen 1.88 m (min 2.20 m) — only 6.51 m available for 7.63 m of rooms",
+      "[architecture] unit U-L02-04: through plan: kitchen 1.39 m (min 2.30 m), bathroom 1.03 m (min 1.70 m) — only 6.51 m available for 10.75 m of rooms",
+      "[architecture] 3 further occurrences of: unit U-L01-03: through plan: bathroom 1.03 m (min 1.70 m), kitchen 1.39 m (min 2.30 m) — only 6.51 m available for 10.75 m of rooms",
+      "[architecture] 4 further occurrences of: unit U-L01-03: bedroom placed away from the façade: a through unit 7.38 m wide offers 7.38 m of end façade for 9.05 m of habitable rooms",
+      "[architecture] 4 further occurrences of: unit U-L01-03: Bathroom: fixtures run on the wall opposite the wet wall because the door swing covers it — branch length 1.03 m (XD-01 allows 3 m)",
+      "[architecture] 3 further occurrences of: unit U-L01-04: through plan: kitchen 1.39 m (min 2.30 m), bathroom 1.03 m (min 1.70 m) — only 6.51 m available for 10.75 m of rooms",
+      "[structure] shear/core walls from architecture are 0.25 m thick; STR-05 wants 0.3 m for this height — architecture should thicken core walls (SIZES.coreWallT) or the writer must note the deviation.",
+      "[plumbing] washer was 4.13 m from its dwelling's stack (e.g. ARC-U-L01-01-WALL-011), over the 1.5 m trap-arm limit (IPC Table 1002.2); a second stack was added on its own wet wall",
+      "[plumbing] kitchen-sink was 2.71 m from its dwelling's stack (e.g. ARC-U-L01-03-WALL-010), over the 1.5 m trap-arm limit (IPC Table 1002.2); a second stack was added on its own wet wall",
+      "[plumbing] washer is 1.98 m from its dwelling's stack (e.g. ARC-U-L01-03-WALL-014), past the 1.5 m unvented trap-arm limit (IPC Table 1002.2); it is routed as an individually vented branch drain rather than opening another stack (architecture should move it onto the wet wall — XD-01)",
+      "[plumbing] kitchen-sink is 2.05 m from its dwelling's stack (e.g. ARC-U-L01-07-WALL-004), past the 1.5 m unvented trap-arm limit (IPC Table 1002.2); it is routed as an individually vented branch drain rather than opening another stack (architecture should move it onto the wet wall — XD-01)",
+      "[plumbing] trap arm 1.98 m on Ø50 exceeds the 1.5 m unvented limit (IPC Table 1002.2) at R-U-L01-03-LAUNDRY1; drained as an individually vented Ø75 branch (IPC 912)",
+      "[plumbing] trap arm 2.05 m on Ø50 exceeds the 1.5 m unvented limit (IPC Table 1002.2) at R-U-L01-07-KITCHEN1; drained as an individually vented Ø75 branch (IPC 912)"
+    ],
+    "writer": []
+  },
+  "timings": {
+    "site": 1.4999159999997573,
+    "architecture": 14.495249999999942,
+    "structure": 1.4629159999999501,
+    "mechanical": 3.882333000000017,
+    "plumbing": 14.68566699999974,
+    "electrical": 15.937209000000166,
+    "metrics": 0.3819160000002739,
+    "generate": 55,
+    "writeIfc": 192,
+    "validate": 86
+  }
+}
