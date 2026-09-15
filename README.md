@@ -9,6 +9,8 @@ spec ──► site + massing ──► architecture (floor plans, furniture) �
                                                                      └──► mechanical ──► plumbing ──► electrical ──► IFC + metrics + pattern trace
 ```
 
+**Live app:** https://samarv.github.io/forma-resi-ifc/ (GitHub Pages, served from `docs/index.html`).
+
 Everything is deterministic (seeded), dependency-free TypeScript that runs in Node 24 and in the
 browser. The shareable artifact is the single file `dist/forma-resi-ifc.html` (≈ 830 kB, works
 offline; the optional 3D tab embeds the ifc-lite WebGPU viewer from embed.ifclite.com).
