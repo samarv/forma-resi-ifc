@@ -1,0 +1,16 @@
+{
+  "name": "forma-resi-ifc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Parametric residential building design → IFC generator (site, architecture, structure, mechanical, plumbing, electrical) built on ifc-lite's IfcCreator",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test 'src/**/*.test.ts'",
+    "typecheck": "/Users/samarvir/formaCAD/node_modules/.bin/tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext --lib ES2022,DOM --allowImportingTsExtensions --erasableSyntaxOnly --verbatimModuleSyntax --skipLibCheck --typeRoots /Users/samarvir/formaCAD/node_modules/@types --types node src/core/*.ts src/disciplines/*/*.ts src/ifc/*.ts src/ifc/vendor/ifc-lite-create/*.ts src/cli/*.ts src/pipeline.ts src/app/*.ts",
+    "gen": "node src/cli/main.ts",
+    "build": "node scripts/build.mjs",
+    "samples": "node src/cli/main.ts --all-presets --out dist/samples"
+  },
+  "license": "MPL-2.0"
+}

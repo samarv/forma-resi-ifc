@@ -1,0 +1,6 @@
+node_modules/
+.DS_Store
+# Generated IFC samples are 0.4–52 MB each; keep only their JSON reports
+dist/samples/*.ifc
+# Built bundle lives in docs/index.html for GitHub Pages
+dist/forma-resi-ifc.html
