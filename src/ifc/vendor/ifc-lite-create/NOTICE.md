@@ -7,7 +7,16 @@ licensed under the Mozilla Public License 2.0 (see LICENSE). Modifications:
 - Import specifiers retargeted to local `.ts` files (no workspace resolution needed).
 - `addIfcSystem` / `addIfcZone` grouping helpers appended (see bottom of `ifc-creator.ts`).
 - `addSharedIfcPropertySet` / `addSharedIfcElementQuantity`: one definition, many products.
-- Shared geometry-resource caches (points, directions, axis placements, parametric profiles).
+- Shared geometry-resource caches (points, directions, axis placements, parametric profiles,
+  `IfcPropertySingleValue`, `IfcLocalPlacement`).
+- Mapped-item type library: `addCartesianTransformationOperator3D`, `addRepresentationMap`,
+  `addMappedItem`, `addMappedShapeRepresentation`, `addBodyRepresentation`, `addTypeObject`
+  (IfcFurnitureType / IfcSanitaryTerminalType / IfcElectricApplianceType /
+  IfcBuildingElementProxyType), `addRelDefinesByType`, `addInstanceElement` (many occurrences
+  share one `IfcProductDefinitionShape` — `ShapeOfProduct` is an inverse SET) and
+  `setSolidColor` (type-level styling; `finalizeStyles` styles solids before elements and never
+  twice). `addAxis2Placement3D` promoted to public (with a new `addCartesianPoint3D`) so
+  `addExtrudedAreaSolid`'s `positionId` is reachable.
 - `addIfcWall` honours `PredefinedType`; IFC2X3 styled items go through an
   `IfcPresentationStyleAssignment`.
 
@@ -118,3 +127,79 @@ property values, same colours, same containment and grouping:
 
 No behaviour changes to any existing call signature: all additions are optional fields or new
 methods, and the existing defaults equal the previous hardcoded values.
+
+### `ifc-creator.ts` — mapped-item type library (the furniture work)
+
+The upstream creator can only author geometry **per product**: every `addIfc*` builds one
+`IfcExtrudedAreaSolid`, one `IfcShapeRepresentation` and one `IfcProductDefinitionShape`, and
+there is no `IfcRepresentationMap`, `IfcMappedItem`, transformation operator, type object or
+`IfcRelDefinesByType` anywhere in the 92 entity types it can emit. A model with 1 810 pieces of
+furniture therefore paid for 1 810 copies of the same bounding box (~6.6 STEP entities each).
+
+Nine new public methods add the type-library encoding, so a type's 3–8 primitives are authored
+once and every occurrence is a mapped item that shares them:
+
+```ts
+addCartesianTransformationOperator3D(params?): number   // cached; identity appears ONCE per file
+addRepresentationMap(shapeRepId, mappingOrigin?): number
+addMappedItem(mapId, operatorId): number
+addMappedShapeRepresentation(mappedItemIds): number     // 'Body','MappedRepresentation'
+addBodyRepresentation(solidIds): number                 // 'Body','SolidModel', any item count
+addTypeObject(ifcType, params): number
+addRelDefinesByType(typeId, objectIds): void            // chunked at TYPE_REL_CHUNK = 500
+addInstanceElement(storeyId, params): number
+setSolidColor(solidId, name, rgb): void
+```
+
+- `addAxis2Placement3D` is promoted from private to public, and a public `addCartesianPoint3D`
+  wrapper added (like the existing `addDirection3D`), because `addExtrudedAreaSolid`'s
+  `positionId` parameter was public but unreachable — no public method could produce a value for
+  it, so no caller could put more than one solid in a shape representation.
+- `addInstanceElement` deliberately does **not** record the shape's solids in `elementSolids`:
+  those solids belong to the type and are styled once through `setSolidColor`. Registering them
+  per occurrence would make `finalizeStyles` emit N × M `IfcStyledItem`s. It also omits the
+  trailing `PredefinedType` for `IFCFURNISHINGELEMENT` (`NO_PREDEFINED_TYPES`), which has no
+  such attribute in IFC4 — the same rule `addIfcFurnishingElement` already follows.
+- Sharing one `IfcProductDefinitionShape` between occurrences is the idiomatic encoding, not a
+  trick: `IfcProductDefinitionShape.ShapeOfProduct` is an INVERSE `SET [1:?] OF IfcProduct FOR
+  Representation`, so N products referencing one shape is precisely how that set acquires N
+  members. The geometry is authored at the type origin and each occurrence carries its position
+  **and rotation** in its own `IfcLocalPlacement`, which is what keeps the identity operator
+  shared. Occurrences are linked to their type with `IfcRelDefinesByType`, which also stops a
+  viewer from drawing the type's representation map a second time as orphan type-only geometry.
+- `finalizeStyles` gained a first loop over `solidColors` that records what it styled, so the
+  existing per-element loop skips those solids: a solid must carry at most one `IfcStyledItem`.
+  The `IfcSurfaceStyle` cache is shared by both loops, so a whole 45-type furniture library
+  costs one surface style per palette colour.
+- **Attribute count correction.** `IFCFURNITURETYPE` has ELEVEN attributes in IFC4, not ten:
+  IFC4 kept IFC2X3's `AssemblyPlace` (as optional) and appended `PredefinedType` after it. The
+  three other type objects (`IFCSANITARYTERMINALTYPE`, `IFCELECTRICAPPLIANCETYPE`,
+  `IFCBUILDINGELEMENTPROXYTYPE`) do have the flat ten-attribute `IfcElementType` layout.
+  `HasPropertySets` is always `$` — occurrence property sets already go through the shared-pset
+  path.
+- IFC2X3 is **not** supported for mapped furniture (its type entities have different attributes
+  and enum members); `src/ifc/writer.ts` routes `instance` geometry to the box path there.
+
+Measured on `us-5-over-1` (1 975 furniture items, 30 types used): **6.53 → 3.01 STEP entities per
+item** (12 891 → 5 936 furniture-attributable entities) while the geometry goes from one bounding
+box to 3–8 primitives each; `IFCSTYLEDITEM`, `IFCEXTRUDEDAREASOLID` and `IFCSHAPEREPRESENTATION`
+each drop by ~1 900.
+
+### `ifc-creator.ts` — two more shared resource caches
+
+Both are schema-legal for the same reason as the geometry resources: the owning attribute is an
+INVERSE set, so one entity may serve many owners.
+
+- **`IfcPropertySingleValue`** by its exact argument text = (Name, Type, NominalValue), inside
+  `buildPropertySet`. `IfcProperty.PartOfPset` is `SET [0:?] OF IfcPropertySet FOR
+  HasProperties`, so one property entity may belong to many sets — and `Discipline` /
+  `Storey` / `System` / `Patterns` recur across thousands of otherwise distinct sets even after
+  the shared-pset work. Measured on `us-5-over-1`: 102 829 property entities would be written,
+  7 520 are (95 309 collapsed).
+  `buildPropertySet` now also collapses a repeated property within one set, because
+  `HasProperties` is a SET and `(#7,#7)` would be invalid.
+- **`IfcLocalPlacement`** by `(relativeTo, axis2Id)`. `IfcObjectPlacement.PlacesObject` is
+  `SET [1:?] OF IfcProduct FOR ObjectPlacement`, and two products share a placement only when
+  they sit at an identical origin *and* orientation relative to the same parent (a space prism
+  and its floor finish, a column and its footing, MEP stacked at one XY). Measured on
+  `us-5-over-1`: 30 607 placements would be written, 28 653 are (1 954 collapsed, 6.4 %).

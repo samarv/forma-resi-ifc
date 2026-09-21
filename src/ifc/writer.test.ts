@@ -11,6 +11,10 @@ import { getTypology } from '../core/typologies.ts';
 import type {
   ArchModel, BuildingSpec, DesignModel, ModelElement, SiteModel, StoreyDef, StructModel,
 } from '../core/types.ts';
+import type { FurnitureType } from '../core/types.ts';
+import { FURNITURE_TYPES, quantizeFurnitureWidth, solidBounds, stretchKey, typeById } from '../core/furniture-3d.ts';
+import { ArchBuilder, emitElements } from '../disciplines/architecture/arch-elements.ts';
+import { FURNITURE_CATALOG } from '../disciplines/architecture/furniture.ts';
 import { boxFootprint, boxPlacement, systemClassification, writeIfc } from './writer.ts';
 import { validateStep } from './validate.ts';
 
@@ -214,7 +218,9 @@ function syntheticModel(overrides: Partial<DesignModel> = {}): DesignModel {
     displayUnits: 'metric',
     typology: 'corridor-midrise',
     site: { width: 40, depth: 24 },
-    massing: { storeys: 2 },
+    // 2 storeys is below corridor-midrise's 4-storey band: this synthetic block declares the
+    // override so `normalizeSpec` honours it instead of clamping (v2 typology storey band).
+    massing: { storeys: 2, allowStoreyOverride: true },
   });
   const typology = getTypology(spec.typology);
   const storeys: StoreyDef[] = buildStoreys(spec, spec.floors);
@@ -342,6 +348,76 @@ function boxModel(count: number): DesignModel {
     });
   }
   return syntheticModel({ storeys, elements });
+}
+
+// ============================================================================
+// Furniture fixtures (mapped-item type library)
+// ============================================================================
+
+const FURNITURE_ONE_STOREY: StoreyDef[] = [
+  { id: 'L01', name: 'Level 1', index: 0, elevation: 0, height: 3, use: 'residential' },
+];
+
+const ALL_FURNITURE_TYPES = Object.keys(FURNITURE_TYPES) as FurnitureType[];
+
+/** The occurrence class as `arch-elements` assigns it, from the type's IFC class. */
+const OCCURRENCE_CLASS: Record<string, string> = {
+  IfcFurnitureType: 'IfcFurnishingElement',
+  IfcSanitaryTerminalType: 'IfcSanitaryTerminal',
+  IfcElectricApplianceType: 'IfcElectricAppliance',
+  IfcBuildingElementProxyType: 'IfcBuildingElementProxy',
+};
+
+/** One mapped-item occurrence, as the architecture furniture phase emits it. */
+function instanceElement(type: FurnitureType, index: number): ModelElement {
+  const def = FURNITURE_TYPES[type]!;
+  return {
+    id: `ARC-L01-FURN-${type}-${index}`,
+    discipline: 'architecture',
+    ifcType: OCCURRENCE_CLASS[def.ifcType],
+    predefinedType: def.ifcType === 'IfcFurnitureType' ? undefined : def.predefinedType,
+    name: type, objectType: type, storey: 'L01',
+    unitId: `U-L01-${String(index % 20).padStart(2, '0')}`,
+    roomId: `R-U-L01-${String(index % 20).padStart(2, '0')}-BED1`,
+    geometry: {
+      kind: 'instance',
+      typeId: stretchKey(type, def.footprint.w),
+      // distinct XY per item, which is what makes the placement chain genuinely
+      // per-occurrence (and the reason the floor is 4 entities, not 2)
+      position: [index * 0.37, ALL_FURNITURE_TYPES.indexOf(type) * 5.1, 0],
+      width: def.footprint.w, depth: def.footprint.d, height: def.height,
+      rotation: (index % 4) * (Math.PI / 2),
+    },
+    psets: [{ name: 'Forma_Architecture', properties: [{ name: 'FurnitureType', value: type }] }],
+    color: [0.7, 0.7, 0.7],
+  };
+}
+
+function furnitureElements(perType: number, types: FurnitureType[] = ALL_FURNITURE_TYPES): ModelElement[] {
+  const elements: ModelElement[] = [];
+  for (const type of types) {
+    for (let i = 0; i < perType; i++) elements.push(instanceElement(type, i));
+  }
+  return elements;
+}
+
+/** `count` of one entity type, from a validated file's byType table. */
+function counted(result: { byType: Record<string, number> }, ...types: string[]): number {
+  return types.reduce((sum, type) => sum + (result.byType[type] ?? 0), 0);
+}
+
+/** Every STEP line of one entity type, with the express id stripped. */
+function linesOf(content: string, type: string): string[] {
+  const re = new RegExp(`^#\\d+=(${type}\\(.*)$`, 'gm');
+  return [...content.matchAll(re)].map(match => match[1]);
+}
+
+/** The trailing `.ENUM.` of the entity that carries `tag` as its Tag, or null when it has none. */
+function trailingEnumByTag(content: string, tag: string): string | null {
+  const line = new RegExp(`^#\\d+=IFC[A-Z0-9]+\\([^\\n]*'${tag}'[^\\n]*$`, 'm').exec(content);
+  assert.ok(line, `no entity tagged '${tag}'`);
+  const token = /\.([A-Z0-9_]+)\.\);$/.exec(line[0]);
+  return token ? token[1] : null;
 }
 
 // ============================================================================
@@ -807,4 +883,365 @@ test('a 20-storey point tower writes in well under 2 s', () => {
   assert.deepEqual(result.errors, []);
   assert.ok(writeMs < 2000, `writeIfc took ${writeMs.toFixed(0)} ms`);
   assert.ok(validateMs < 2000, `validateStep took ${validateMs.toFixed(0)} ms`);
+});
+
+// ============================================================================
+// Furniture: mapped items off a type library
+// ============================================================================
+
+test('furniture geometry is authored once per type and instanced', () => {
+  const instances = furnitureElements(4);
+  const model = syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements: instances });
+  const out = writeIfc(model);
+  const result = validateStep(out.content);
+
+  assert.deepEqual(result.errors, [], 'validation errors');
+  assert.equal(result.unresolvedRefs, 0);
+
+  // One identity transformation operator for the whole FILE: every mapped item
+  // shares it, because position and rotation live in the occurrence placement.
+  assert.equal(counted(result, 'IFCCARTESIANTRANSFORMATIONOPERATOR3D'), 1);
+  assert.equal(counted(result, 'IFCCARTESIANTRANSFORMATIONOPERATOR3DNONUNIFORM'), 0);
+
+  // One representation map + one mapped item per USED type, and one type object.
+  const usedTypes = ALL_FURNITURE_TYPES.length;
+  assert.equal(counted(result, 'IFCREPRESENTATIONMAP'), usedTypes);
+  assert.equal(counted(result, 'IFCMAPPEDITEM'), usedTypes);
+  assert.equal(counted(result,
+    'IFCFURNITURETYPE', 'IFCSANITARYTERMINALTYPE', 'IFCELECTRICAPPLIANCETYPE', 'IFCBUILDINGELEMENTPROXYTYPE',
+  ), usedTypes);
+  // Two shape representations per type (the solid body and the mapped item) and
+  // ONE product definition shape, shared by every occurrence of that type.
+  assert.equal(counted(result, 'IFCSHAPEREPRESENTATION'), usedTypes * 2);
+  assert.equal(counted(result, 'IFCPRODUCTDEFINITIONSHAPE'), usedTypes);
+
+  // Solids and styled items are per TYPE PRIMITIVE, not per occurrence — that is
+  // the whole point: 3–8 primitives each, once.
+  const solids = ALL_FURNITURE_TYPES.reduce((sum, t) => sum + FURNITURE_TYPES[t]!.solids.length, 0);
+  assert.equal(counted(result, 'IFCEXTRUDEDAREASOLID'), solids);
+  assert.equal(counted(result, 'IFCSTYLEDITEM'), solids);
+  assert.ok(solids > instances.length, `${solids} primitives for ${instances.length} occurrences`);
+
+  // …and the eleven palette colours collapse to eleven surface styles (+ the
+  // creator's default style).
+  assert.equal(counted(result, 'IFCSURFACESTYLE'), 12);
+
+  // Every element became exactly one occurrence, of the class its type implies.
+  assert.equal(counted(result,
+    'IFCFURNISHINGELEMENT', 'IFCSANITARYTERMINAL', 'IFCELECTRICAPPLIANCE', 'IFCBUILDINGELEMENTPROXY',
+  ), instances.length);
+  assert.equal(Object.keys(out.idMap).length, instances.length);
+  assert.deepEqual(out.warnings, []);
+});
+
+test('type-level and occurrence-level PredefinedType agree', () => {
+  const out = writeIfc(syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements: furnitureElements(1) }));
+
+  const classified = ALL_FURNITURE_TYPES.filter(t => FURNITURE_TYPES[t]!.ifcType !== 'IfcFurnitureType');
+  assert.ok(classified.length >= 12, `only ${classified.length} classified types`);
+  for (const type of classified) {
+    const def = FURNITURE_TYPES[type]!;
+    assert.equal(trailingEnumByTag(out.content, def.id), def.predefinedType,
+      `type object token for ${type}`);
+    assert.equal(trailingEnumByTag(out.content, `ARC-L01-FURN-${type}-0`), def.predefinedType,
+      `occurrence token for ${type}`);
+  }
+
+  // IfcFurnishingElement has NO PredefinedType attribute in IFC4 — the occurrence
+  // must stop at Tag, exactly as addIfcFurnishingElement does.
+  for (const line of linesOf(out.content, 'IFCFURNISHINGELEMENT')) {
+    assert.match(line, /,'ARC-L01-FURN-[^']*'\);$/, line);
+  }
+});
+
+test('one IfcRelDefinesByType per type, chunked at 500 occurrences', () => {
+  const single = writeIfc(syntheticModel({
+    storeys: FURNITURE_ONE_STOREY, elements: furnitureElements(500, ['bed-queen']),
+  }));
+  assert.deepEqual(validateStep(single.content).errors, []);
+  assert.equal(linesOf(single.content, 'IFCRELDEFINESBYTYPE').length, 1);
+
+  const chunked = writeIfc(syntheticModel({
+    storeys: FURNITURE_ONE_STOREY, elements: furnitureElements(501, ['bed-queen']),
+  }));
+  assert.deepEqual(validateStep(chunked.content).errors, []);
+  assert.equal(linesOf(chunked.content, 'IFCRELDEFINESBYTYPE').length, 2);
+
+  // …and one per type, whatever the occurrence count.
+  const many = writeIfc(syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements: furnitureElements(3) }));
+  assert.equal(linesOf(many.content, 'IFCRELDEFINESBYTYPE').length, ALL_FURNITURE_TYPES.length);
+});
+
+test('a mapped-item furniture occurrence costs at most 5 STEP entities including the library', () => {
+  // 40 of each of the 45 types ≈ the 1 810 items of the us-5-over-1 preset.
+  const instances = furnitureElements(40);
+  const withFurniture = writeIfc(syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements: instances }));
+  const baseline = writeIfc(syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements: [] }));
+
+  const perInstance = (withFurniture.entityCount - baseline.entityCount) / instances.length;
+  assert.ok(perInstance <= 5.0, `${perInstance.toFixed(2)} entities per furniture instance`);
+
+  // The same items as single bounding boxes, which is what this replaces.
+  const boxes = instances.map(element => ({
+    ...element,
+    geometry: { ...element.geometry, kind: 'box' } as ModelElement['geometry'],
+  }));
+  const asBoxes = writeIfc(syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements: boxes }));
+  assert.ok(withFurniture.entityCount < asBoxes.entityCount,
+    `mapped ${withFurniture.entityCount} vs boxes ${asBoxes.entityCount}`);
+});
+
+test('shared property values and local placements are written once', () => {
+  const model = syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements: furnitureElements(6) });
+  const out = writeIfc(model);
+  assert.deepEqual(validateStep(out.content).errors, []);
+
+  for (const type of ['IFCPROPERTYSINGLEVALUE', 'IFCLOCALPLACEMENT']) {
+    const lines = linesOf(out.content, type);
+    assert.ok(lines.length > 0, `no ${type} lines`);
+    assert.equal(new Set(lines).size, lines.length, `duplicate ${type} lines modulo the express id`);
+  }
+
+  // The full synthetic model (every geometry kind) keeps the same guarantee.
+  const full = writeIfc(syntheticModel());
+  for (const type of ['IFCPROPERTYSINGLEVALUE', 'IFCLOCALPLACEMENT']) {
+    const lines = linesOf(full.content, type);
+    assert.equal(new Set(lines).size, lines.length, `duplicate ${type} lines modulo the express id`);
+  }
+});
+
+test('IFC2X3 and unknown types degrade an instance to a box', () => {
+  const elements = furnitureElements(2, ['bed-queen', 'wc', 'fridge', 'car']);
+  const model = syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements });
+
+  const old = writeIfc(model, { schema: 'IFC2X3' });
+  const oldResult = validateStep(old.content);
+  assert.deepEqual(oldResult.errors, []);
+  assert.equal(oldResult.byType.IFCMAPPEDITEM, undefined);
+  assert.equal(oldResult.byType.IFCREPRESENTATIONMAP, undefined);
+  assert.equal(oldResult.byType.IFCFURNITURETYPE, undefined);
+  // …and every occurrence still exists, as its own extruded box.
+  assert.equal(counted(oldResult, 'IFCEXTRUDEDAREASOLID'), elements.length);
+  assert.equal(Object.keys(old.idMap).length, elements.length);
+
+  const unknown = writeIfc(syntheticModel({
+    storeys: FURNITURE_ONE_STOREY,
+    elements: [{
+      ...instanceElement('bed-queen', 0),
+      geometry: { ...instanceElement('bed-queen', 0).geometry, typeId: 'FT-not-a-type' } as ModelElement['geometry'],
+    }],
+  }));
+  assert.deepEqual(validateStep(unknown.content).errors, []);
+  assert.equal(validateStep(unknown.content).byType.IFCMAPPEDITEM, undefined);
+  assert.deepEqual(unknown.warnings?.length, 1);
+  assert.match(unknown.warnings?.[0] ?? '', /unknown furniture type 'FT-not-a-type' — written as a box/);
+});
+
+test('a non-identity instance scale warns and falls back to identity', () => {
+  const base = instanceElement('bed-queen', 0);
+  const out = writeIfc(syntheticModel({
+    storeys: FURNITURE_ONE_STOREY,
+    elements: [{ ...base, geometry: { ...base.geometry, scale: [2, 1, 1] } as ModelElement['geometry'] }],
+  }));
+  assert.deepEqual(validateStep(out.content).errors, []);
+  assert.equal(validateStep(out.content).byType.IFCCARTESIANTRANSFORMATIONOPERATOR3D, 1);
+  assert.deepEqual(out.warnings?.length, 1);
+  assert.match(out.warnings?.[0] ?? '', /non-identity scale is not supported/);
+});
+
+test('instance output is byte-identical across runs', () => {
+  for (const compact of [true, false]) {
+    const elements = furnitureElements(5);
+    const a = writeIfc(syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements }), { compact });
+    const b = writeIfc(syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements }), { compact });
+    assert.equal(a.content, b.content, `compact: ${compact}`);
+    assert.equal(a.entityCount, b.entityCount);
+    assert.deepEqual(validateStep(a.content).errors, []);
+  }
+});
+
+test('the furniture library matches the catalogue it is built from', () => {
+  // The catalogue owns the footprint; this file owns the third dimension.
+  for (const type of ALL_FURNITURE_TYPES) {
+    const def = FURNITURE_TYPES[type]!;
+    const spec = FURNITURE_CATALOG[type];
+    assert.equal(def.footprint.w, spec.w, `${type} width`);
+    assert.equal(def.footprint.d, spec.d, `${type} depth`);
+    assert.ok(def.height >= spec.h, `${type} height ${def.height} < catalogue ${spec.h}`);
+    assert.ok(def.solids.length >= 3 && def.solids.length <= 8, `${type} has ${def.solids.length} solids`);
+    assert.ok(def.symbol.length >= 2, `${type} plan symbol has ${def.symbol.length} rings`);
+
+    // height is the real bounding height, and NOTHING pokes out of the footprint
+    // (an item that did would be drawn through the wall it stands against).
+    let top = 0;
+    for (const solid of def.solids) {
+      const b = solidBounds(solid);
+      top = Math.max(top, b.z1);
+      assert.ok(b.x0 >= -1e-9 && b.x1 <= def.footprint.w + 1e-9, `${type}: solid out of footprint in x`);
+      assert.ok(b.y0 >= -1e-9 && b.y1 <= def.footprint.d + 1e-9, `${type}: solid out of footprint in y`);
+      assert.ok(b.z0 >= -1e-9, `${type}: solid below the floor`);
+    }
+    assert.ok(Math.abs(top - def.height) < 1e-9, `${type}: height ${def.height} is not max(z + h) ${top}`);
+  }
+
+  // The six items whose real height exceeds the catalogue's clear height, stated
+  // explicitly so a future edit cannot silently grow an item.
+  assert.equal(FURNITURE_TYPES['tv-unit']!.height, 1.07);
+  assert.equal(FURNITURE_TYPES['kitchen-sink']!.height, 0.49);
+  assert.equal(FURNITURE_TYPES.lavatory!.height, 1.02);
+  assert.equal(FURNITURE_TYPES['water-heater']!.height, 1.5);
+  assert.equal(FURNITURE_TYPES.planter!.height, 0.85);
+  assert.equal(FURNITURE_TYPES.shower!.height, 2.03);
+
+  // Only counters stretch, and only they carry a per-length id.
+  const stretchable = ALL_FURNITURE_TYPES.filter(t => FURNITURE_TYPES[t]!.stretch);
+  assert.deepEqual(stretchable, ['kitchen-counter']);
+  assert.equal(stretchKey('bed-queen', 9), 'FT-bed-queen');
+  assert.equal(stretchKey('kitchen-counter', 1.24), 'FT-kitchen-counter-w120');
+  assert.equal(stretchKey('kitchen-counter', 1.26), 'FT-kitchen-counter-w130');
+  assert.equal(quantizeFurnitureWidth('kitchen-counter', 1.24), 1.2000000000000002);
+  assert.equal(quantizeFurnitureWidth('bed-queen', 1.24), 1.24);
+
+  // Door panel COUNT follows the run length — what a non-uniform scale could not do.
+  const panels = (w: number): number => typeById(stretchKey('kitchen-counter', w))!.solids.length - 3;
+  assert.equal(panels(0.6), 1);
+  assert.equal(panels(1.2), 2);
+  assert.equal(panels(1.8), 3);
+  assert.equal(panels(3.4), 5);
+  assert.equal(panels(6), 5);
+  assert.equal(typeById('FT-kitchen-counter-w340')!.footprint.w, 3.4);
+  assert.equal(typeById('FT-kitchen-counter-w340'), typeById('FT-kitchen-counter-w340'), 'memoised');
+});
+
+test('the furniture emit phase gates instances on detail and quantises stretch widths', () => {
+  const furnish = (detail: 'low' | 'medium' | 'high'): ModelElement[] => {
+    const b = new ArchBuilder([]);
+    b.addFurniture({
+      storey: 'L01', roomId: 'R-1', type: 'bed-queen', position: [1, 2], width: 1.52, depth: 2.03,
+      height: 0.6, rotation: 0,
+    });
+    b.addFurniture({
+      storey: 'L01', roomId: 'R-1', type: 'kitchen-counter', position: [4, 2], width: 2.63, depth: 0.6,
+      height: 0.9, rotation: Math.PI / 2,
+    });
+    b.addFurniture({
+      storey: 'L01', roomId: 'R-1', type: 'wc', position: [6, 2], width: 0.4, depth: 0.7,
+      height: 0.8, rotation: 0,
+    });
+    const out = emitElements(b, { ceilingHeight: new Map(), unitTemplateOf: new Map(), detail });
+    // …and the FurnitureDef now agrees with the emitted geometry.
+    assert.equal(b.furniture[1].width, 2.6, 'counter width quantised in the definition');
+    assert.equal(b.furniture[0].width, 1.52, 'a non-stretchable item keeps its width');
+    return out;
+  };
+
+  const low = furnish('low');
+  assert.deepEqual(low.map(e => e.geometry.kind), ['box', 'box', 'box']);
+
+  for (const detail of ['medium', 'high'] as const) {
+    const elements = furnish(detail);
+    assert.deepEqual(elements.map(e => e.geometry.kind), ['instance', 'instance', 'instance']);
+    const kinds = elements.map(e => e.geometry as Extract<ModelElement['geometry'], { kind: 'instance' }>);
+    assert.equal(kinds[0].typeId, 'FT-bed-queen');
+    assert.equal(kinds[0].height, FURNITURE_TYPES['bed-queen']!.height);
+    assert.equal(kinds[1].typeId, 'FT-kitchen-counter-w260');
+    assert.equal(kinds[1].width, 2.6);
+    assert.equal(kinds[2].typeId, 'FT-wc');
+    // The occurrence class and token come from the type library.
+    assert.deepEqual(elements.map(e => e.ifcType),
+      ['IfcFurnishingElement', 'IfcFurnishingElement', 'IfcSanitaryTerminal']);
+    assert.deepEqual(elements.map(e => e.predefinedType), [undefined, undefined, 'TOILETPAN']);
+  }
+
+  // Both detail levels write a valid file, and only the high one is mapped.
+  const lowOut = writeIfc(syntheticModel({ storeys: FURNITURE_ONE_STOREY, elements: low }));
+  assert.deepEqual(validateStep(lowOut.content).errors, []);
+  assert.equal(validateStep(lowOut.content).byType.IFCMAPPEDITEM, undefined);
+});
+
+/**
+ * Parse the extruded solids of a STEP file back to world-space bounding boxes.
+ *
+ * Rebuilds each solid's placement frame (`Axis` = local Z, `RefDirection` = local X,
+ * local Y = Z × X), maps its profile points into world space and extrudes them along
+ * the extrusion direction — which is how a reader sees the geometry, and therefore
+ * the only way to prove that a sideways `Solid.axis` was encoded as the rotated
+ * placement `solidBounds` promises rather than a rotated profile.
+ */
+function solidBoxesOf(content: string): { x0: number; y0: number; z0: number; x1: number; y1: number; z1: number }[] {
+  const entities = new Map<number, { type: string; args: string }>();
+  for (const match of content.matchAll(/^#(\d+)=([A-Z0-9]+)\((.*)\);$/gm)) {
+    entities.set(Number(match[1]), { type: match[2], args: match[3] });
+  }
+  const refs = (args: string): number[] => [...args.matchAll(/#(\d+)/g)].map(m => Number(m[1]));
+  const point = (id: number): number[] => entities.get(id)!.args.replace(/[()]/g, '').split(',').map(Number);
+  const centre2D = (args: string): number[] => point(refs(entities.get(refs(args)[0])!.args)[0]);
+  const profile = (id: number): number[][] => {
+    const entity = entities.get(id)!;
+    if (entity.type === 'IFCRECTANGLEPROFILEDEF') {
+      const [w, d] = entity.args.split(',').slice(-2).map(Number);
+      const [cx, cy] = centre2D(entity.args);
+      return [[cx - w / 2, cy - d / 2], [cx + w / 2, cy - d / 2], [cx + w / 2, cy + d / 2], [cx - w / 2, cy + d / 2]];
+    }
+    if (entity.type === 'IFCCIRCLEPROFILEDEF') {
+      const r = Number(entity.args.split(',').pop());
+      const [cx, cy] = centre2D(entity.args);
+      return [[cx - r, cy - r], [cx + r, cy - r], [cx + r, cy + r], [cx - r, cy + r]];
+    }
+    assert.equal(entity.type, 'IFCARBITRARYCLOSEDPROFILEDEF', `unexpected profile ${entity.type}`);
+    return refs(entities.get(refs(entity.args)[0])!.args).map(point);
+  };
+  const cross = (a: number[], b: number[]): number[] =>
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
+  const boxes: { x0: number; y0: number; z0: number; x1: number; y1: number; z1: number }[] = [];
+  for (const entity of entities.values()) {
+    if (entity.type !== 'IFCEXTRUDEDAREASOLID') continue;
+    const [profileId, placementId, dirId] = refs(entity.args);
+    const depth = Number(entity.args.split(',').pop());
+    const [originRef, axisRef, refDirRef] = entities.get(placementId)!.args.split(',');
+    const origin = point(Number(originRef.slice(1)));
+    const localZ = axisRef === '$' ? [0, 0, 1] : point(refs(axisRef)[0]);
+    const localX = refDirRef === '$' ? [1, 0, 0] : point(refs(refDirRef)[0]);
+    const localY = cross(localZ, localX);
+    const dir = point(dirId);
+
+    const world: number[][] = [];
+    for (const [p, q] of profile(profileId)) {
+      for (const t of [0, depth]) {
+        world.push([0, 1, 2].map(k => origin[k] + p * localX[k] + q * localY[k]
+          + t * (dir[0] * localX[k] + dir[1] * localY[k] + dir[2] * localZ[k])));
+      }
+    }
+    const axis = (k: number): number[] => world.map(p => p[k]);
+    boxes.push({
+      x0: Math.min(...axis(0)), x1: Math.max(...axis(0)),
+      y0: Math.min(...axis(1)), y1: Math.max(...axis(1)),
+      z0: Math.min(...axis(2)), z1: Math.max(...axis(2)),
+    });
+  }
+  return boxes;
+}
+
+test('every type primitive is written where solidBounds says it is', () => {
+  for (const type of ALL_FURNITURE_TYPES) {
+    const def = FURNITURE_TYPES[type]!;
+    const out = writeIfc(syntheticModel({
+      storeys: FURNITURE_ONE_STOREY,
+      elements: [{ ...instanceElement(type, 0), geometry: { ...instanceElement(type, 0).geometry, rotation: 0 } as ModelElement['geometry'] }],
+    }));
+    const boxes = solidBoxesOf(out.content);
+    assert.equal(boxes.length, def.solids.length, `${type}: ${boxes.length} solids written`);
+    for (let i = 0; i < boxes.length; i++) {
+      const solid = def.solids[i];
+      const want = solidBounds(solid);
+      // A circle/ellipse is written as a 16-gon, which is inscribed: its bounds can
+      // fall short of the true radius by r·(1 − cos(π/16)) ≈ 2 % of r.
+      const tolerance = solid.kind === 'box' || solid.kind === 'prism' ? 1e-6 : 0.021;
+      for (const key of ['x0', 'x1', 'y0', 'y1', 'z0', 'z1'] as const) {
+        assert.ok(Math.abs(boxes[i][key] - want[key]) <= tolerance,
+          `${type} solid ${i} (${solid.kind}, axis ${solid.axis ?? 'z'}): ${key} is ${boxes[i][key]}, expected ${want[key]}`);
+      }
+    }
+  }
 });

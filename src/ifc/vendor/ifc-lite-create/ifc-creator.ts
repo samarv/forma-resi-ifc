@@ -79,6 +79,21 @@ const GROUP_CHUNK = 500;
  */
 const PROPERTY_REL_CHUNK = 250;
 
+/**
+ * Max related objects per IfcRelDefinesByType line (forma-resi-ifc addition,
+ * used by `addRelDefinesByType`). Mirrors {@link GROUP_CHUNK}: one furniture
+ * type can have every unit's copy of an item as an occurrence.
+ */
+const TYPE_REL_CHUNK = 500;
+
+/**
+ * Occurrence entities with NO `PredefinedType` attribute (forma-resi-ifc
+ * addition). `IfcFurnishingElement` is the IFC2X3-era supertype that IFC4 kept
+ * without a type enum, so `addInstanceElement` must stop at `Tag` for it — see
+ * `addIfcFurnishingElement`, which does the same.
+ */
+const NO_PREDEFINED_TYPES = new Set(['IFCFURNISHINGELEMENT']);
+
 // ============================================================================
 // IfcCreator
 // ============================================================================
@@ -165,6 +180,25 @@ export class IfcCreator {
   private profileCache: Map<string, number> = new Map();
   /** IFC2X3 only: IfcSurfaceStyle id → its IfcPresentationStyleAssignment id */
   private styleAssignments: Map<number, number> = new Map();
+  //
+  // Two more resource caches (forma-resi-ifc addition, NOTICE.md). Both are
+  // schema-legal because the owning attribute is an INVERSE set:
+  // `IfcProperty.PartOfPset` and `IfcObjectPlacement.PlacesObject` are both
+  // `SET OF … FOR …`, so one property / one placement may serve many owners.
+  /** `IFCPROPERTYSINGLEVALUE(<args>)` → id; identical (Name, Type, Value) triples share one entity */
+  private propertyCache: Map<string, number> = new Map();
+  /** `relativeTo|axis2Id` → IfcLocalPlacement id; two products at one origin AND orientation share it */
+  private localPlacementCache: Map<string, number> = new Map();
+  //
+  // ---- Mapped-item type library (forma-resi-ifc addition, NOTICE.md) -------
+  /** `IFCCARTESIANTRANSFORMATIONOPERATOR3D(<args>)` → id; the identity operator is file-wide */
+  private transformOpCache: Map<string, number> = new Map();
+  /** `shapeRepId|originId` → IfcRepresentationMap id */
+  private representationMapCache: Map<string, number> = new Map();
+  /** `mapId|operatorId` → IfcMappedItem id */
+  private mappedItemCache: Map<string, number> = new Map();
+  /** Solid id → its own colour (type-level styling; styled before, and instead of, element solids) */
+  private solidColors: Map<number, { name: string; rgb: [number, number, number] }> = new Map();
 
   // Tracking for spatial aggregation
   private storeyIds: number[] = [];
@@ -1659,11 +1693,16 @@ export class IfcCreator {
     const propIds: number[] = [];
 
     for (const prop of pset.Properties) {
-      const propId = this.id();
-      const valueStr = this.serializePropertyValue(prop);
-      this.line(propId, 'IFCPROPERTYSINGLEVALUE',
-        `'${esc(prop.Name)}',$,${valueStr},$`);
-      propIds.push(propId);
+      // forma-resi-ifc addition: an IfcPropertySingleValue is a value-typed
+      // definition, and `PartOfPset` is an INVERSE SET, so one entity may
+      // belong to many property sets. `Discipline = 'architecture'` is the same
+      // property in all 13 000 sets that carry it. Cached on the exact argument
+      // text = (Name, Type, NominalValue).
+      const propId = this.sharedResource(this.propertyCache, 'IFCPROPERTYSINGLEVALUE',
+        `'${esc(prop.Name)}',$,${this.serializePropertyValue(prop)},$`);
+      // HasProperties is a SET: a caller that passed the same property twice
+      // must not produce `(#7,#7)`.
+      if (!propIds.includes(propId)) propIds.push(propId);
     }
 
     const psetId = this.id();
@@ -1744,6 +1783,21 @@ export class IfcCreator {
    */
   setColor(elementId: number, name: string, rgb: [number, number, number]): void {
     this.elementColors.set(elementId, { name, rgb });
+  }
+
+  /**
+   * Assign a colour to ONE SOLID rather than to a product (forma-resi-ifc
+   * addition). Call before toIfc().
+   *
+   * This is what lets a multi-solid shape representation be polychrome — a
+   * furniture type's frame, mattress and pillows each get their own
+   * IfcStyledItem — and it is the only styling route for geometry that is not
+   * owned by a single product (a type's `IfcRepresentationMap`, shared by every
+   * occurrence). `name` must be a pure function of the colour, because
+   * `finalizeStyles` caches one IfcSurfaceStyle per `name|rgb`.
+   */
+  setSolidColor(solidId: number, name: string, rgb: [number, number, number]): void {
+    this.solidColors.set(solidId, { name, rgb });
   }
 
   // ============================================================================
@@ -2204,27 +2258,42 @@ ENDSEC;
     return styleId;
   }
 
-  /** Create all IfcStyledItem entities — custom colour or default per element */
+  /**
+   * Create all IfcStyledItem entities — per SOLID where a colour was set on the
+   * solid itself, then per element for the rest.
+   *
+   * forma-resi-ifc change: the `solidColors` loop runs FIRST and records what it
+   * styled, so the per-element loop can skip those solids. A solid must carry at
+   * most one IfcStyledItem; without the guard, a solid that is both coloured
+   * directly (a furniture type's solid) and listed under an element would get
+   * two. `styleCache` is shared by both loops, so one IfcSurfaceStyle serves
+   * every user of a colour.
+   */
   private finalizeStyles(): void {
     // Cache: colour key → styleId so identical colours share one style entity
     const styleCache = new Map<string, number>();
+    const styleFor = (name: string, rgb: [number, number, number]): number => {
+      const key = `${name}|${rgb.join(',')}`;
+      const cached = styleCache.get(key);
+      if (cached !== undefined) return cached;
+      const styleId = this.buildColorStyle(name, rgb);
+      styleCache.set(key, styleId);
+      return styleId;
+    };
+
+    const styled = new Set<number>();
+    for (const [solidId, color] of this.solidColors) {
+      const styleRef = this.styleReference(styleFor(color.name, color.rgb));
+      this.line(this.id(), 'IFCSTYLEDITEM', `#${solidId},(#${styleRef}),$`);
+      styled.add(solidId);
+    }
+
     for (const [elementId, solidIds] of this.elementSolids) {
       const color = this.elementColors.get(elementId);
-      let styleId: number;
-      if (color) {
-        const key = `${color.name}|${color.rgb.join(',')}`;
-        const cached = styleCache.get(key);
-        if (cached !== undefined) {
-          styleId = cached;
-        } else {
-          styleId = this.buildColorStyle(color.name, color.rgb);
-          styleCache.set(key, styleId);
-        }
-      } else {
-        styleId = this.defaultStyleId;
-      }
+      const styleId = color ? styleFor(color.name, color.rgb) : this.defaultStyleId;
       const styleRef = this.styleReference(styleId);
       for (const solidId of solidIds) {
+        if (styled.has(solidId)) continue;
         const styledItemId = this.id();
         this.line(styledItemId, 'IFCSTYLEDITEM', `#${solidId},(#${styleRef}),$`);
       }
@@ -2333,7 +2402,16 @@ ENDSEC;
       `(${num(d[0])},${num(d[1])},${num(d[2])})`);
   }
 
-  private addAxis2Placement3D(originId: number, axisId?: number, refDirId?: number): number {
+  /**
+   * Get or emit the shared IfcAxis2Placement3D for an origin/axis/refDirection
+   * triple.
+   *
+   * forma-resi-ifc change: PUBLIC, because `addExtrudedAreaSolid`'s
+   * `positionId` parameter is public but no public method could produce a
+   * value for it — a caller placing several solids inside one shape
+   * representation (the furniture type library) needs exactly this.
+   */
+  addAxis2Placement3D(originId: number, axisId?: number, refDirId?: number): number {
     const axis = axisId ? `#${axisId}` : '$';
     const refDir = refDirId ? `#${refDirId}` : '$';
     const key = `${originId}|${axisId ?? 0}|${refDirId ?? 0}`;
@@ -2376,10 +2454,33 @@ ENDSEC;
     }
 
     const axis2Id = this.addAxis2Placement3D(originId, axisId, refDirId);
+    return this.localPlacement(relativeTo, axis2Id);
+  }
 
+  /**
+   * Get or emit the shared IfcLocalPlacement for a (parent, axis placement)
+   * pair (forma-resi-ifc addition).
+   *
+   * `IfcObjectPlacement.PlacesObject` is an INVERSE `SET [1:?] OF IfcProduct`,
+   * so N products may reference one placement — and two products share one
+   * only when they sit at an identical origin AND orientation relative to the
+   * same parent (a space prism and its floor finish, a column and its footing,
+   * MEP stacked at one XY). The cache key is the pair of ids, so two calls
+   * share an entity precisely when the STEP line would be byte-identical.
+   */
+  private localPlacement(relativeTo: number, axis2Id: number): number {
+    const key = `${relativeTo}|${axis2Id}`;
+    const cached = this.localPlacementCache.get(key);
+    if (cached !== undefined) return cached;
     const id = this.id();
     this.line(id, 'IFCLOCALPLACEMENT', `#${relativeTo},#${axis2Id}`);
+    this.localPlacementCache.set(key, id);
     return id;
+  }
+
+  /** Create an IfcCartesianPoint. Returns the (cached) point id. */
+  addCartesianPoint3D(p: Point3D): number {
+    return this.addCartesianPoint(p);
   }
 
   /**
@@ -2986,10 +3087,7 @@ ENDSEC;
     const axisId = this.addDirection([0, -1, 0]);
     const refDirId = this.addDirection([1, 0, 0]);
     const axis2Id = this.addAxis2Placement3D(originId, axisId, refDirId);
-
-    const placementId = this.id();
-    this.line(placementId, 'IFCLOCALPLACEMENT', `#${hostPlacementId},#${axis2Id}`);
-    return placementId;
+    return this.localPlacement(hostPlacementId, axis2Id);
   }
 
   private trackElement(storeyId: number, elementId: number): void {
@@ -3006,6 +3104,196 @@ ENDSEC;
     const up: Point3D = Math.abs(axis[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
     const cross = vecCross(up, axis);
     return vecNorm(cross);
+  }
+
+  // ============================================================================
+  // Public API — Mapped-item type library (forma-resi-ifc addition, NOTICE.md)
+  //
+  // The upstream creator can only author geometry per product: every addIfc*
+  // builds one IfcExtrudedAreaSolid, one IfcShapeRepresentation and one
+  // IfcProductDefinitionShape, and there is no IfcRepresentationMap,
+  // IfcMappedItem, transformation operator, type object or IfcRelDefinesByType
+  // anywhere in it. A model with 1 800 pieces of furniture therefore pays for
+  // 1 800 copies of the same box.
+  //
+  // These nine methods add the type-library encoding instead: author a type's
+  // solids ONCE at its own origin, wrap them in an IfcRepresentationMap, and
+  // give every occurrence the same IfcProductDefinitionShape (one
+  // IfcMappedItem through the shared identity operator) with its position and
+  // rotation in its own IfcLocalPlacement. `IfcProductDefinitionShape`'s
+  // `ShapeOfProduct` is an INVERSE `SET [1:?] OF IfcProduct FOR
+  // Representation`, so N products referencing one shape is exactly how that
+  // set acquires N members — nothing in the creator couples a product shape to
+  // one product either. The occurrences are linked to the type with
+  // IfcRelDefinesByType so the type's map is never ALSO drawn as orphan
+  // type-only geometry.
+  // ============================================================================
+
+  /**
+   * Get or emit an IfcCartesianTransformationOperator3D.
+   *
+   * IFC4 attribute order (`IfcCartesianTransformationOperator` +
+   * `IfcCartesianTransformationOperator3D`):
+   * `Axis1, Axis2, LocalOrigin, Scale, Axis3`. Passing `Scale2`/`Scale3` emits
+   * the `…3DNONUNIFORM` subtype, which appends `Scale2, Scale3`.
+   *
+   * Cached, so the identity operator every mapped item shares appears exactly
+   * once in the file.
+   */
+  addCartesianTransformationOperator3D(params: {
+    LocalOrigin?: Point3D; Scale?: number; Scale2?: number; Scale3?: number;
+    Axis1?: Point3D; Axis2?: Point3D; Axis3?: Point3D;
+  } = {}): number {
+    const originId = this.addCartesianPoint(params.LocalOrigin ?? [0, 0, 0]);
+    const axis1 = params.Axis1 ? `#${this.addDirection(params.Axis1)}` : '$';
+    const axis2 = params.Axis2 ? `#${this.addDirection(params.Axis2)}` : '$';
+    const axis3 = params.Axis3 ? `#${this.addDirection(params.Axis3)}` : '$';
+    const scale = optReal(params.Scale);
+    const nonUniform = params.Scale2 !== undefined || params.Scale3 !== undefined;
+    const args = nonUniform
+      ? `${axis1},${axis2},#${originId},${scale},${axis3},${optReal(params.Scale2)},${optReal(params.Scale3)}`
+      : `${axis1},${axis2},#${originId},${scale},${axis3}`;
+    return this.sharedResource(this.transformOpCache,
+      nonUniform ? 'IFCCARTESIANTRANSFORMATIONOPERATOR3DNONUNIFORM' : 'IFCCARTESIANTRANSFORMATIONOPERATOR3D',
+      args);
+  }
+
+  /**
+   * Get or emit the IfcRepresentationMap that makes a shape representation
+   * instantiable. `IfcRepresentationMap(MappingOrigin, MappedRepresentation)`.
+   */
+  addRepresentationMap(shapeRepId: number, mappingOrigin: Point3D = [0, 0, 0]): number {
+    const originId = this.addAxis2Placement3D(this.addCartesianPoint(mappingOrigin));
+    const key = `${shapeRepId}|${originId}`;
+    const cached = this.representationMapCache.get(key);
+    if (cached !== undefined) return cached;
+    const id = this.id();
+    this.line(id, 'IFCREPRESENTATIONMAP', `#${originId},#${shapeRepId}`);
+    this.representationMapCache.set(key, id);
+    return id;
+  }
+
+  /** Get or emit `IfcMappedItem(MappingSource, MappingTarget)`. */
+  addMappedItem(mapId: number, operatorId: number): number {
+    const key = `${mapId}|${operatorId}`;
+    const cached = this.mappedItemCache.get(key);
+    if (cached !== undefined) return cached;
+    const id = this.id();
+    this.line(id, 'IFCMAPPEDITEM', `#${mapId},#${operatorId}`);
+    this.mappedItemCache.set(key, id);
+    return id;
+  }
+
+  /**
+   * An IfcShapeRepresentation of mapped items: RepresentationType is
+   * `MappedRepresentation`, which {@link addShapeRepresentation} can never
+   * write (it picks SweptSolid/SolidModel from the item count).
+   */
+  addMappedShapeRepresentation(mappedItemIds: number[]): number {
+    const refs = mappedItemIds.map(id => `#${id}`).join(',');
+    const id = this.id();
+    this.line(id, 'IFCSHAPEREPRESENTATION', `#${this.subContextBody},'Body','MappedRepresentation',(${refs})`);
+    return id;
+  }
+
+  /**
+   * An IfcShapeRepresentation of one or more solids, always labelled
+   * `SolidModel`. {@link addShapeRepresentation} labels a single-item body
+   * `SweptSolid`, which would type a one-solid furniture type differently from
+   * its five-solid sibling.
+   */
+  addBodyRepresentation(solidIds: number[]): number {
+    const refs = solidIds.map(id => `#${id}`).join(',');
+    const id = this.id();
+    this.line(id, 'IFCSHAPEREPRESENTATION', `#${this.subContextBody},'Body','SolidModel',(${refs})`);
+    return id;
+  }
+
+  /**
+   * Emit an element type object carrying RepresentationMaps.
+   *
+   * One attribute list serves the three `IfcElementType` leaves whose only own
+   * attribute is `PredefinedType`:
+   * `GlobalId, OwnerHistory, Name, Description, ApplicableOccurrence,
+   *  HasPropertySets, RepresentationMaps, Tag, ElementType, PredefinedType`
+   *
+   * `IFCFURNITURETYPE` is the exception: IFC4 keeps IFC2X3's `AssemblyPlace`
+   * (made optional) and adds `PredefinedType` after it, so it has ELEVEN
+   * attributes. `PredefinedType` is optional on all four but is mandatory in
+   * practice for readers that classify by it, so it defaults to `.NOTDEFINED.`.
+   * `HasPropertySets` stays `$`: occurrence property sets already go through
+   * the shared-pset path, and a second mechanism buys nothing.
+   */
+  addTypeObject(
+    ifcType: 'IFCFURNITURETYPE' | 'IFCSANITARYTERMINALTYPE' | 'IFCELECTRICAPPLIANCETYPE' | 'IFCBUILDINGELEMENTPROXYTYPE',
+    params: {
+      Name: string; Description?: string; ApplicableOccurrence?: string;
+      RepresentationMaps?: number[]; Tag?: string; ElementType?: string; PredefinedType?: string;
+      AssemblyPlace?: string;
+    },
+  ): number {
+    const id = this.id();
+    const globalId = this.newGlobalId();
+    const maps = params.RepresentationMaps && params.RepresentationMaps.length > 0
+      ? `(${params.RepresentationMaps.map(m => `#${m}`).join(',')})`
+      : '$';
+    const head = `'${globalId}',#${this.ownerHistoryId},'${esc(params.Name)}',${optStr(params.Description)},`
+      + `${optStr(params.ApplicableOccurrence)},$,${maps},${optStr(params.Tag)},${optStr(params.ElementType)}`;
+    const predefined = optEnum(params.PredefinedType ?? 'NOTDEFINED');
+    this.line(id, ifcType, ifcType === 'IFCFURNITURETYPE'
+      ? `${head},${optEnum(params.AssemblyPlace)},${predefined}`
+      : `${head},${predefined}`);
+    this.entities.push({ expressId: id, type: ifcType, Name: params.Name });
+    return id;
+  }
+
+  /**
+   * Link occurrences to their type with IfcRelDefinesByType, chunked at
+   * {@link TYPE_REL_CHUNK} ids and with duplicates collapsed (as
+   * `assignToGroup` and `relateDefinition` do). Not idempotent — call once per
+   * type, after every occurrence exists.
+   */
+  addRelDefinesByType(typeId: number, objectIds: number[]): void {
+    const unique = [...new Set(objectIds)];
+    for (let i = 0; i < unique.length; i += TYPE_REL_CHUNK) {
+      const chunk = unique.slice(i, i + TYPE_REL_CHUNK);
+      const relId = this.id();
+      const globalId = this.newGlobalId();
+      const refs = chunk.map(id => `#${id}`).join(',');
+      this.line(relId, 'IFCRELDEFINESBYTYPE',
+        `'${globalId}',#${this.ownerHistoryId},$,$,(${refs}),#${typeId}`);
+    }
+  }
+
+  /**
+   * Emit one occurrence of a type: the element tail only, with a placement of
+   * its own and a SHARED `IfcProductDefinitionShape`.
+   *
+   * Deliberately does NOT record the shape's solids in `elementSolids`: those
+   * solids belong to the type and are styled once by `setSolidColor`, so
+   * registering them per occurrence would emit N × M IfcStyledItems — worse
+   * than the per-product geometry this replaces.
+   */
+  addInstanceElement(storeyId: number, params: {
+    IfcType: string; Name?: string; Description?: string; ObjectType?: string; Tag?: string;
+    PredefinedType?: string; Placement: Placement3D; ProductShapeId: number;
+  }): number {
+    assertFinitePoint3({ Location: params.Placement.Location }, 'addInstanceElement');
+    const placementId = this.addLocalPlacement(this.getStoreyPlacement(storeyId), params.Placement);
+
+    const elementId = this.id();
+    const globalId = this.newGlobalId();
+    const name = params.Name ?? params.IfcType;
+    const ifcType = params.IfcType.toUpperCase();
+    const head = `'${globalId}',#${this.ownerHistoryId},'${esc(name)}',${optStr(params.Description)},`
+      + `${optStr(params.ObjectType)},#${placementId},#${params.ProductShapeId},${optStr(params.Tag)}`;
+    this.line(elementId, ifcType, NO_PREDEFINED_TYPES.has(ifcType)
+      ? head
+      : `${head}${this.ifc4Only(optEnum(params.PredefinedType ?? 'NOTDEFINED'))}`);
+
+    this.trackElement(storeyId, elementId);
+    this.entities.push({ expressId: elementId, type: params.IfcType, Name: name });
+    return elementId;
   }
 
   // ============================================================================

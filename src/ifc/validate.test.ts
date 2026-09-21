@@ -154,6 +154,32 @@ test('an empty relationship member list fails', () => {
   assert.ok(noRelating.errors.some(e => e.includes('IFCRELASSIGNSTOGROUP needs at least one element and a relating object')), noRelating.errors.join('\n'));
 });
 
+test('IfcRelDefinesByType is checked like the other member-list relationships', () => {
+  // RelatedObjects is the member set and RelatingType is the last attribute, so
+  // the existing rule fits the layout exactly.
+  const ok = validateStep(tinyValidFile([
+    "#23=IFCFURNITURETYPE('000000000000000000000F',#5,'Bed Queen',$,$,$,$,'FT-bed-queen','bed-queen',$,.BED.);",
+    "#24=IFCFURNISHINGELEMENT('000000000000000000000G',#5,'Bed Queen',$,'bed-queen',#10,$,'ARC-L01-FURN-001');",
+    "#25=IFCRELDEFINESBYTYPE('000000000000000000000H',#5,$,$,(#24),#23);",
+  ]));
+  assert.deepEqual(ok.errors, []);
+  assert.equal(ok.byType.IFCRELDEFINESBYTYPE, 1);
+
+  const empty = validateStep(tinyValidFile([
+    "#23=IFCFURNITURETYPE('000000000000000000000F',#5,'Bed Queen',$,$,$,$,'FT-bed-queen','bed-queen',$,.BED.);",
+    "#24=IFCRELDEFINESBYTYPE('000000000000000000000H',#5,$,$,(),#23);",
+  ]));
+  assert.equal(empty.ok, false);
+  assert.ok(empty.errors.some(e => e.includes('IFCRELDEFINESBYTYPE needs at least one element')), empty.errors.join('\n'));
+
+  const noType = validateStep(tinyValidFile([
+    "#23=IFCFURNISHINGELEMENT('000000000000000000000G',#5,'Bed Queen',$,'bed-queen',#10,$,'ARC-L01-FURN-001');",
+    "#24=IFCRELDEFINESBYTYPE('000000000000000000000H',#5,$,$,(#23),$);",
+  ]));
+  assert.equal(noType.ok, false);
+  assert.ok(noType.errors.some(e => e.includes('IFCRELDEFINESBYTYPE needs at least one element and a relating object')), noType.errors.join('\n'));
+});
+
 test('error reporting is capped', () => {
   const extra: string[] = [];
   for (let i = 0; i < 200; i++) extra.push(`#${1000 + i}=IFCDIRECTION((1.,0.,#${500000 + i}));`);

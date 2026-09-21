@@ -15,6 +15,14 @@
  *   standalone IfcDoor/IfcWindow plus a warning.
  * - `box.position` is the corner at the box's LOCAL origin; the box rotates about
  *   that corner (identical semantics to IfcFurnishingElement).
+ * - `instance.position` follows the same convention: it is the footprint min corner
+ *   BEFORE rotation, and the type's solids are authored in that same local frame.
+ *   Furniture is written as an `IfcMappedItem` of an `IfcFurnitureType` (or the
+ *   sanitary / appliance / proxy type) — see `./furniture-types.ts`. Three things
+ *   fall back to the `box` path: `schema: 'IFC2X3'` (its type entities have
+ *   different attributes), an unknown `typeId`, and `detail: 'low'` (which emits
+ *   `box` upstream). `instance.scale` is not honoured — the writer warns and uses
+ *   identity.
  * - `slab.profile` / `prism.profile` points are RELATIVE to `position`.
  * - A wall may either carry `geometry.openings` OR host `door-in-wall` /
  *   `window-in-wall` elements (which cut their own openings) — doing both cuts
@@ -35,7 +43,12 @@
  *   one IfcRelDefinesByProperties per 250 products. See {@link SharedSets}.
  * - The vendored creator caches the immutable geometry resources
  *   (IfcCartesianPoint, IfcDirection, IfcAxis2Placement2D/3D, parametric
- *   profiles), so repeated values cost one entity instead of thousands.
+ *   profiles, IfcPropertySingleValue, IfcLocalPlacement), so repeated values
+ *   cost one entity instead of thousands.
+ * - Furniture goes through a TYPE LIBRARY: each of the ~45 types is authored once
+ *   as 3–8 primitives and every occurrence is an IfcMappedItem sharing one
+ *   IfcProductDefinitionShape, which costs ~4 entities per item instead of ~6.6
+ *   for a single bounding box.
  * Neither changes what a reader sees: same products, same property values,
  * same colours, same containment and grouping. `opts.compact` (default on)
  * additionally trims the per-element metadata that cannot be shared.
@@ -45,6 +58,11 @@ import type {
   RectangularOpeningDef, StoreyDef, Vec2, Vec3,
 } from '../core/types.ts';
 import { createRng } from '../core/rng.ts';
+import { typeById } from '../core/furniture-3d.ts';
+import {
+  ensureFurnitureType, finalizeFurnitureTypes, newTypeLibrary, occurrenceEntity,
+  type TypeLibrary,
+} from './furniture-types.ts';
 import { IfcCreator } from './vendor/ifc-lite-create/ifc-creator.ts';
 import { generateIfcGuid } from './vendor/ifc-lite-create/guid.ts';
 import type {
@@ -434,6 +452,7 @@ export function writeIfc(model: DesignModel, opts: WriteIfcOptions = {}): IfcOut
 
   const idMap: Record<string, number> = {};
   const shared = newSharedSets();
+  const typeLib = newTypeLibrary();
 
   const writeOne = (element: ModelElement): void => {
     try {
@@ -451,7 +470,7 @@ export function writeIfc(model: DesignModel, opts: WriteIfcOptions = {}): IfcOut
       }
       const expressId = writeGeometry(
         creator, element, resolveStorey(element), idMap, wallGeometryById, schema,
-        shearArchWalls.has(element.id), warn,
+        shearArchWalls.has(element.id), typeLib, warn,
       );
       if (expressId === null) return;
       idMap[element.id] = expressId;
@@ -505,6 +524,11 @@ export function writeIfc(model: DesignModel, opts: WriteIfcOptions = {}): IfcOut
     }
   }
 
+  // ---- furniture types → occurrences ---------------------------------------
+  // Also written last (IfcRelDefinesByType is not idempotent), before the shared
+  // sets so the id order is fixed.
+  finalizeFurnitureTypes(creator, typeLib, warn);
+
   // ---- property / quantity sets, shared across products --------------------
   // Written last, once every product's expressId is known: one IfcPropertySet
   // per DISTINCT (name + properties) tuple, bound to all of its products.
@@ -541,6 +565,38 @@ export function writeIfc(model: DesignModel, opts: WriteIfcOptions = {}): IfcOut
 
 type Warn = (message: string) => void;
 
+/** The `box` geometry: one extruded rectangle. Also the `detail: 'low'`, IFC2X3 and
+ * unknown-type path for `instance`, which carries the same placed footprint. */
+function writeBox(
+  creator: IfcCreator,
+  element: ModelElement,
+  storeyId: number,
+  g: { position: Vec3; width: number; depth: number; height: number; rotation?: number },
+  schema: 'IFC2X3' | 'IFC4' | 'IFC4X3',
+  attrs: { Name: string; Description?: string; ObjectType?: string; Tag: string },
+): number {
+  const rotation = g.rotation ?? 0;
+  if (element.ifcType?.toUpperCase() === 'IFCFURNISHINGELEMENT') {
+    return creator.addIfcFurnishingElement(storeyId, {
+      ...attrs,
+      Position: g.position as Point3D,
+      Width: g.width,
+      Depth: g.depth,
+      Height: g.height,
+      Direction: rotation,
+    });
+  }
+  const { location, refDirection } = boxPlacement(g.position, g.width, g.depth, rotation);
+  return creator.addElement(storeyId, {
+    ...attrs,
+    IfcType: ifcTypeToken(element.ifcType, 'IFCBUILDINGELEMENTPROXY', schema),
+    Placement: { Location: location, RefDirection: refDirection },
+    Profile: { ProfileType: 'AREA', XDim: g.width, YDim: g.depth },
+    Depth: g.height,
+    PredefinedType: enumToken(element.predefinedType),
+  });
+}
+
 function writeGeometry(
   creator: IfcCreator,
   element: ModelElement,
@@ -549,6 +605,7 @@ function writeGeometry(
   wallGeometryById: Map<string, Extract<ElementGeometry, { kind: 'wall' }>>,
   schema: 'IFC2X3' | 'IFC4' | 'IFC4X3',
   isShearWall: boolean,
+  typeLib: TypeLibrary,
   warn: Warn,
 ): number | null {
   const g = element.geometry;
@@ -636,28 +693,42 @@ function writeGeometry(
         : creator.addIfcBeam(storeyId, params);
     }
 
-    case 'box': {
+    case 'box':
       if (!positive(g.width, g.depth, g.height)) return reject('box dimensions must be > 0');
-      const rotation = g.rotation ?? 0;
-      if (element.ifcType?.toUpperCase() === 'IFCFURNISHINGELEMENT') {
-        return creator.addIfcFurnishingElement(storeyId, {
-          ...attrs,
-          Position: g.position as Point3D,
-          Width: g.width,
-          Depth: g.depth,
-          Height: g.height,
-          Direction: rotation,
-        });
+      return writeBox(creator, element, storeyId, g, schema, attrs);
+
+    case 'instance': {
+      if (!positive(g.width, g.depth, g.height)) return reject('instance dimensions must be > 0');
+      // IFC2X3 has IfcRepresentationMap and IfcMappedItem, but its IfcFurnitureType
+      // carries AssemblyPlace instead of PredefinedType and the appliance/sanitary
+      // enums have different members. Forking four attribute lists for a
+      // compatibility escape hatch is not worth it: degrade to the box.
+      if (schema === 'IFC2X3') return writeBox(creator, element, storeyId, g, schema, attrs);
+      const def = typeById(g.typeId);
+      if (!def) {
+        warn(`writer: ${element.id} (instance): unknown furniture type '${g.typeId}' — written as a box`);
+        return writeBox(creator, element, storeyId, g, schema, attrs);
       }
-      const { location, refDirection } = boxPlacement(g.position, g.width, g.depth, rotation);
-      return creator.addElement(storeyId, {
+      if (g.scale && (g.scale[0] !== 1 || g.scale[1] !== 1 || g.scale[2] !== 1)) {
+        warn(`writer: ${element.id} (instance): non-identity scale is not supported — using identity`);
+      }
+      const entry = ensureFurnitureType(creator, typeLib, def);
+      const rotation = g.rotation ?? 0;
+      // The type's solids are authored at its own origin, so position AND rotation
+      // live here — which is what lets every occurrence share one product shape and
+      // the one identity transformation operator.
+      const expressId = creator.addInstanceElement(storeyId, {
         ...attrs,
-        IfcType: ifcTypeToken(element.ifcType, 'IFCBUILDINGELEMENTPROXY', schema),
-        Placement: { Location: location, RefDirection: refDirection },
-        Profile: { ProfileType: 'AREA', XDim: g.width, YDim: g.depth },
-        Depth: g.height,
-        PredefinedType: enumToken(element.predefinedType),
+        IfcType: occurrenceEntity(def),
+        PredefinedType: enumToken(element.predefinedType) ?? enumToken(def.predefinedType),
+        Placement: {
+          Location: g.position as Point3D,
+          RefDirection: rotation !== 0 ? [Math.cos(rotation), Math.sin(rotation), 0] : undefined,
+        },
+        ProductShapeId: entry.prodShapeId,
       });
+      entry.occurrences.push(expressId);
+      return expressId;
     }
 
     case 'prism': {
@@ -966,7 +1037,10 @@ function collectDefinitions(
   shared: SharedSets,
   warn: Warn,
 ): void {
-  if (element.color) {
+  // A mapped-item occurrence owns no solids: the colours live on the TYPE's solids
+  // (per primitive, so a bed's frame, mattress and pillows differ), and an
+  // element-level colour here would style nothing while adding entities.
+  if (element.color && element.geometry.kind !== 'instance') {
     const rgb = element.color.map(c => Math.min(Math.max(Number.isFinite(c) ? c : 0.5, 0), 1)) as [number, number, number];
     creator.setColor(expressId, styleName(element), rgb);
   }

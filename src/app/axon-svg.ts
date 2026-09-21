@@ -140,7 +140,8 @@ function zOf(el: ModelElement): number {
   const g = el.geometry;
   switch (g.kind) {
     case 'wall': return g.start[2] ?? 0;
-    case 'slab': case 'prism': case 'column': case 'box': case 'roof': case 'gable-roof': case 'ramp':
+    case 'slab': case 'prism': case 'column': case 'box': case 'instance':
+    case 'roof': case 'gable-roof': case 'ramp':
       return g.position[2] ?? 0;
     case 'beam': case 'axis': case 'railing': return g.start[2] ?? 0;
     case 'footing': return (g.position[2] ?? 0) - g.height;
@@ -157,6 +158,9 @@ function heightOf(el: ModelElement): number | null {
     case 'slab': return g.thickness;
     case 'column': return g.height;
     case 'box': return g.height;
+    // A mapped-item occurrence draws as the extruded footprint prism: the right
+    // silhouette at one prism per item, rather than 3-8 in a 2400-item budget.
+    case 'instance': return g.height;
     case 'prism': return g.height;
     case 'beam': return g.height;
     case 'roof': case 'gable-roof': return g.thickness;
@@ -176,6 +180,6 @@ function prio(el: ModelElement): number {
   if (el.geometry.kind === 'column') return 2;
   if (el.discipline === 'site') return 3;
   if (el.geometry.kind === 'beam') return 4;
-  if (el.geometry.kind === 'box') return 6;
+  if (el.geometry.kind === 'box' || el.geometry.kind === 'instance') return 6;
   return 5;
 }
