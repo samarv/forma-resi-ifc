@@ -32,40 +32,50 @@
  * it centres the rectangle profile on the placement). Width = X extent, height = Y extent.
  */
 import type {
-  FloorPlan, FootprintShape, FoundationElement, FoundationType, GenContext,
+  BalconyDef, FloorPlan, FootprintShape, FoundationElement, FoundationType, GenContext,
   GridLine, ModelElement, PatternApplication, Polygon, PropertySetDef, QuantitySetDef, Rect,
   RectangularOpeningDef, StairDef, StoreyDef, StructBeam, StructColumn, StructModel,
   StructSlab, StructWall, StructuralSystemId, Vec2, Vec3, WallDef,
 } from '../../core/types.ts';
+import type { Box3, ElementKind } from '../../core/kernel/types.ts';
+import type { Ledger, RuleSet } from '../../core/rules/types.ts';
 import {
   dist, inset, offsetPolygon, pointInPolygon, polygonArea, polygonBounds, rectArea, rectCenter,
   rectIntersection, rectToPolygon, rectUnionBounds, relativeTo, round,
 } from '../../core/geometry.ts';
 import { IdFactory, FOUNDATION_STOREY, ROOF_STOREY, storeyIdFor } from '../../core/ids.ts';
-import { SIZES } from '../../core/coordination.ts';
-import { foundationFor, structuralSystemFor } from '../../core/typologies.ts';
+import { buildGrid, insideAnyRect, tributaryExtent, type GridPlan } from './grid.ts';
+import { collectingLedger, passthroughRuleSet } from './fallbacks.ts';
+import { checkLoadPath, loadPathBases } from './loadpath.ts';
+import { presizeStructure, type StructuralPresize } from './presize.ts';
+import { createProfileBook } from './profiles-seam.ts';
 import {
-  buildGrid, insideAnyRect, snapToWalls, snapWallsOf, tributaryExtent, type GridPlan, type SnapWall,
-} from './grid.ts';
-import {
-  CARBON, COLORS, FOUNDATION_RULES, GRID_RULES, LINTEL, LIVE_CORRIDOR_KPA, MATERIALS,
+  CARBON, COLORS, FOUNDATION_RULES, LINTEL, MATERIALS,
   RC_KGCO2E_PER_M3, STEEL_KG_PER_M2, TIMBER_RIM, TRANSFER, beamSection, bearingWallMaterialFor,
   columnMaterialFor, columnSection, columnSide, floorPlateMaterialFor, foundationIndex,
-  frameColor, isBearingWallSystem, isFrameSystem, isHybridPodiumSystem, loadsFor, materialFor,
+  frameColor, isBearingWallSystem, isFrameSystem, isHybridPodiumSystem, materialFor,
   padSide, sizesFor, slabSection, systemIndex, timberIntensity,
   type FrameMaterial, type Loads, type Sizes, type WallMaterial,
 } from './sizing.ts';
 
 export { STRUCT_PATTERNS } from './patterns.ts';
+export { checkLoadPath, loadPathBases } from './loadpath.ts';
+
+/**
+ * Every MEP kind that may not enter a structural member or a lift hoistway. Registered as the `bans` of the
+ * structure keep-outs so `kernel.validate` reports a penetration instead of a silent clash.
+ * *No designed openings exist in this model: sleeves go through slabs and non-structural walls only.*
+ */
+const MEP_KINDS: readonly ElementKind[] = [
+  'duct', 'duct-fitting', 'air-terminal', 'fan', 'ahu', 'jet-fan',
+  'waste', 'vent', 'storm', 'trench-drain', 'dcw', 'dhw', 'hwr', 'gas',
+  'sprinkler-main', 'sprinkler-branch', 'sprinkler-head', 'standpipe',
+  'tray-power', 'tray-data', 'conduit', 'busduct', 'panel', 'switchgear',
+  'light', 'sensor', 'ev-charger', 'pump', 'tank', 'sump', 'ejector', 'plinth',
+];
 
 /** How a storey is framed: RC/steel column frame, or load-bearing walls */
 type StoreyMode = 'frame-rc' | 'frame-steel' | 'bearing';
-
-/**
- * Shortest wall for which `WallDef.loadBearingHint` is taken up as a real bearing wall. Below
- * this an internal wall is a stub partition, not a line of support (STR-09 timber span band).
- */
-const MIN_HINTED_BEARING_LENGTH = 3.0;
 
 export function generateStructure(ctx: GenContext): StructModel {
   const ids = new IdFactory('structure');
@@ -75,6 +85,25 @@ export function generateStructure(ctx: GenContext): StructModel {
   const elements: ModelElement[] = [];
   const apps: PatternApplication[] = [];
   const warn = (m: string): void => { ctx.warnings.push(`[structure] ${m}`); };
+
+  // ---------------------------------------------------------------- rules, issues, pre-sizing
+  // `ctx.rules` / `ctx.issues` / `ctx.presize` are optional until the pipeline threads them (step 7 makes them
+  // required). Without a rule set every `rules.num(id, fallback)` keeps today's constant; without a ledger the
+  // issues are collected locally so nothing is lost and no new warning string is invented.
+  const rules: RuleSet = ctx.rules ?? passthroughRuleSet();
+  const ledger: Ledger = ctx.issues ?? collectingLedger();
+  // The pipeline owns the pre-sizing (it runs BEFORE architecture and publishes `storeysResolved`). When it has
+  // not been wired yet, structure runs the same pure function itself against a throwaway ledger, so slab, beam,
+  // core-wall and transfer numbers still have exactly one owner. Geometry always follows `ctx.storeys`.
+  const presize: StructuralPresize = ctx.presize ?? presizeStructure({
+    spec,
+    typology: ctx.typology,
+    site: ctx.site,
+    storeys: ctx.storeys,
+    profiles: createProfileBook(rules),
+    rules,
+    ledger: collectingLedger(),
+  });
 
   // ---------------------------------------------------------------- storeys
   const byId = new Map<string, StoreyDef>(ctx.storeys.map(s => [s.id, s]));
@@ -88,16 +117,16 @@ export function generateStructure(ctx: GenContext): StructModel {
   const lowestStorey = framedStoreys[0] ?? topStorey;
   const orderIndex = new Map<string, number>(framedStoreys.map((s, i) => [s.id, i]));
 
-  // ---------------------------------------------------------------- system
-  const system: StructuralSystemId = structuralSystemFor(ctx.typology, storeyCount);
+  // ---------------------------------------------------------------- system (all from the pre-sizing)
+  const system: StructuralSystemId = presize.system;
   const parkingType = spec.site.parking?.type ?? ctx.typology.parking;
-  const foundation: FoundationType = foundationFor(system, storeyCount, parkingType);
-  let podiumStoreys = spec.massing.podiumStoreys ?? 0;
-  if (isHybridPodiumSystem(system) && podiumStoreys < 1) podiumStoreys = 1;
-  podiumStoreys = Math.min(podiumStoreys, Math.max(0, storeyCount - 1));
-  const transferStorey = podiumStoreys > 0 ? storeyIdFor(podiumStoreys) : undefined;
-  const podiumTopStoreyId = podiumStoreys > 0 ? storeyIdFor(podiumStoreys - 1) : undefined;
-  const loads: Loads = loadsFor(system);
+  const foundation: FoundationType = presize.foundation;
+  const podiumStoreys = presize.podiumStoreys;
+  // ONE owner for the transfer level: its FLOOR slab is the transfer slab, and the storey BELOW it carries the
+  // transfer zone. v1 had architecture thicken `index + 1 === podiumStoreys` and structure `storeyIdFor(podium)`.
+  const transferStorey = presize.transferStorey ?? undefined;
+  const podiumTopStoreyId = presize.transferBelowStorey ?? undefined;
+  const loads: Loads = presize.loads;
 
   const modeOf = (s: StoreyDef): StoreyMode => {
     if (system === 'steel-frame') return 'frame-steel';
@@ -150,22 +179,13 @@ export function generateStructure(ctx: GenContext): StructModel {
     const list = wallsByStorey.get(w.storey);
     if (list) list.push(w); else wallsByStorey.set(w.storey, [w]);
   }
-  const snapCache = new Map<string, SnapWall[]>();
-  const snapsFor = (storeyId: string): SnapWall[] => {
-    let s = snapCache.get(storeyId);
-    if (!s) {
-      s = snapWallsOf(wallsByStorey.get(storeyId) ?? [], ['exterior', 'party', 'corridor', 'core']);
-      snapCache.set(storeyId, s);
-    }
-    return s;
-  };
-
   // ---------------------------------------------------------------- grid
   const bars = ctx.site?.massing?.bars ?? [];
   const typicalBounds = polygonBounds(outlineOf(typicalStorey.id));
   const longAxis: 'x' | 'y' = bars.length > 0 ? bars[0].axis : (typicalBounds.w >= typicalBounds.h ? 'x' : 'y');
   const shape: FootprintShape = spec.massing.footprintShape ?? ctx.typology.footprintShapes[0];
   const podiumOutline = podiumStoreys > 0 ? outlineOf(storeyIdFor(0)) : (basements.length > 0 ? outlineOf(lowestStorey.id) : null);
+  const exteriorWallT = presize.exteriorWallT;
   const grid: GridPlan = buildGrid({
     typicalOutline: outlineOf(typicalStorey.id),
     podiumOutline,
@@ -173,39 +193,67 @@ export function generateStructure(ctx: GenContext): StructModel {
     shape,
     walls: wallsByStorey.get(typicalStorey.id) ?? [],
     cores: arch?.cores ?? [],
-    exteriorWallT: SIZES.exteriorWallT,
+    exteriorWallT,
     includeParkingGrid: podiumStoreys > 0 || basements.length > 0 || aboveGrade.some(s => s.use === 'parking'),
+    partyLines: arch?.partyLines,
     namer: label => ids.named('GRID', label),
   });
   const gridLines: GridLine[] = grid.lines;
 
   const maxTribX = Math.max(...grid.mainX.map((_, i) => tributaryExtent(grid.mainX, i)), 3);
   const maxTribY = Math.max(...grid.mainY.map((_, i) => tributaryExtent(grid.mainY, i)), 3);
-  const sizes: Sizes = sizesFor(system, storeyCount, maxTribX * maxTribY, loads);
+  // Column and beam WIDTHS still come from the real grid (it is finer than the pre-sizing's proposal); slab,
+  // beam depth and shear-wall thickness are the pre-sizing's to own, because other disciplines read them.
+  const sizes: Sizes = {
+    ...sizesFor(system, storeyCount, maxTribX * maxTribY, loads),
+    slabT: presize.sizes.slabT,
+    beamD: presize.sizes.beamD,
+    shearWallT: presize.shearWallT,
+  };
 
-  // ---------------------------------------------------------------- slab thickness per storey
+  // ---------------------------------------------------------------- slab thickness per storey (from the pre-sizing)
   const usesRaft = foundation === 'raft';
-  const groundSlabT = Math.max(sizes.slabT, basements.length > 0 || lowestStorey.use === 'parking' ? 0.3 : 0.25);
+  const sizingOf = (storeyId: string): { slabTOwn: number; slabTAbove: number } | null => presize.byStorey.get(storeyId) ?? null;
   const slabTOf = (storeyId: string): number => {
-    if (transferStorey && storeyId === transferStorey) return TRANSFER.slabT;
-    if (storeyId === lowestStorey.id) return groundSlabT;
+    const s = sizingOf(storeyId);
+    if (s) return s.slabTOwn;
+    if (transferStorey && storeyId === transferStorey) return presize.transferSlabT;
     return sizes.slabT;
   };
+  const groundSlabT = slabTOf(lowestStorey.id);
   const storeyAbove = (storeyId: string): StoreyDef | null => {
     const i = orderIndex.get(storeyId);
     if (i === undefined) return null;
     return i + 1 < framedStoreys.length ? framedStoreys[i + 1] : roofStorey;
   };
   const thicknessAbove = (storeyId: string): number => {
+    const s = sizingOf(storeyId);
+    if (s) return s.slabTAbove;
     const a = storeyAbove(storeyId);
     if (!a || a.id === ROOF_STOREY) return sizes.slabT;
     return slabTOf(a.id);
   };
 
-  // Coordination check on the typical floor only (that is the one that sets ceiling heights)
-  const typicalPlan = planByStorey.get(typicalStorey.id);
-  if (typicalPlan && typicalPlan.slabThickness > 0 && Math.abs(typicalPlan.slabThickness - slabTOf(typicalStorey.id)) > 0.02) {
-    warn(`arch.floors[${typicalStorey.id}].slabThickness ${typicalPlan.slabThickness.toFixed(3)} differs from the structural slab ${slabTOf(typicalStorey.id).toFixed(3)} — structure is authoritative; architecture should adopt ${slabTOf(typicalStorey.id).toFixed(3)} for ceiling heights.`);
+  // One owner, so this can only fire while architecture still computes its own slab (deviation, not a warning:
+  // it becomes unreachable the moment architecture reads `ctx.presize.byStorey[...].slabTAbove`).
+  // `FloorPlan.slabThickness` is the slab ABOVE the storey — it is what architecture subtracts from the
+  // floor-to-floor to get its wall height and ceiling, so it must equal `slabTAbove`, not the storey's own slab.
+  for (const s of framedStoreys) {
+    const plan = planByStorey.get(s.id);
+    const want = thicknessAbove(s.id);
+    if (!plan || plan.slabThickness <= 0 || Math.abs(plan.slabThickness - want) <= 0.02) continue;
+    const added = ledger.addOnce(`STR-09.slabThickness:${s.id}`, {
+      severity: 'deviation',
+      ruleId: 'STR-09.slabThickness',
+      discipline: 'structure',
+      storey: s.id,
+      message: `arch.floors[${s.id}].slabThickness ${plan.slabThickness.toFixed(3)} differs from the pre-sized slab above it ${want.toFixed(3)} — the pre-sizing is the single owner; architecture should read presize.byStorey.get('${s.id}').slabTAbove.`,
+      observed: round(plan.slabThickness, 3),
+      limit: round(want, 3),
+      source: 'presize / STR-09',
+      resolution: { id: 'none', note: 'structure uses the pre-sized thickness; architecture ceiling heights stay 0.05 m out until it adopts it' },
+    });
+    if (added) break; // one issue per run, not one per storey
   }
 
   // ---------------------------------------------------------------- openings (STR-07)
@@ -403,13 +451,27 @@ export function generateStructure(ctx: GenContext): StructModel {
     return false;
   };
 
+  /**
+   * STR-C1 by construction. A parking storey runs on the 8.4 / 16.8 module and the storey above runs on the
+   * party-wall grid; that jump is only legal across a TRANSFER level. A basement under a residential frame with
+   * no podium (uk-mansion, ie-courtyard) therefore has to carry BOTH sets of lines, or every column on the
+   * ground floor lands on a slab with nothing underneath — which is exactly what v1 produced, unreported.
+   */
+  const gridKindOf = (s: StoreyDef): 'park' | 'main' => (isPodiumStorey(s) ? 'park' : 'main');
+  const carriesGridAbove = (s: StoreyDef): boolean => {
+    const a = storeyAbove(s.id);
+    if (!a || a.id === ROOF_STOREY) return false;
+    if (transferStorey !== undefined && a.id === transferStorey) return false; // the transfer level makes the jump
+    return gridKindOf(a) !== gridKindOf(s);
+  };
   for (const s of framedStoreys) {
     if (!columnsOnStorey(s)) continue;
-    const parking = isPodiumStorey(s);
+    // A parking storey that has to carry the frame above WITHOUT a transfer level cannot run on the parking
+    // module at all: it has to be the same grid, or nothing lands on anything.
+    const parking = isPodiumStorey(s) && !carriesGridAbove(s);
     const xs = parking ? grid.parkX : grid.mainX;
     const ys = parking ? grid.parkY : grid.mainY;
     const outline = outlineOf(s.id);
-    const snaps = snapsFor(s.id);
     const blockers = blockerRects(s.id);
     const height = round(s.height - thicknessAbove(s.id), 4);
     const storeysAbove = Math.max(1, topStorey.index - s.index + 1);
@@ -417,20 +479,21 @@ export function generateStructure(ctx: GenContext): StructModel {
     const seen = new Set<string>();
     for (let i = 0; i < xs.length; i++) {
       for (let j = 0; j < ys.length; j++) {
-        const raw: Vec2 = [xs[i], ys[j]];
-        if (insideAnyRect(raw, blockers)) { droppedInCores++; continue; }
-        const snapped = snapToWalls(raw, snaps);
-        const p = snapped.p;
+        // ONE grid for the whole building: the intersection is used as-is on every storey. STR-03 is satisfied
+        // by the grid itself (its transverse lines ARE wall centrelines), not by a per-storey snap that used to
+        // move the same column by up to 0.6 m between levels.
+        const p: Vec2 = [xs[i], ys[j]];
         if (insideAnyRect(p, blockers)) { droppedInCores++; continue; }
         if (!pointInPolygon(p, outline)) continue;
         const key = `${round(p[0], 2)}:${round(p[1], 2)}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        if (snapped.snapped) snapCount++;
+        const onWall = grid.isWallLine('x', p[0]) && grid.isWallLine('y', p[1]);
+        if (onWall) snapCount++;
         const tributary = round(tributaryExtent(xs, i) * tributaryExtent(ys, j), 3);
         maxTributary = Math.max(maxTributary, tributary);
         const side = columnSide(colMaterial, storeysAbove, tributary, loads);
-        const gridRef = grid.ref(raw[0], raw[1]);
+        const gridRef = grid.ref(p[0], p[1]);
         const col: StructColumn = {
           id: ids.next(s.id, 'COL'),
           storey: s.id,
@@ -463,7 +526,7 @@ export function generateStructure(ctx: GenContext): StructModel {
             formaStructure(system, materialFor(colMaterial).name, section, tributary, gridRef, {
               StoreysAbove: storeysAbove,
               AxialLoadKn: round(storeysAbove * (loads.deadKpa + loads.liveKpa) * tributary, 1),
-              SnappedToWall: snapped.snapped,
+              OnWallCentreline: onWall,
             }),
           ],
           quantities: [qset('Qto_ColumnBaseQuantities', [
@@ -493,7 +556,11 @@ export function generateStructure(ctx: GenContext): StructModel {
     });
   };
   const bearingMaterial: WallMaterial = bearingWallMaterialFor(system);
-  let designThicknessWarned = false;
+  /**
+   * Shortest wall for which `WallDef.loadBearingHint` is taken up as a real bearing wall. Below this an internal
+   * wall is a stub partition, not a line of support (STR-09 timber span band).
+   */
+  const minHintedBearingLength = rules.num('STR-09.minHintedBearingLength', 3.0);
 
   for (const w of arch?.walls ?? []) {
     const s = byId.get(w.storey);
@@ -510,7 +577,7 @@ export function generateStructure(ctx: GenContext): StructModel {
     } else if (mode === 'bearing' && (w.type === 'exterior' || w.type === 'party' || w.type === 'corridor')) {
       role = 'bearing';
       material = bearingMaterial;
-    } else if (mode === 'bearing' && w.loadBearingHint && dist(w.start, w.end) >= MIN_HINTED_BEARING_LENGTH
+    } else if (mode === 'bearing' && w.loadBearingHint && dist(w.start, w.end) >= minHintedBearingLength
       && (w.type === 'partition' || w.type === 'wet')) {
       // Architecture's hint, taken up where it is structurally credible: an internal spine wall
       // long enough to halve the joist span really does carry floor (WallDef.loadBearingHint —
@@ -527,10 +594,8 @@ export function generateStructure(ctx: GenContext): StructModel {
       material = 'concrete';
     }
     if (!role) continue;
-    if ((role === 'core' || role === 'shear') && w.thickness < sizes.shearWallT - 0.001 && !designThicknessWarned) {
-      designThicknessWarned = true;
-      warn(`shear/core walls from architecture are ${round(w.thickness, 3)} m thick; STR-05 wants ${sizes.shearWallT} m for this height — architecture should thicken core walls (SIZES.coreWallT) or the writer must note the deviation.`);
-    }
+    // No core/shear-wall thickness warning any more: `presize.coreWallT` IS the number architecture builds to
+    // (0.25 m for a low-rise fire enclosure, 0.30 m once the core is the shear spine — ACI 318-19 §18.10.2.1).
     const sw: StructWall = {
       id: ids.next(w.storey, role === 'core' ? 'CORWALL' : role === 'shear' ? 'SHRWALL' : role === 'foundation' ? 'RETWALL' : 'BRGWALL'),
       storey: w.storey,
@@ -658,6 +723,26 @@ export function generateStructure(ctx: GenContext): StructModel {
     });
   };
 
+  /**
+   * STR-C4. The slab of storey k+1 is carried by storey k's structure, so wherever the plate ABOVE reaches past
+   * this storey's own plate edge (a deeper basement under a shallower ground floor, a podium under a tower) its
+   * edge needs a beam here. v1 only ever ringed the storey's own outline, so the ground-floor plate's rear edge
+   * over a deeper basement cantilevered as far as the plan happened to reach.
+   */
+  const edgeBeamsUnderPlateAbove = (s: StoreyDef, zTop: number, material: FrameMaterial): void => {
+    const a = storeyAbove(s.id);
+    if (!a || a.id === ROOF_STOREY) return;
+    const ab = polygonBounds(outlineOf(a.id));
+    const ob = polygonBounds(outlineOf(s.id));
+    const differs = Math.abs(ab.x - ob.x) > 0.5 || Math.abs(ab.y - ob.y) > 0.5
+      || Math.abs(ab.w - ob.w) > 0.5 || Math.abs(ab.h - ob.h) > 0.5;
+    if (!differs) return;
+    const ring = offsetPolygon(outlineOf(a.id), exteriorWallT / 2);
+    for (let i = 0; i < ring.length; i++) {
+      pushBeam(s.id, ring[i], ring[(i + 1) % ring.length], sizes.beamW, sizes.beamD, material, 'rim', zTop - sizes.beamD, `edge of the ${a.id} plate`);
+    }
+  };
+
   for (const s of framedStoreys) {
     const mode = modeOf(s);
     const outline = outlineOf(s.id);
@@ -665,31 +750,93 @@ export function generateStructure(ctx: GenContext): StructModel {
     const isPodiumTop = podiumTopStoreyId === s.id && transferStorey !== undefined;
 
     if (isPodiumTop) {
-      // STR-04: transfer beams on the residential grid, under the thickened transfer slab.
-      // They only need to reach as far as the structure they pick up, i.e. the plate above.
-      const zUnder = s.height - TRANSFER.slabT - TRANSFER.beamD;
+      // STR-04, corrected: a transfer beam is only a transfer beam if BOTH ends land on something. v1 laid them
+      // on the residential grid across the whole plate, so a beam could hang between two points in mid-air.
+      // The grillage is built in two levels instead:
+      //   primary   — between CONSECUTIVE PODIUM COLUMNS on each podium grid line;
+      //   secondary — under each residential line that carries load above, ending on the primaries it crosses.
+      const zUnder = s.height - presize.transferSlabT - presize.transferBeamD;
+      const beamW = rules.num('STR-04.transferBeamWidth', TRANSFER.beamW);
+      const podiumCols = columnsByStorey.get(s.id) ?? [];
+      interface TransferLine { a: Vec2; b: Vec2; constAxis: 'x' | 'y'; at: number }
+      const primaries: TransferLine[] = [];
+      const colsOnLine = (axis: 'x' | 'y', at: number): StructColumn[] => podiumCols
+        .filter(c => Math.abs(c.position[axis === 'x' ? 0 : 1] - at) < 0.3)
+        .sort((p, q) => p.position[axis === 'x' ? 1 : 0] - q.position[axis === 'x' ? 1 : 0]);
+      for (const px of grid.parkX) {
+        const on = colsOnLine('x', px);
+        for (let k = 0; k + 1 < on.length; k++) primaries.push({ a: on[k].position, b: on[k + 1].position, constAxis: 'x', at: px });
+      }
+      for (const py of grid.parkY) {
+        const on = colsOnLine('y', py);
+        for (let k = 0; k + 1 < on.length; k++) primaries.push({ a: on[k].position, b: on[k + 1].position, constAxis: 'y', at: py });
+      }
+      for (const pr of primaries) {
+        pushBeam(s.id, pr.a, pr.b, beamW, presize.transferBeamD, 'concrete', 'transfer', zUnder,
+          `${grid.label(pr.constAxis, pr.at)} (podium column line)`);
+      }
+      // Secondary lines: where the load above actually is. Ends must sit on a primary that spans across them.
+      const emitted: { constAxis: 'x' | 'y'; at: number }[] = [];
+      const secondary = (constAxis: 'x' | 'y', at: number): void => {
+        if (primaries.some(pr => pr.constAxis === constAxis && Math.abs(pr.at - at) < 0.3)) return;
+        if (emitted.some(pr => pr.constAxis === constAxis && Math.abs(pr.at - at) < 0.3)) return;
+        emitted.push({ constAxis, at });
+        const crossAxis: 'x' | 'y' = constAxis === 'x' ? 'y' : 'x';
+        const i = constAxis === 'x' ? 0 : 1;
+        const ends = primaries
+          .filter(pr => pr.constAxis === crossAxis && Math.min(pr.a[i], pr.b[i]) - 0.15 <= at && at <= Math.max(pr.a[i], pr.b[i]) + 0.15)
+          .map(pr => pr.at)
+          .sort((p, q) => p - q);
+        if (ends.length < 2) return;
+        const lo = ends[0];
+        const hi = ends[ends.length - 1];
+        const a: Vec2 = constAxis === 'x' ? [at, lo] : [lo, at];
+        const b: Vec2 = constAxis === 'x' ? [at, hi] : [hi, at];
+        pushBeam(s.id, a, b, beamW, presize.transferBeamD, 'concrete', 'transfer', zUnder,
+          `${grid.label(constAxis, at)} (carries the plate above)`);
+      };
       const above = polygonBounds(outlineOf(transferStorey!));
-      const b = rectIntersection(polygonBounds(outline), above) ?? above;
+      const plate = rectIntersection(polygonBounds(outline), above) ?? above;
       for (const x of grid.mainX) {
-        if (x < b.x - 0.01 || x > b.x + b.w + 0.01) continue;
-        pushBeam(s.id, [x, b.y + SIZES.exteriorWallT / 2], [x, b.y + b.h - SIZES.exteriorWallT / 2], TRANSFER.beamW, TRANSFER.beamD, 'concrete', 'transfer', zUnder, `${grid.label('x', x)}`);
+        if (x < plate.x - 0.01 || x > plate.x + plate.w + 0.01) continue;
+        secondary('x', x);
       }
       for (const y of grid.mainY) {
-        if (y < b.y - 0.01 || y > b.y + b.h + 0.01) continue;
-        pushBeam(s.id, [b.x + SIZES.exteriorWallT / 2, y], [b.x + b.w - SIZES.exteriorWallT / 2, y], TRANSFER.beamW, TRANSFER.beamD, 'concrete', 'transfer', zUnder, `${grid.label('y', y)}`);
+        if (y < plate.y - 0.01 || y > plate.y + plate.h + 0.01) continue;
+        secondary('y', y);
       }
+      // A transfer level carries whatever bears on it, and on a bearing-wall system above a podium that is not
+      // the grid but the WALL LINES of the storey above (including internal spine walls taken up from
+      // `loadBearingHint`). Each distinct line gets a beam that ends on the primaries it crosses.
+      const carriedLines: { constAxis: 'x' | 'y'; at: number }[] = [];
+      for (const w of walls) {
+        if (w.storey !== transferStorey) continue;
+        if (w.role !== 'bearing' && w.role !== 'core' && w.role !== 'shear') continue;
+        if (dist(w.start, w.end) < 1.0) continue;
+        const dx = Math.abs(w.end[0] - w.start[0]);
+        const dy = Math.abs(w.end[1] - w.start[1]);
+        const constAxis: 'x' | 'y' | null = dy < 1e-3 ? 'y' : dx < 1e-3 ? 'x' : null;
+        if (constAxis === null) continue;
+        const at = round(constAxis === 'x' ? w.start[0] : w.start[1], 3);
+        if (carriedLines.some(l => l.constAxis === constAxis && Math.abs(l.at - at) < 0.3)) continue;
+        carriedLines.push({ constAxis, at });
+      }
+      carriedLines.sort((a, b) => (a.constAxis === b.constAxis ? a.at - b.at : a.constAxis < b.constAxis ? -1 : 1));
+      for (const l of carriedLines) secondary(l.constAxis, l.at);
       apps.push({
         patternId: 'STR-04',
         storey: transferStorey,
         elementIds: beams.filter(x => x.role === 'transfer').map(x => x.id),
         params: {
           podiumStoreys,
-          transferSlabThickness: TRANSFER.slabT,
-          transferBeam: `${TRANSFER.beamW}x${TRANSFER.beamD}`,
-          parkingModuleAlong: TRANSFER.moduleAlong,
+          transferSlabThickness: presize.transferSlabT,
+          transferBeam: `${beamW}x${presize.transferBeamD}`,
+          transferZoneDepth: presize.transferZoneDepth,
+          parkingModuleAlong: presize.gridProposal.parkingModule.along,
           podiumGridLines: grid.parkX.length * grid.parkY.length,
+          primaryTransferBeams: primaries.length,
         },
-        note: `Podium storeys 0..${podiumStoreys - 1} on the parking module; dwellings above on the party-wall grid; transfer level at ${transferStorey}.`,
+        note: `Podium storeys 0..${podiumStoreys - 1} on the parking module; dwellings above on the party-wall grid; transfer level at ${transferStorey}. Primary beams run column to column; secondary beams under the residential lines end on the primaries.`,
       });
       continue;
     }
@@ -697,20 +844,21 @@ export function generateStructure(ctx: GenContext): StructModel {
     if (mode === 'frame-rc') {
       // Flat slab: rim/edge beams at the slab edges only — the perimeter, and the courtyard
       // edge, which is just as much a slab edge
-      const ring = offsetPolygon(outline, SIZES.exteriorWallT / 2);
+      const ring = offsetPolygon(outline, exteriorWallT / 2);
       for (let i = 0; i < ring.length; i++) {
         pushBeam(s.id, ring[i], ring[(i + 1) % ring.length], sizes.beamW, sizes.beamD, 'concrete', 'rim', zTop - sizes.beamD, 'perimeter');
       }
       if (courtyardOn(s.id) && courtyardRect) {
-        const cy = offsetPolygon(rectToPolygon(courtyardRect), -SIZES.exteriorWallT / 2);
+        const cy = offsetPolygon(rectToPolygon(courtyardRect), -exteriorWallT / 2);
         for (let i = 0; i < cy.length; i++) {
           pushBeam(s.id, cy[i], cy[(i + 1) % cy.length], sizes.beamW, sizes.beamD, 'concrete', 'rim', zTop - sizes.beamD, 'courtyard');
         }
       }
+      edgeBeamsUnderPlateAbove(s, zTop, 'concrete');
     } else if (mode === 'frame-steel') {
       const cols = columnsByStorey.get(s.id) ?? [];
       const at = new Set(cols.map(c => `${round(c.position[0], 2)}:${round(c.position[1], 2)}`));
-      const parking = isPodiumStorey(s);
+      const parking = isPodiumStorey(s) && !carriesGridAbove(s);
       const xs = parking ? grid.parkX : grid.mainX;
       const ys = parking ? grid.parkY : grid.mainY;
       for (const x of xs) {
@@ -741,6 +889,7 @@ export function generateStructure(ctx: GenContext): StructModel {
           }
         }
       }
+      edgeBeamsUnderPlateAbove(s, zTop, 'steel');
     } else {
       // Bearing walls: rim beam on top of each bearing wall, plus headers over wide openings.
       // Platform frame gets an LVL rim board; CLT gets a glulam edge beam; masonry gets a
@@ -878,14 +1027,27 @@ export function generateStructure(ctx: GenContext): StructModel {
     });
   };
 
-  const lowestColumns = columnsByStorey.get(lowestStorey.id) ?? [];
-  const lowestWalls = walls.filter(w => w.storey === lowestStorey.id && (w.role === 'bearing' || w.role === 'core' || w.role === 'shear'));
+  // STR-C2: the things to found are the LOWEST supports on each vertical line, from the load-path walk — not
+  // "the columns and walls of the lowest storey". A column that only exists on L02, or a core that starts in a
+  // basement the lowest plate does not reach, used to get no footing at all.
+  const bases = loadPathBases({
+    storeysAscending: framedStoreys,
+    columns,
+    walls,
+    beams,
+    rules,
+  });
+  const baseColumnIds = new Set(bases.filter(b => b.kind === 'column').map(b => b.id));
+  const baseWallIds = new Set(bases.filter(b => b.kind === 'wall').map(b => b.id));
+  const columnById = new Map<string, StructColumn>(columns.map(c => [c.id, c]));
+  const lowestColumns = [...baseColumnIds].map(id => columnById.get(id)).filter((c): c is StructColumn => c !== undefined);
+  const lowestWalls = walls.filter(w => baseWallIds.has(w.id) && (w.role === 'bearing' || w.role === 'core' || w.role === 'shear'));
   /** A line of wall to found: from a structural wall, or from the outline when there is none */
   interface BearingLine { start: Vec2; end: Vec2; ref: string }
   const stripLines: BearingLine[] = [];
 
   const perimeterLines = (): BearingLine[] => {
-    const ring = offsetPolygon(outlineOf(lowestStorey.id), SIZES.exteriorWallT / 2);
+    const ring = offsetPolygon(outlineOf(lowestStorey.id), exteriorWallT / 2);
     return ring.map((p, i) => ({ start: p, end: ring[(i + 1) % ring.length], ref: 'outline perimeter' }))
       .filter(l => dist(l.start, l.end) > 0.5);
   };
@@ -912,9 +1074,11 @@ export function generateStructure(ctx: GenContext): StructModel {
     }
   };
 
-  if (foundation === 'strip-footing' || (foundation === 'pad-footing' && lowestWalls.some(w => w.role === 'core'))) {
-    const targets = foundation === 'strip-footing' ? lowestWalls : lowestWalls.filter(w => w.role === 'core');
-    let lines: BearingLine[] = targets.map(w => ({ start: w.start, end: w.end, ref: w.archWallId ?? w.id }));
+  // STR-C2: EVERY wall base gets a strip, whatever the headline foundation type. v1 founded core walls only on
+  // a pad-footing scheme, so a bearing wall at grade (a podium perimeter, a senior-living spine wall) carried
+  // load into nothing.
+  if (foundation !== 'raft' && foundation !== 'piles') {
+    let lines: BearingLine[] = lowestWalls.map(w => ({ start: w.start, end: w.end, ref: w.archWallId ?? w.id }));
     if (lines.length === 0 && foundation === 'strip-footing') {
       warn('no bearing walls on the lowest storey — strip footings fall back to the floor-plate perimeter.');
       lines = perimeterLines();
@@ -934,6 +1098,12 @@ export function generateStructure(ctx: GenContext): StructModel {
     const pileLen = storeyCount > 25 ? FOUNDATION_RULES.pileLengthTall : FOUNDATION_RULES.pileLength;
     const perCap = storeyCount > 15 ? 4 : 2;
     const capPoints: { p: Vec2; ref: string }[] = lowestColumns.map(c => ({ p: c.position, ref: c.gridRef }));
+    // STR-C2: a wall base needs a cap too — a core wall on a basement level the core rect does not describe,
+    // or a bearing wall at grade, otherwise its load reaches the ground through nothing.
+    for (const w of lowestWalls) {
+      const ref = w.archWallId ?? w.id;
+      capPoints.push({ p: w.start, ref: `${ref} start` }, { p: w.end, ref: `${ref} end` });
+    }
     for (const core of arch?.cores ?? []) {
       const r = core.rect;
       capPoints.push({ p: [r.x + 0.6, r.y + 0.6], ref: `${core.id} SW` });
@@ -942,10 +1112,14 @@ export function generateStructure(ctx: GenContext): StructModel {
       capPoints.push({ p: [r.x + r.w - 0.6, r.y + r.h - 0.6], ref: `${core.id} NE` });
     }
     const seenCaps = new Set<string>();
+    const placed: Vec2[] = [];
     for (const { p, ref } of capPoints) {
       const key = `${round(p[0], 1)}:${round(p[1], 1)}`;
       if (seenCaps.has(key)) continue;
       seenCaps.add(key);
+      // Two caps closer than one cap size are one cap: a core corner and the wall end that meets it.
+      if (placed.some(q => Math.abs(q[0] - p[0]) < capSize && Math.abs(q[1] - p[1]) < capSize)) continue;
+      placed.push(p);
       emitFooting(p, capSize, capSize, FOUNDATION_RULES.pileCapHeight, 'PILE_CAP', 'pile-cap', `Pile cap ${ref}`);
       const o = 0.45;
       const offs: Vec2[] = perCap === 4
@@ -1054,6 +1228,130 @@ export function generateStructure(ctx: GenContext): StructModel {
     }
   }
 
+  // ---------------------------------------------------------------- constructability (STR-C1 .. STR-C5)
+  // Architecture emits the balcony slabs; structure still has to verify them, so they are handed to the checker
+  // as `StructSlab`s of type 'balcony' (never added to `slabs`, which stays one structural slab per storey).
+  const balconies: BalconyDef[] = (arch?.floors ?? []).flatMap(f => f.balconies ?? []);
+  const balconySlabs: StructSlab[] = [];
+  if (balconies.length > 0) {
+    const archSlabAt = new Map<string, number>();
+    for (const e of arch?.elements ?? []) {
+      if (e.geometry.kind !== 'slab' || e.unitId === undefined) continue;
+      archSlabAt.set(`${e.storey}:${round(e.geometry.position[0], 2)}:${round(e.geometry.position[1], 2)}`, e.geometry.thickness);
+    }
+    for (const b of balconies) {
+      const t = archSlabAt.get(`${b.storey}:${round(b.rect.x, 2)}:${round(b.rect.y, 2)}`);
+      if (t === undefined || t <= 0) continue;
+      balconySlabs.push({ id: b.id, storey: b.storey, outline: rectToPolygon(b.rect), thickness: t, type: 'balcony', openings: [] });
+    }
+  }
+  const loadPath = checkLoadPath({
+    storeysAscending: framedStoreys,
+    columns,
+    walls,
+    beams,
+    slabs: [...slabs, ...balconySlabs],
+    foundations,
+    balconies,
+    presize,
+    rules,
+    ledger,
+  });
+  if (loadPath.nodes.length > 0) {
+    apps.push({
+      patternId: 'STR-C1',
+      params: {
+        supports: loadPath.derived.supports,
+        carried: loadPath.derived.supportsCarried,
+        onTransferBeams: loadPath.derived.supportsOnTransfer,
+        unsupported: loadPath.derived.unsupportedSupports,
+        continuityTolerance: rules.num('STR-C1.continuityTolerance', 0.15),
+      },
+      note: 'Every column and bearing wall is carried by a column, a wall or a fully supported transfer beam below.',
+    });
+    apps.push({
+      patternId: 'STR-C2',
+      storey: fndStorey?.id ?? FOUNDATION_STOREY,
+      params: { bases: loadPath.derived.bases, unfounded: loadPath.derived.unfoundedBases, foundationType: foundation },
+      note: 'Footings are generated from the load-path bases, not from the lowest storey\'s columns.',
+    });
+    apps.push({
+      patternId: 'STR-C3',
+      params: { coreWallLines: walls.filter(w => w.role === 'core' || w.role === 'shear').length, discontinuous: loadPath.derived.discontinuousCoreLines, coreWallThickness: presize.coreWallT },
+    });
+    apps.push({
+      patternId: 'STR-C4',
+      params: {
+        edgeSamples: loadPath.derived.slabEdgeSamples,
+        unsupportedEdges: loadPath.derived.unsupportedSlabEdges,
+        maxCantilever: Math.min(rules.num('STR-C4.maxCantilever', 2.0), 10 * sizes.slabT),
+        edgeSampleStep: rules.num('STR-C4.edgeSampleStep', 1.0),
+      },
+    });
+    if (balconies.length > 0) {
+      apps.push({
+        patternId: 'STR-C5',
+        params: {
+          balconies: balconies.length,
+          verified: loadPath.derived.balconiesVerified,
+          cantileverFails: loadPath.derived.balconyCantileverFails,
+          thicknessFails: loadPath.derived.balconyThicknessFails,
+          minBalconyThickness: rules.num('STR-C5.minBalconyThickness', 0.18),
+        },
+        note: 'Architecture owns the balcony slab geometry; structure verifies the cantilever and the thickness.',
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------- kernel keep-outs (before any MEP runs)
+  if (ctx.kernel) {
+    const kernel = ctx.kernel;
+    const boxesByStorey = new Map<string, { beams: Box3[]; columns: Box3[]; drops: Box3[]; shafts: Box3[] }>();
+    const bucket = (storeyId: string): { beams: Box3[]; columns: Box3[]; drops: Box3[]; shafts: Box3[] } => {
+      let b = boxesByStorey.get(storeyId);
+      if (!b) { b = { beams: [], columns: [], drops: [], shafts: [] }; boxesByStorey.set(storeyId, b); }
+      return b;
+    };
+    for (const b of beams) {
+      const x0 = Math.min(b.start[0], b.end[0]);
+      const y0 = Math.min(b.start[1], b.end[1]);
+      const dx = Math.abs(b.end[0] - b.start[0]);
+      const dy = Math.abs(b.end[1] - b.start[1]);
+      bucket(b.storey).beams.push({
+        x: round(x0 - (dy > dx ? b.width / 2 : 0), 4), y: round(y0 - (dx >= dy ? b.width / 2 : 0), 4), z: round(b.z, 4),
+        w: round(dx + (dy > dx ? b.width : 0), 4), d: round(dy + (dx >= dy ? b.width : 0), 4), h: round(b.depth, 4),
+      });
+    }
+    for (const c of columns) {
+      bucket(c.storey).columns.push({
+        x: round(c.position[0] - c.width / 2, 4), y: round(c.position[1] - c.depth / 2, 4), z: 0,
+        w: c.width, d: c.depth, h: c.height,
+      });
+      // Flat plate / flat slab: the local thickening at the column head is the governing obstruction under the
+      // soffit even though it is not modelled as its own element (parking profile, band 1).
+      if (!isFrameSystem(system)) continue;
+      const dropDepth = rules.num('STR-04.dropPanelDepth', 0.1);
+      const dropSide = rules.num('STR-04.dropPanelSide', 2.4);
+      bucket(c.storey).drops.push({
+        x: round(c.position[0] - dropSide / 2, 4), y: round(c.position[1] - dropSide / 2, 4),
+        z: round(c.height - dropDepth, 4), w: dropSide, d: dropSide, h: dropDepth,
+      });
+    }
+    for (const e of arch?.elevators ?? []) {
+      for (const sid of e.storeys) {
+        const st = byId.get(sid);
+        if (!st) continue;
+        bucket(sid).shafts.push({ x: e.rect.x, y: e.rect.y, z: 0, w: e.rect.w, d: e.rect.h, h: round(st.height, 4) });
+      }
+    }
+    for (const [storeyId, b] of [...boxesByStorey.entries()].sort((p, q) => (p[0] < q[0] ? -1 : 1))) {
+      if (b.beams.length > 0) kernel.keepOut({ owner: 'structure', kind: 'beam', storey: storeyId, boxes: b.beams, bans: MEP_KINDS, note: 'No designed openings: nothing may pass through a beam (touching the soffit is legal).' });
+      if (b.columns.length > 0) kernel.keepOut({ owner: 'structure', kind: 'column', storey: storeyId, boxes: b.columns, bans: MEP_KINDS, note: 'No designed openings in columns.' });
+      if (b.drops.length > 0) kernel.keepOut({ owner: 'structure', kind: 'drop-panel', storey: storeyId, boxes: b.drops, bans: MEP_KINDS, note: 'Flat-plate drop panel at the column head.' });
+      if (b.shafts.length > 0) kernel.keepOut({ owner: 'structure', kind: 'shaft-void', storey: storeyId, boxes: b.shafts, bans: MEP_KINDS, note: 'IBC 2021 §3005.3 / ASME A17.1 §2.8: a hoistway contains no piping or ducting that does not serve it.' });
+    }
+  }
+
   // ---------------------------------------------------------------- pattern trace
   apps.push({
     patternId: 'STR-01',
@@ -1076,16 +1374,28 @@ export function generateStructure(ctx: GenContext): StructModel {
       linesY: grid.mainY.length,
       avgSpacingX: grid.avgSpacingX,
       avgSpacingY: grid.avgSpacingY,
-      minSpacing: GRID_RULES.minSpacing,
-      maxSpacing: GRID_RULES.maxSpacing,
+      minSpacing: presize.gridProposal.bay.min,
+      maxSpacing: presize.gridProposal.bay.max,
+      targetSpacing: presize.gridProposal.bay.target,
       longAxis,
+      source: grid.source,
       sourceWalls: (wallsByStorey.get(typicalStorey.id) ?? []).filter(w => w.type === 'party').length,
     },
+    note: grid.source === 'party-lines'
+      ? 'Transverse grid on exactly the party lines the placer published (ArchModel.partyLines).'
+      : 'Transverse grid derived once from the typical storey\'s wall centrelines; the placer has not published party lines yet.',
   });
   if (columns.length > 0) {
     apps.push({
       patternId: 'STR-03',
-      params: { snapDistance: GRID_RULES.snapDistance, columnsSnapped: snapCount, intersectionsDroppedInCores: droppedInCores, columns: columns.length },
+      params: {
+        snapTolerance: presize.gridProposal.snapTolerance,
+        gridSource: grid.source,
+        columnsOnWallLines: snapCount,
+        intersectionsDroppedInCores: droppedInCores,
+        columns: columns.length,
+      },
+      note: 'One grid for the whole building: the transverse lines are the wall centrelines, so no column is snapped per storey.',
     });
     apps.push({
       patternId: 'STR-10',
@@ -1158,7 +1468,13 @@ export function generateStructure(ctx: GenContext): StructModel {
   apps.push({
     patternId: 'XD-03',
     storey: typicalStorey.id,
-    params: { gridOnPartyWalls: true, maxSpan: GRID_RULES.maxSpacing, parkingModule: TRANSFER.moduleAlong, transferStorey: transferStorey ?? 'none' },
+    params: {
+      gridOnPartyWalls: true,
+      handshake: grid.source,
+      maxSpan: presize.gridProposal.bay.max,
+      parkingModule: presize.gridProposal.parkingModule.along,
+      transferStorey: transferStorey ?? 'none',
+    },
   });
 
   // ---------------------------------------------------------------- derived
@@ -1209,10 +1525,19 @@ export function generateStructure(ctx: GenContext): StructModel {
   }
   const avgTributary = tribStoreys > 0 ? tribSum / tribStoreys : 0;
 
-  const corridorBeamDepth = system === 'steel-frame' || system === 'mass-timber-clt' ? sizes.beamD : 0;
-  const typicalF2f = typicalStorey.height;
+  // The plenum the MEP disciplines may occupy: the lowest permitted obstruction on each storey, from the
+  // pre-sizing's resolved ceiling profiles (slab + beams, or the transfer zone on the transfer-below storey).
+  const typicalSizing = presize.byStorey.get(typicalStorey.id) ?? null;
+  const corridorBeamDepth = typicalSizing ? typicalSizing.beamDAbove : (system === 'steel-frame' || system === 'mass-timber-clt' ? sizes.beamD : 0);
   const typicalSlabT = thicknessAbove(typicalStorey.id);
-  const corridorSoffitZ = round(typicalF2f - typicalSlabT - corridorBeamDepth, 4);
+  const corridorSoffitZ = typicalSizing
+    ? typicalSizing.corridorSoffitZ
+    : round(typicalStorey.height - typicalSlabT - corridorBeamDepth, 4);
+  const plenumByStorey: Record<string, number> = {};
+  for (const s of [...framedStoreys, ...(roofStorey ? [roofStorey] : [])]) {
+    const z = presize.byStorey.get(s.id);
+    plenumByStorey[s.id] = z ? z.corridorSoffitZ : round(s.height - thicknessAbove(s.id) - corridorBeamDepth, 4);
+  }
 
   const derived: Record<string, number> = {
     columnCount: columns.length,
@@ -1250,9 +1575,16 @@ export function generateStructure(ctx: GenContext): StructModel {
     shearWallT: sizes.shearWallT,
     deadKpa: loads.deadKpa,
     liveKpa: loads.liveKpa,
-    liveCorridorKpa: LIVE_CORRIDOR_KPA,
+    liveCorridorKpa: presize.loads.liveCorridorKpa,
     roofLiveKpa: loads.roofLiveKpa,
     storeysAboveGrade: storeyCount,
+    coreWallT: presize.coreWallT,
+    partyWallT: presize.partyWallT,
+    transferZoneDepth: transferStorey ? presize.transferZoneDepth : 0,
+    bayTarget: presize.gridProposal.bay.target,
+    gridFromPartyLines: grid.source === 'party-lines' ? 1 : 0,
+    floorToFloorRaised: presize.issues.filter(i => i.ruleId === 'XD-02.plenumDepth').length,
+    ...loadPath.derived,
   };
 
   if (columns.length === 0 && walls.filter(w => w.role === 'bearing').length === 0 && arch) {
@@ -1270,8 +1602,8 @@ export function generateStructure(ctx: GenContext): StructModel {
     foundations,
     transferStorey,
     sizes,
-    loads,
-    plenumClearance: { corridorSoffitZ },
+    loads: { deadKpa: loads.deadKpa, liveKpa: loads.liveKpa, roofLiveKpa: loads.roofLiveKpa },
+    plenumClearance: { corridorSoffitZ, byStorey: plenumByStorey },
     elements,
     patterns: apps,
     derived,

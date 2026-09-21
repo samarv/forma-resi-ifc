@@ -75,7 +75,10 @@ class Builder {
   }
 
   door(storey: string, wallId: string, along: number, width: number, height: number, type: DoorDef['type'], unitId?: string): DoorDef {
-    const d: DoorDef = { id: this.id('DOOR', storey), storey, wallId, along, width, height, type, operation: 'SINGLE_SWING_LEFT', unitId };
+    const d: DoorDef = {
+      id: this.id('DOOR', storey), storey, wallId, along, width, height, type,
+      motion: 'swing', hinge: 'start', swing: 'left', unitId,
+    };
     this.doors.push(d);
     return d;
   }

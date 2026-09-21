@@ -16,6 +16,9 @@ import { generateStructure } from './index.ts';
 import { STRUCT_PATTERNS } from './patterns.ts';
 import { allFixtures, makeArchFixture, type Fixture } from './test-fixtures.ts';
 import { FOUNDATION_RULES, GRID_RULES } from './sizing.ts';
+import { presizeStructure } from './presize.ts';
+import { createProfileBook } from './profiles-seam.ts';
+import { collectingLedger, passthroughRuleSet } from './fallbacks.ts';
 
 // ----------------------------------------------------------------------------
 // Helpers
@@ -362,7 +365,9 @@ test('beams sit under the slab soffit and headers only appear over wide openings
   }
 });
 
-test('plenum clearance and structural depth are published for the MEP disciplines', () => {
+test('plenum clearance and structural depth come from the pre-sizing, per storey', () => {
+  const rules = passthroughRuleSet();
+  const profiles = createProfileBook(rules);
   for (const { fixture, struct } of BUILT) {
     const tag = fixture.id;
     const above = aboveGradeOf(fixture.storeys);
@@ -371,6 +376,28 @@ test('plenum clearance and structural depth are published for the MEP discipline
     assert.ok(struct.plenumClearance.corridorSoffitZ <= typicalF2f, `${tag}: corridor soffit is above the floor-to-floor height`);
     assert.equal(struct.derived.corridorSoffitZ, struct.plenumClearance.corridorSoffitZ, `${tag}: derived and plenumClearance disagree`);
     assert.ok(struct.derived.structuralDepthAtCorridor >= struct.sizes.slabT - 1e-9, `${tag}: structural depth is thinner than the slab`);
+
+    // THE single owner: every published number must be the pre-sizing's, per storey, not a local constant.
+    const presize = presizeStructure({
+      spec: fixture.spec, typology: fixture.typology, site: fixture.site, storeys: fixture.storeys,
+      profiles, rules, ledger: collectingLedger(),
+    });
+    assert.equal(struct.sizes.slabT, presize.sizes.slabT, `${tag}: struct.sizes.slabT is not the pre-sized slab`);
+    assert.equal(struct.sizes.shearWallT, presize.shearWallT, `${tag}: struct.sizes.shearWallT is not the pre-sized shear wall`);
+    assert.equal(struct.derived.coreWallT, presize.coreWallT, `${tag}: derived.coreWallT is not the pre-sized core wall`);
+    assert.equal(struct.transferStorey, presize.transferStorey ?? undefined, `${tag}: transfer storey disagrees with the pre-sizing`);
+
+    const byStorey = struct.plenumClearance.byStorey ?? {};
+    assert.ok(Object.keys(byStorey).length >= above.length, `${tag}: plenumClearance.byStorey is missing storeys`);
+    for (const s of framedOf(fixture.storeys)) {
+      const sizing = presize.byStorey.get(s.id);
+      assert.ok(sizing, `${tag}: no pre-sizing for ${s.id}`);
+      assert.equal(byStorey[s.id], sizing.corridorSoffitZ, `${tag}: plenum on ${s.id} is not the pre-sized corridor soffit`);
+      const slab = struct.slabs.find(sl => sl.storey === s.id);
+      if (slab && slab.type !== 'ground') {
+        assert.ok(Math.abs(slab.thickness - sizing.slabTOwn) < 1e-9, `${tag}: slab on ${s.id} is ${slab.thickness} but the pre-sizing says ${sizing.slabTOwn}`);
+      }
+    }
   }
 });
 
@@ -399,7 +426,10 @@ test('embodied carbon and quantities are in a plausible range', () => {
 
 test('every pattern reference resolves and applications carry concrete parameters', () => {
   const known = new Set([...STRUCT_PATTERNS, ...CROSS_PATTERNS].map(p => p.id));
-  assert.equal(STRUCT_PATTERNS.length, 11, 'expected STR-01..STR-11');
+  assert.equal(STRUCT_PATTERNS.length, 16, 'expected STR-01..STR-11 plus the constructability patterns STR-C1..C5');
+  for (const id of ['STR-C1', 'STR-C2', 'STR-C3', 'STR-C4', 'STR-C5']) {
+    assert.ok(known.has(id), `constructability pattern ${id} is not registered`);
+  }
   for (const p of STRUCT_PATTERNS) {
     assert.equal(p.discipline, 'structure', `${p.id} discipline`);
     assert.ok(p.problem.length > 60 && p.solution.length > 60, `${p.id} needs a real problem/solution`);
@@ -449,6 +479,39 @@ test('podium storeys use the parking module and the dwellings above use the part
   const gridX = struct.grid.filter(g => g.axis === 'x').map(g => g.offset);
   const covered = partyX.filter(px => gridX.some(gx => Math.abs(gx - px) < 0.3)).length;
   assert.ok(covered >= partyX.length - 1, `only ${covered} of ${partyX.length} party wall lines became grid lines`);
+});
+
+test('the grid handshake: ArchModel.partyLines becomes the transverse grid verbatim, on every storey', () => {
+  // No agent publishes `partyLines` yet, so this pins the consuming half of the handshake before the placer
+  // lands: the lines the placer returns ARE the column lines, with no merging, no subdivision and no snapping.
+  const f = makeArchFixture('midrise-bar');
+  const bar = f.site.massing.bars[0];
+  const offsets = [6.5, 13, 19.5, 26, 32.5, 39, 45.5, 52];
+  const ctx: GenContext = {
+    ...f.ctx,
+    arch: { ...f.arch, partyLines: [{ barId: bar.id, axis: 'x', offsets }] },
+    warnings: [],
+  };
+  const struct = generateStructure(ctx);
+  const gridX = struct.grid.filter(g => g.axis === 'x').map(g => g.offset);
+  for (const o of offsets) {
+    assert.ok(gridX.some(x => Math.abs(x - o) < 1e-6), `party line ${o} did not become a grid line (got ${gridX.join(', ')})`);
+  }
+  assert.equal(struct.derived.gridFromPartyLines, 1, 'the grid must report that it came from the party lines');
+
+  // and the SAME x appears on every residential storey: one grid, no per-storey kinks
+  const byStorey = new Map<string, number[]>();
+  for (const c of struct.columns) {
+    const list = byStorey.get(c.storey) ?? [];
+    list.push(Number(c.position[0].toFixed(3)));
+    byStorey.set(c.storey, list);
+  }
+  const residential = [...byStorey.keys()].filter(s => f.storeys.find(x => x.id === s)?.use === 'residential');
+  const reference = [...new Set(byStorey.get(residential[0]) ?? [])].sort((a, b) => a - b);
+  for (const s of residential.slice(1)) {
+    const xs = [...new Set(byStorey.get(s) ?? [])].sort((a, b) => a - b);
+    assert.deepEqual(xs, reference, `${s} column lines differ from ${residential[0]} — the grid kinked between storeys`);
+  }
 });
 
 test('every structural system and detail level generates a coherent model', () => {

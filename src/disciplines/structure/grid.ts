@@ -6,6 +6,14 @@
  *   axis: 'x'  →  `offset` is an X coordinate; the line runs parallel to +Y. Labelled A, B, C…
  *   axis: 'y'  →  `offset` is a Y coordinate; the line runs parallel to +X. Labelled 1, 2, 3…
  *   Letters skip I and O, as in structural drafting practice. A column's `gridRef` is 'C-3'.
+ *
+ * ONE GRID FOR THE WHOLE BUILDING (v2). The grid is derived ONCE — from `ArchModel.partyLines` when the placer
+ * has published them, otherwise from the typical storey's walls — and every storey reuses it. v1 additionally
+ * ran `snapToWalls` per storey with that storey's own walls, so one grid intersection could land at different
+ * XY on different levels: a silent 0.6 m kink in a column line, and a column that lands on nothing below.
+ * `snapToWalls` / `SnapWall` / `snapWallsOf` are gone; STR-03 is now satisfied by construction, because the
+ * transverse lines ARE the party/exterior/corridor/core wall centrelines. `GridPlan.isWallLine` reports which
+ * of the resulting lines coincides with a wall, for the STR-03 pattern trace.
  */
 import type { CoreDef, FootprintShape, GridLine, Polygon, Rect, Vec2, WallDef, WallType } from '../../core/types.ts';
 import { EPS, polygonBounds, round } from '../../core/geometry.ts';
@@ -24,8 +32,8 @@ export function letterLabel(i: number): string {
   return s;
 }
 
-/** An axis-aligned wall centreline reduced to the data STR-03 needs for snapping */
-export interface SnapWall {
+/** An axis-aligned wall centreline reduced to the data the grid needs. Internal: the grid is the only consumer. */
+interface WallLine {
   /** 'x' = line of constant x (wall runs along +Y); 'y' = line of constant y (wall runs along +X) */
   constAxis: 'x' | 'y';
   at: number;
@@ -50,6 +58,10 @@ export interface GridPlan {
   /** Mean bay dimension (m) of the main grid */
   avgSpacingX: number;
   avgSpacingY: number;
+  /** Where the transverse lines came from: the placer's party lines, or the typical storey's walls */
+  source: 'party-lines' | 'walls';
+  /** True when this grid line sits on an exterior / party / corridor / core wall centreline (STR-03) */
+  isWallLine(axis: 'x' | 'y', offset: number): boolean;
   label(axis: 'x' | 'y', offset: number): string;
   ref(x: number, y: number): string;
 }
@@ -68,6 +80,12 @@ export interface BuildGridOptions {
   exteriorWallT: number;
   /** Only publish the parking-module grid when there actually is a podium or basement storey */
   includeParkingGrid: boolean;
+  /**
+   * The structural handshake (v2): the party-wall / column lines the placer actually laid out
+   * (`ArchModel.partyLines`). When present the transverse grid is built on EXACTLY these lines, with no
+   * merging and no snapping — the placer has already snapped them to `presize.gridProposal`.
+   */
+  partyLines?: { barId: string; axis: 'x' | 'y'; offsets: number[] }[];
   namer: (label: string) => string;
 }
 
@@ -75,9 +93,9 @@ export interface BuildGridOptions {
 // Wall helpers
 // ----------------------------------------------------------------------------
 
-export function snapWallsOf(walls: WallDef[], types: WallType[]): SnapWall[] {
+function wallLinesOf(walls: WallDef[], types: WallType[]): WallLine[] {
   const wanted = new Set<WallType>(types);
-  const out: SnapWall[] = [];
+  const out: WallLine[] = [];
   for (const w of walls) {
     if (!wanted.has(w.type)) continue;
     const dx = Math.abs(w.start[0] - w.end[0]);
@@ -92,7 +110,7 @@ export function snapWallsOf(walls: WallDef[], types: WallType[]): SnapWall[] {
 }
 
 /** Constant coordinates of the axis-aligned walls of the given types, on the given axis */
-function wallOffsets(snaps: SnapWall[], types: WallType[], constAxis: 'x' | 'y', minLength = 1.0): number[] {
+function wallOffsets(snaps: WallLine[], types: WallType[], constAxis: 'x' | 'y', minLength = 1.0): number[] {
   const wanted = new Set<WallType>(types);
   return snaps.filter(s => s.constAxis === constAxis && wanted.has(s.type) && s.hi - s.lo >= minLength).map(s => s.at);
 }
@@ -170,7 +188,7 @@ export function moduleOffsets(lo: number, hi: number, module: number, maxBay = 1
 export function buildGrid(opts: BuildGridOptions): GridPlan {
   const b = polygonBounds(opts.typicalOutline);
   const t = opts.exteriorWallT;
-  const snaps = snapWallsOf(opts.walls, ['exterior', 'party', 'corridor', 'core', 'retaining']);
+  const snaps = wallLinesOf(opts.walls, ['exterior', 'party', 'corridor', 'core', 'retaining']);
   const coreX: number[] = [];
   const coreY: number[] = [];
   for (const c of opts.cores) {
@@ -196,7 +214,30 @@ export function buildGrid(opts: BuildGridOptions): GridPlan {
   let corridorAxis: 'x' | 'y';
   let corridorOffsets: number[];
 
-  if (squarish) {
+  // The handshake: transverse lines on exactly the party lines the placer laid out. They are already snapped to
+  // `presize.gridProposal` and identical on every storey, so nothing here merges, subdivides or snaps them.
+  const handX = opts.partyLines?.filter(p => p.axis === 'x').flatMap(p => p.offsets) ?? [];
+  const handY = opts.partyLines?.filter(p => p.axis === 'y').flatMap(p => p.offsets) ?? [];
+  const handshakeAxis: 'x' | 'y' | null = handX.length >= 2 ? 'x' : handY.length >= 2 ? 'y' : null;
+
+  if (handshakeAxis !== null) {
+    const transverse = dedupeOffsets(handshakeAxis === 'x' ? [...perimX, ...handX] : [...perimY, ...handY], 0.05);
+    if (handshakeAxis === 'x') {
+      mainX = transverse;
+      let longitudinal = dedupeOffsets([...perimY, ...corrY]);
+      if (longitudinal.length < 3) longitudinal = dedupeOffsets([...longitudinal, b.y + b.h / 2]);
+      mainY = normalizeOffsets(longitudinal, 1.5, 11, [...perimY, ...corrY]);
+      corridorAxis = 'y';
+      corridorOffsets = dedupeOffsets(corrY);
+    } else {
+      mainY = transverse;
+      let longitudinal = dedupeOffsets([...perimX, ...corrX]);
+      if (longitudinal.length < 3) longitudinal = dedupeOffsets([...longitudinal, b.x + b.w / 2]);
+      mainX = normalizeOffsets(longitudinal, 1.5, 11, [...perimX, ...corrX]);
+      corridorAxis = 'x';
+      corridorOffsets = dedupeOffsets(corrX);
+    }
+  } else if (squarish) {
     // Point plate: perimeter + core walls in both directions, capped at the economic span.
     // With no interior line at all, fall back to the target module across the whole plate.
     mainX = normalizeOffsets([...perimX, ...coreX, ...partyX], GRID_RULES.minSpacing, GRID_RULES.maxSpacing, [...perimX, ...partyX]);
@@ -226,14 +267,24 @@ export function buildGrid(opts: BuildGridOptions): GridPlan {
     corridorOffsets = dedupeOffsets(corrX);
   }
 
-  // Parking module grid for podium / basement storeys (STR-04)
-  const pb = polygonBounds(opts.podiumOutline ?? opts.typicalOutline);
+  // Parking module grid for podium / basement storeys (STR-04). The module is laid over the podium BOUNDS, so
+  // on an L / U / O plate it can miss the plate's own faces entirely — and then nothing carries the exterior
+  // wall of the plate above (us-senior: a 9 m deep wing with no column line under its rear wall). The exterior
+  // wall centrelines are therefore must-keep lines in the parking grid too.
+  const pOutline = opts.podiumOutline ?? opts.typicalOutline;
+  const pb = polygonBounds(pOutline);
   const alongX = opts.longAxis === 'x';
+  const faceX = dedupeOffsets([...extX, ...perimX], 0.25);
+  const faceY = dedupeOffsets([...extY, ...perimY], 0.25);
+  const parkAxis = (lo: number, hi: number, module: number, faces: number[]): number[] => {
+    const inside = faces.filter(v => v > lo - 0.5 && v < hi + 0.5);
+    return normalizeOffsets([...moduleOffsets(lo, hi, module), ...inside], GRID_RULES.minSpacing, module, inside);
+  };
   const parkX = opts.includeParkingGrid
-    ? moduleOffsets(pb.x + t / 2, pb.x + pb.w - t / 2, alongX ? TRANSFER.moduleAlong : TRANSFER.moduleAcross)
+    ? parkAxis(pb.x + t / 2, pb.x + pb.w - t / 2, alongX ? TRANSFER.moduleAlong : TRANSFER.moduleAcross, faceX)
     : mainX;
   const parkY = opts.includeParkingGrid
-    ? moduleOffsets(pb.y + t / 2, pb.y + pb.h - t / 2, alongX ? TRANSFER.moduleAcross : TRANSFER.moduleAlong)
+    ? parkAxis(pb.y + t / 2, pb.y + pb.h - t / 2, alongX ? TRANSFER.moduleAcross : TRANSFER.moduleAlong, faceY)
     : mainY;
 
   // Label the union of every offset that exists on any storey
@@ -257,6 +308,10 @@ export function buildGrid(opts: BuildGridOptions): GridPlan {
     ...allY.map(v => ({ id: opts.namer(labelY.get(key(v))!), axis: 'y' as const, offset: v })),
   ];
 
+  // STR-03: which lines are absorbed into a wall zone. Party lines from the placer are wall lines by definition.
+  const wallKeysX = new Set<string>([...handX, ...extX, ...corrX, ...partyX, ...coreX].map(key));
+  const wallKeysY = new Set<string>([...handY, ...extY, ...corrY, ...partyY, ...coreY].map(key));
+
   return {
     lines,
     mainX,
@@ -268,6 +323,8 @@ export function buildGrid(opts: BuildGridOptions): GridPlan {
     corridorOffsets,
     avgSpacingX: meanGap(mainX),
     avgSpacingY: meanGap(mainY),
+    source: handshakeAxis !== null ? 'party-lines' : 'walls',
+    isWallLine: (axis, offset) => (axis === 'x' ? wallKeysX : wallKeysY).has(key(offset)),
     label: (axis, offset) => (axis === 'x' ? nearestLabel(labelX, allX, offset) : nearestLabel(labelY, allY, offset)),
     ref(x, y) {
       return `${nearestLabel(labelX, allX, x)}-${nearestLabel(labelY, allY, y)}`;
@@ -290,34 +347,6 @@ export function tributaryExtent(offsets: number[], i: number): number {
   const next = i < offsets.length - 1 ? (offsets[i + 1] - offsets[i]) / 2 : 0;
   const t = prev + next;
   return t > EPS ? t : 3.0;
-}
-
-// ----------------------------------------------------------------------------
-// STR-03 Columns Hide in Walls
-// ----------------------------------------------------------------------------
-
-/**
- * Move a grid intersection onto any wall centreline within `snapDistance`, so the column is
- * absorbed into the wall zone instead of standing 300 mm clear of it.
- */
-export function snapToWalls(p: Vec2, snaps: SnapWall[], snapDistance: number = GRID_RULES.snapDistance): { p: Vec2; snapped: boolean } {
-  let x = p[0];
-  let y = p[1];
-  let bestX = snapDistance;
-  let bestY = snapDistance;
-  let snapped = false;
-  for (const s of snaps) {
-    if (s.constAxis === 'x') {
-      if (p[1] < s.lo - 0.5 || p[1] > s.hi + 0.5) continue;
-      const d = Math.abs(p[0] - s.at);
-      if (d < bestX - EPS) { bestX = d; x = s.at; snapped = true; }
-    } else {
-      if (p[0] < s.lo - 0.5 || p[0] > s.hi + 0.5) continue;
-      const d = Math.abs(p[1] - s.at);
-      if (d < bestY - EPS) { bestY = d; y = s.at; snapped = true; }
-    }
-  }
-  return { p: [x, y], snapped };
 }
 
 /** True when the point falls inside any of the rects (cores, stairs, lifts, shafts), with a margin */
