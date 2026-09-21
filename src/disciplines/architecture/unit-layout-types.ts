@@ -12,6 +12,9 @@ import type {
   Rect, Side, Compass, Region, UnitTemplateDef, RoomDef, WallDef, DoorDef, WindowDef, FurnitureDef,
   PatternApplication, Rng, GenerationOptions,
 } from '../../core/types.ts';
+import type { ProgramGraph, Feasibility, ResolvedProgramGraph, StackPort, ExhaustPort, PanelPort } from './program/types.ts';
+import type { UnitEdit } from '../../core/overrides.ts';
+import type { Deviation } from '../../core/rules/types.ts';
 
 /** Boundary walls of the unit rect, keyed by the side of the rect they lie on (wall centreline is outside the NET rect by thickness/2). */
 export interface UnitBoundaryWalls {
@@ -58,6 +61,19 @@ export interface UnitLayoutRequest {
   stackAlong?: number;
   /** Fixed internal stair footprint for multi-storey units (identical on every level) */
   stairRect?: Rect;
+  // ---- v2 (required once the program solver lands; optional so the v1 engine keeps compiling) ----
+  /** Module identity from the placer */
+  moduleId?: string;
+  /** The program graph to lay out */
+  program?: ProgramGraph;
+  /** Feasibility witness for (frontage, depth). The v2 solver ASSERTS it and cannot fail. */
+  fit?: Feasibility;
+  /** Mirror the frozen plan shape (u → 1 − u) */
+  mirrored?: boolean;
+  /** Party/column lines in LOCAL u, for partition snapping */
+  gridLinesLocal?: number[];
+  /** Per-unit edits from spec.overrides, already resolved to this slot */
+  edits?: UnitEdit[];
 }
 
 export interface UnitLayout {
@@ -77,7 +93,15 @@ export interface UnitLayout {
   /** Internal stair for multi-storey units (nose of first tread at position, treads along direction) */
   stair?: { rect: Rect; position: [number, number]; direction: number; risers: number; riserHeight: number; tread: number; width: number };
   patterns: PatternApplication[];
+  /** v2: reserved for true contradictions only; empty for every preset once the solver lands */
   warnings: string[];
+  // ---- v2 outputs persisted for plumbing / MEP / the editor ----
+  graph?: ResolvedProgramGraph;
+  stackPorts?: StackPort[];
+  exhaustPorts?: ExhaustPort[];
+  panelPort?: PanelPort | null;
+  swings?: { doorId: string; roomId: string; rect: Rect }[];
+  deviations?: Deviation[];
 }
 
 export type UnitLayoutFn = (req: UnitLayoutRequest) => UnitLayout;

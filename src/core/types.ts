@@ -19,6 +19,14 @@
  * - Ids are deterministic strings (see core/ids.ts). Never use Math.random — use core/rng.ts.
  */
 
+import type { Issue, Rule, RuleOverrides, RuleSet, Ledger } from './rules/types.ts';
+import type { Kernel, Chase } from './kernel/types.ts';
+import type { OverrideDoc } from './overrides.ts';
+import type { StructuralPresize } from '../disciplines/structure/presize.ts';
+import type { FloorLayout } from '../disciplines/architecture/placer/types.ts';
+import type { CorridorGraph } from '../disciplines/site/corridor-graph.ts';
+import type { StackPort, ExhaustPort, PanelPort, ResolvedProgramGraph } from '../disciplines/architecture/program/types.ts';
+
 // ============================================================================
 // Primitives
 // ============================================================================
@@ -269,6 +277,12 @@ export interface MassingSpec {
   roofPitchDeg?: number;
   parapetHeight?: number;
   balconyDepth?: number;
+  /** v2: allow storeys outside the typology band (recorded as a deviation; switches to the high-rise rule profile) */
+  allowStoreyOverride?: boolean;
+  /** v2: the parking solver may add basement levels up to this count (default 3) */
+  maxBasementStoreys?: number;
+  /** v2: the parking solver may add podium parking levels up to this count (default 3) */
+  maxPodiumStoreys?: number;
 }
 
 export interface FloorSpec {
@@ -312,6 +326,10 @@ export interface BuildingSpec {
   /** Building-wide unit mix weights; overrides typology default */
   unitMix?: Partial<Record<UnitTemplateId, number>>;
   options: GenerationOptions;
+  /** v2: rule parameter overrides, disabled rules, custom rules and rule profiles (JSON, deterministic, shareable) */
+  rules?: RuleOverrides;
+  /** v2: floorplan editor overrides applied between planFloorLayout and instantiateFloor */
+  overrides?: OverrideDoc;
 }
 
 // ============================================================================
@@ -354,6 +372,8 @@ export type ElementGeometry =
   | { kind: 'beam'; start: Vec3; end: Vec3; width: number; height: number }
   /** Box: min corner at position, rotated about position by rotation (radians) — furniture, equipment, panels */
   | { kind: 'box'; position: Vec3; width: number; depth: number; height: number; rotation?: number }
+  /** Instance of a shared type (core/furniture-3d.ts): min corner at position before rotation, like box; width/depth/height are the placed footprint (the writer derives the stretch scale from the type footprint) */
+  | { kind: 'instance'; typeId: string; position: Vec3; width: number; depth: number; height: number; rotation?: number; scale?: Vec3 }
   /** Prism: arbitrary footprint (points RELATIVE to position) extruded by height — spaces, zones, pads, courtyards */
   | { kind: 'prism'; position: Vec3; profile: Vec2[]; height: number }
   /** Axis element: pipe/duct/tray/conduit from start to end with a round or rectangular section */
@@ -533,6 +553,8 @@ export interface CorridorSpine {
   id: string;
   barId: string;
   centerline: Segment2;
+  /** v2: legs ≤ ARC-03.maxLegLength from the corridor graph; centerline === legs[0] during migration */
+  legs?: Segment2[];
   width: number;
   /** Which side(s) of the corridor have units */
   loaded: 'both' | 'left' | 'right';
@@ -551,6 +573,8 @@ export interface MassingModel {
   towerFootprint?: Polygon;
   cores: CorePlacement[];
   corridors: CorridorSpine[];
+  /** v2: legs, knuckles, break slots and dead ends — consumed by placeCores and the architecture placer */
+  corridorGraph?: CorridorGraph;
   roof: { type: RoofType; pitchRad: number; parapetHeight: number; ridgeAxis: 'x' | 'y' };
 }
 
@@ -629,22 +653,45 @@ export interface WallDef {
   rightRoomId?: string;
   /** Compass exposure of an exterior wall's outside face */
   exposure?: Compass;
+  /** v2: stable program ref for partitions inside a unit ('refA|refB'), used by editor overrides */
+  ref?: string;
 }
 
+/** How the leaf moves. Only 'swing' | 'double-swing' draw an arc. */
+export type DoorMotion = 'swing' | 'double-swing' | 'sliding' | 'folding' | 'rolling' | 'opening';
+/** End of the host wall — in the wall's STORED start→end direction — that carries the hinge (sliding: the end the leaf parks at) */
+export type DoorHinge = 'start' | 'end';
+/** Side of the host wall the leaf's motion volume occupies, 'left' | 'right' of the stored start→end direction; 'none' for rolling/opening */
+export type DoorSwing = 'left' | 'right' | 'none';
+
+/**
+ * Door hosted in a wall. v2 convention (see core/openings.ts, the single owner of the geometry): hinge and swing are
+ * derived ONCE by the producer with solveSwing() and stored; the 2D plan, the IFC writer, switch placement and the
+ * furniture keep-out all read them. The IFC operation token is derived by doorOperation(); the operation field is legacy and
+ * is removed once every producer writes motion/hinge/swing.
+ */
 export interface DoorDef {
   id: string;
   storey: string;
   wallId: string;
-  /** Distance from wall start to door centre */
+  /** Distance from the HOST WALL's stored start to the door centre */
   along: number;
   width: number;
   height: number;
   type: 'unit-entry' | 'interior' | 'building-entry' | 'balcony' | 'garage' | 'exit' | 'closet' | 'service';
+  /** @deprecated legacy IFC token; derive with doorOperation() from motion/hinge/swing */
   operation: string;
+  motion?: DoorMotion;
+  hinge?: DoorHinge;
+  swing?: DoorSwing;
+  /** Room whose floor the leaf sweeps over; required for swing motions, must be fromRoomId or toRoomId */
+  swingIntoRoomId?: string;
   fromRoomId?: string;
   toRoomId?: string;
   fireRated?: boolean;
   unitId?: string;
+  /** v2: stable program ref ('entry1~hall1', 'entry', 'balcony', 'garage'), used by editor overrides */
+  ref?: string;
 }
 
 export interface WindowDef {
@@ -683,6 +730,8 @@ export interface FurnitureDef {
   /** Plumbing/electrical hooks: true if the item needs water/waste or a dedicated circuit */
   needsWater?: boolean;
   needsPower?: boolean;
+  /** v2: stable program ref ('roomRef#kitSlot'), used by editor overrides */
+  ref?: string;
 }
 
 export interface RoomDef {
@@ -705,6 +754,8 @@ export interface RoomDef {
   furnitureIds: string[];
   occupancy: number;
   zone: Zone;
+  /** v2: stable program-node ref ('bedroom2'), used by editor overrides and the room graph */
+  ref?: string;
 }
 
 export interface UnitInstance {
@@ -729,6 +780,18 @@ export interface UnitInstance {
   balconyRoomId?: string;
   barId?: string;
   coreId?: string;
+  /** v2 module/placer identity and ports (consumed by plumbing, mechanical, electrical and the editor) */
+  moduleId?: string;
+  slotId?: string;
+  mirrored?: boolean;
+  stackPorts?: StackPort[];
+  exhaustPorts?: ExhaustPort[];
+  panelPort?: PanelPort | null;
+  roomGraph?: ResolvedProgramGraph;
+  /** v2: canonical-layout cache key (moduleId|F|D|level|…|editsHash) — the editor uses it to say how many identical units an edit touches */
+  layoutKey?: string;
+  /** Along-bar coordinates of the unit's two party lines and whether each is a structural column line */
+  partyLines?: [{ at: number; column: boolean }, { at: number; column: boolean }];
 }
 
 export interface CorridorDef {
@@ -841,6 +904,12 @@ export interface ArchModel {
   roof: RoofDef;
   /** Which templates were used, with the resolved parameters */
   templatesUsed: UnitTemplateId[];
+  /** v2: actual party-wall / column lines returned to structure detailing (the structural handshake) */
+  partyLines?: { barId: string; axis: 'x' | 'y'; offsets: number[] }[];
+  /** v2: wet-wall chases registered in the kernel from the units' stack ports */
+  chases?: Chase[];
+  /** v2: the editable floor documents by storey id */
+  layouts?: Record<string, FloorLayout>;
   elements: ModelElement[];
   patterns: PatternApplication[];
   derived: Record<string, number>;
@@ -897,7 +966,7 @@ export interface StructSlab {
   storey: string;
   outline: Polygon;
   thickness: number;
-  type: 'floor' | 'roof' | 'ground' | 'podium-transfer';
+  type: 'floor' | 'roof' | 'ground' | 'podium-transfer' | 'balcony';
   openings: Rect[];
 }
 
@@ -926,7 +995,7 @@ export interface StructModel {
   sizes: { columnW: number; columnD: number; beamW: number; beamD: number; slabT: number; shearWallT: number };
   loads: { deadKpa: number; liveKpa: number; roofLiveKpa: number };
   /** Zones that must stay free of structure for MEP (shafts, corridor plenum band) */
-  plenumClearance: { corridorSoffitZ: number };
+  plenumClearance: { corridorSoffitZ: number; byStorey?: Record<string, number> };
   elements: ModelElement[];
   patterns: PatternApplication[];
   derived: Record<string, number>;
@@ -1011,7 +1080,7 @@ export type PipeSystemType = 'dcw' | 'dhw' | 'hwr' | 'waste' | 'vent' | 'storm' 
 export interface PlumbingFixture {
   id: string;
   storey: string;
-  type: 'wc' | 'lavatory' | 'shower' | 'bathtub' | 'kitchen-sink' | 'dishwasher' | 'washer' | 'hose-bibb' | 'floor-drain' | 'water-heater' | 'utility-sink' | 'drinking-fountain' | 'water-meter' | 'backflow-preventer' | 'booster-pump' | 'roof-drain' | 'sprinkler-head' | 'fire-hose-valve';
+  type: 'wc' | 'lavatory' | 'shower' | 'bathtub' | 'kitchen-sink' | 'dishwasher' | 'washer' | 'hose-bibb' | 'floor-drain' | 'water-heater' | 'utility-sink' | 'drinking-fountain' | 'water-meter' | 'backflow-preventer' | 'booster-pump' | 'roof-drain' | 'sprinkler-head' | 'fire-hose-valve' | 'sump-pit' | 'sewage-ejector';
   roomId?: string;
   unitId?: string;
   furnitureId?: string;
@@ -1172,7 +1241,15 @@ export interface GenContext {
   mech: MechModel | null;
   plumb: PlumbModel | null;
   elec: ElecModel | null;
+  /** @deprecated v2: live projection of issues; disciplines should add to ctx.issues */
   warnings: string[];
+  /** v2 (required once wave 1 lands): structural pre-sizing, coordination kernel, rule set, issues ledger */
+  presize?: StructuralPresize | null;
+  kernel?: Kernel | null;
+  rules?: RuleSet;
+  issues?: Ledger;
+  /** v2: progress callback for the app worker (phase name, 0..1) */
+  onPhase?: (phase: string, pct: number) => void;
 }
 
 export type SiteGenerator = (spec: BuildingSpec, typology: TypologyDef, rng: Rng, warnings: string[]) => SiteModel;
@@ -1198,6 +1275,9 @@ export interface DesignModel {
   patterns: { book: Pattern[]; applications: PatternApplication[] };
   warnings: string[];
   timings: Record<string, number>;
+  /** v2: structured issues (warnings is their string projection) and the resolved rule set */
+  issues?: Issue[];
+  rules?: Rule[];
 }
 
 export interface IfcOutput {

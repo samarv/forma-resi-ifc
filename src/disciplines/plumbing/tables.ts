@@ -123,6 +123,17 @@ export const FIXTURES: Record<FixtureType, FixtureSpec> = {
     objectType: 'Class I hose valve', name: 'Fire hose valve',
     size: [0.25, 0.2, 0.3], supplyZ: 1.2, wasteD: 0, supplyD: 0.065,
   },
+  // v2 — pumped drainage for storeys below the sewer invert (IPC 2021 §712); placed by the plumbing agent from InvertModel
+  'sump-pit': {
+    dfu: 0, wsfu: 0, connections: ['waste', 'vent'],
+    ifcType: 'IfcDistributionChamberElement', predefinedType: 'SUMP', objectType: 'Sewage sump pit',
+    name: 'Sump pit', size: [0.9, 0.9, 1.2], supplyZ: 0, wasteD: 0.1, supplyD: 0,
+  },
+  'sewage-ejector': {
+    dfu: 0, wsfu: 0, connections: ['waste'],
+    ifcType: 'IfcPump', predefinedType: 'SUBMERSIBLEPUMP', objectType: 'Duplex sewage ejector',
+    name: 'Sewage ejector (duplex)', size: [0.5, 0.5, 0.6], supplyZ: 0, wasteD: 0.08, supplyD: 0,
+  },
 };
 
 /** Architecture furniture types that carry a water/waste connection */
