@@ -8,7 +8,7 @@ import type {
   AccessType, BuildingSpec, Compass, FloorSpec, FootprintShape, FloorUse, Region, TypologyDef,
   TypologyId, UnitTemplateDef, UnitTemplateId,
 } from '../core/types.ts';
-import { PRESETS, UNIT_TEMPLATE_IDS, normalizeSpec, type PartialSpec } from '../core/spec.ts';
+import { PRESETS, UNIT_TEMPLATE_IDS, normalizeSpec, resolveStoreys, type PartialSpec } from '../core/spec.ts';
 import { TYPOLOGIES } from '../core/typologies.ts';
 import { backend } from './backend.ts';
 import { state, structuredCloneSafe } from './state.ts';
@@ -150,19 +150,27 @@ export function renderForm(root: HTMLElement): void {
     arr.push([ty.id, typologyLabel(ty, resolved.region)]);
     groups.set(ty.access, arr);
   }
+  // v2: the storey band is enforced, not reported. The slider and the number input take their
+  // min/max from the typology, so the band is unreachable unless the user ticks the override —
+  // which `normalizeSpec` honours and records as a deviation (with the 'high-rise' rule profile).
+  const band = resolveStoreys(spec.massing, t);
   const storeys = resolved.massing.storeys;
-  const clamped = clamp(storeys, t.storeys.min, t.storeys.max);
+  const override = resolved.massing.allowStoreyOverride === true;
+  const lo = override ? 1 : band.min;
+  const hi = override ? 60 : band.max;
   parts.push(section('Typology & height', true, [
     selRow('Typology', 'typology', resolved.typology, [], true,
       [...groups.entries()].map(([a, items]) => [ACCESS_LABEL[a], items] as [string, [string, string][]])),
     `<p class="desc">${esc(t.description)}</p>`,
     `<div class="row-wide"><label for="f-storeys">Storeys above grade</label><div class="slider-row">
-      <input id="f-storeys" type="range" data-p="massing.storeys" data-t="int" min="${t.storeys.min}" max="${t.storeys.max}" step="1" value="${clamped}" data-s="1">
-      <input type="number" data-p="massing.storeys" data-t="int" min="1" max="60" step="1" value="${storeys}" data-s="1">
+      <input id="f-storeys" type="range" data-p="massing.storeys" data-t="int" min="${lo}" max="${hi}" step="1" value="${clamp(storeys, lo, hi)}" data-s="1">
+      <input type="number" data-p="massing.storeys" data-t="int" min="${lo}" max="${hi}" step="1" value="${storeys}" data-s="1">
     </div>
-    <p class="hint${storeys < t.storeys.min || storeys > t.storeys.max ? ' hint-warn' : ''}">
-      Typology range ${t.storeys.min}–${t.storeys.max} (default ${t.storeys.default}).
-      ${storeys < t.storeys.min || storeys > t.storeys.max ? ' Outside the typical range for this typology.' : ''}
+    ${chk('Allow storeys outside the typology band', 'massing.allowStoreyOverride', override, true)}
+    <p class="hint${band.clamped || band.override ? ' hint-warn' : ''}">
+      Typology range ${band.min}–${band.max} (default ${t.storeys.default}).
+      ${band.clamped ? ` ${band.requested} storeys clamped to ${storeys}; tick the box above to build it anyway.` : ''}
+      ${band.override ? ' Outside the typical range: recorded as a deviation and generated with the high-rise rule profile.' : ''}
     </p></div>`,
   ]));
 

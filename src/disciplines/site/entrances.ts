@@ -14,6 +14,7 @@ import { SITE_STOREY } from '../../core/ids.ts';
 import type { SiteFrame, MassingResult } from './massing.ts';
 import { integralGarageWidth } from './parking.ts';
 import { clampNum } from './util.ts';
+import { RULE, deviation, type IssueSink } from './issues.ts';
 
 export interface EntranceResult {
   entrances: Entrance[];
@@ -29,7 +30,7 @@ export function buildEntrances(
   m: MassingResult,
   rng: Rng,
   ids: IdFactory,
-  warnings: string[],
+  sink: IssueSink,
 ): EntranceResult {
   const entrances: Entrance[] = [];
   const apps: PatternApplication[] = [];
@@ -66,7 +67,9 @@ export function buildEntrances(
       }
       if (doorXs.length !== dwellings) {
         // Would leave architecture's houses without doors to align to.
-        warnings.push(`Only ${doorXs.length} of ${dwellings} front doors fit on the ${bar.rect.w.toFixed(1)} m street face (SIT-02).`);
+        sink.add(deviation(RULE.dwellingBand,
+          `Only ${doorXs.length} of ${dwellings} front doors fit on the ${bar.rect.w.toFixed(1)} m street face (SIT-02).`,
+          { observed: doorXs.length, limit: dwellings, source: 'SIT-02' }));
       }
     }
     apps.push({

@@ -1,8 +1,26 @@
 /**
  * Spec normalisation and named presets. `normalizeSpec` fills every optional field from the
  * typology so that discipline generators can rely on defaults being present.
+ *
+ * Two v2 rules live here, both about a number the generator must not merely complain about:
+ *
+ * 1. **Storey band (typology).** `massing.storeys` is CLAMPED to `typology.storeys.{min,max}`
+ *    unless `massing.allowStoreyOverride` is set. An accepted override layers the `'high-rise'`
+ *    rule profile onto `spec.rules.profiles` (the kernel agent defines what that profile changes)
+ *    and is recorded as a `deviation` by `generateSite` — the discipline that consumes the number
+ *    — because no ledger exists yet at normalisation time. The form's storeys slider takes its
+ *    min/max from the same band, so reaching the clamp needs either the override checkbox or a
+ *    programmatic spec.
+ * 2. **Parking levels (solver).** `massing.basementStoreys` / `massing.podiumStoreys` start from
+ *    the typology default here, but they are OUTPUTS of `solveParking()` (site, before massing):
+ *    it raises them to meet the parking ratio and calls `resolveFloors` again, so the floor list
+ *    and `buildStoreys` see the parking levels. Nothing else may write those two fields.
+ *
+ * `PartialSpec` stays JSON-compatible: every v2 field is a plain boolean or number.
  */
-import type { BuildingSpec, FloorSpec, StoreyDef, TypologyDef, FloorUse, Region, UnitTemplateId } from './types.ts';
+import type {
+  BuildingSpec, FloorSpec, StoreyDef, TypologyDef, FloorUse, Region, UnitTemplateId, MassingSpec,
+} from './types.ts';
 import { getTypology } from './typologies.ts';
 import { storeyIdFor, SITE_STOREY, FOUNDATION_STOREY, ROOF_STOREY } from './ids.ts';
 
@@ -13,9 +31,41 @@ export type PartialSpec = Partial<Omit<BuildingSpec, 'site' | 'massing' | 'optio
   options?: Partial<BuildingSpec['options']>;
 };
 
+/** Absolute limits, whatever the typology says */
+const STOREY_HARD_MIN = 1;
+const STOREY_HARD_MAX = 60;
+
+export interface StoreyBandResult {
+  storeys: number;
+  requested: number;
+  /** The band was applied and changed the request */
+  clamped: boolean;
+  /** The request sits outside the band and was honoured (`allowStoreyOverride`) */
+  override: boolean;
+  min: number;
+  max: number;
+}
+
+/**
+ * SIT / typology storey band. Pure, so the form, the tests and `normalizeSpec` all agree on
+ * what a given request resolves to.
+ */
+export function resolveStoreys(massing: Partial<MassingSpec> | undefined, t: TypologyDef): StoreyBandResult {
+  const requested = clamp(massing?.storeys ?? t.storeys.default, STOREY_HARD_MIN, STOREY_HARD_MAX);
+  const min = Math.max(STOREY_HARD_MIN, t.storeys.min);
+  const max = Math.min(STOREY_HARD_MAX, t.storeys.max);
+  const outside = requested < min || requested > max;
+  if (outside && massing?.allowStoreyOverride) {
+    return { storeys: requested, requested, clamped: false, override: true, min, max };
+  }
+  const storeys = clamp(requested, min, max);
+  return { storeys, requested, clamped: storeys !== requested, override: false, min, max };
+}
+
 export function normalizeSpec(input: PartialSpec): BuildingSpec {
   const t = getTypology(input.typology);
-  const storeys = clamp(input.massing?.storeys ?? t.storeys.default, 1, 60);
+  const band = resolveStoreys(input.massing, t);
+  const storeys = band.storeys;
   const region: Region = input.region ?? 'US';
   const spec: BuildingSpec = {
     name: input.name ?? `${t.name} (${storeys} storeys)`,
@@ -51,6 +101,9 @@ export function normalizeSpec(input: PartialSpec): BuildingSpec {
       roofPitchDeg: input.massing?.roofPitchDeg ?? 30,
       parapetHeight: input.massing?.parapetHeight ?? 1.1,
       balconyDepth: input.massing?.balconyDepth ?? (t.access === 'direct' ? 0 : 1.8),
+      allowStoreyOverride: input.massing?.allowStoreyOverride ?? false,
+      maxBasementStoreys: input.massing?.maxBasementStoreys ?? 3,
+      maxPodiumStoreys: input.massing?.maxPodiumStoreys ?? 3,
     },
     floors: input.floors ?? [],
     unitMix: input.unitMix ?? t.defaultUnitMix,
@@ -66,6 +119,13 @@ export function normalizeSpec(input: PartialSpec): BuildingSpec {
       ...(input.options ?? {}),
     },
   };
+  // An accepted override switches the rule profile rather than silently generating a tower with
+  // a walk-up's rules; `generateSite` records the matching `deviation`.
+  if (band.override) {
+    const rules = spec.rules ?? { version: 1 };
+    const profiles = rules.profiles ?? [];
+    spec.rules = { ...rules, profiles: profiles.includes('high-rise') ? profiles : [...profiles, 'high-rise'] };
+  }
   spec.floors = resolveFloors(spec, t);
   return spec;
 }

@@ -8,15 +8,23 @@
  *
  * World frame reminder: origin = site front-left corner, +X along the street, +Y from the
  * street into the site. So for any bar, "front" = its min-Y edge and "rear" = its max-Y edge.
+ *
+ * v2: "resolve, then record" — a resolution (a clipped dimension, a degraded shape, a core that
+ * had to move) is an `info` Issue carrying its `ResolutionId`; only a real contradiction (zoning
+ * exceeded, travel distance over the limit, exits too close together) stays a `deviation` and so
+ * keeps its string in `warnings`. Nothing in this file calls `warnings.push` any more.
+ * The corridor topology is owned by `corridor-graph.ts`: `buildMassing` asks it for the spines,
+ * the legs, the knuckles and the break slots, and `placeCores` spends cores in those slots first.
  */
 import type {
   BuildingSpec, TypologyDef, Rng, Rect, Polygon, Side, Compass, FootprintShape,
   MassingBar, MassingModel, CorePlacement, CorridorSpine, PatternApplication, StoreyDef, AccessType,
-  UnitTemplateDef, UnitTemplateId,
+  UnitTemplateDef, UnitTemplateId, Vec2,
 } from '../../core/types.ts';
+import type { RuleSet } from '../../core/rules/types.ts';
 import {
-  rectToPolygon, rectCenter, rectilinearOutline, polygonArea, insetSides, inset,
-  exposureOf, rearExposure, solarScore, compassToRad, cross, polygonCentroid, round,
+  rectToPolygon, rectCenter, rectilinearOutline, insetSides, inset,
+  exposureOf, rearExposure, solarScore, compassToRad, polygonCentroid, round,
 } from '../../core/geometry.ts';
 import { buildStoreys } from '../../core/spec.ts';
 import { structuralSystemFor, foundationFor } from '../../core/typologies.ts';
@@ -28,6 +36,8 @@ import { SITE_STOREY } from '../../core/ids.ts';
 // read one source of truth (see ARC/SITE coordination note at the top of index.ts).
 import { UNIT_TEMPLATES } from '../architecture/templates.ts';
 import { clampNum } from './util.ts';
+import { RULE, deviation, info, nullSink, ruleNum, travelRule, type IssueSink } from './issues.ts';
+import { buildCorridorGraph, coreSlotsOn, resolveDeadEnds, type BreakSlot, type CorridorGraph } from './corridor-graph.ts';
 
 // ---------------------------------------------------------------------------
 // Rule constants (see SITE_PATTERNS for provenance)
@@ -53,6 +63,12 @@ export const CORE_STAIR_BAY = 2.6;
 export const CORE_SHAFT_BAY = 2.4;
 /** Along-bar width of every core rect: stair bay + shaft bay */
 export const CORE_WIDTH_ALONG_BAR = CORE_STAIR_BAY + CORE_SHAFT_BAY;
+/**
+ * How far a core will move along the bar to land in a corridor break slot: its own width plus a
+ * slot. Further than that and the egress geometry (end clearance, exit separation, travel
+ * distance) is worth more than the free break, so `alongPositions` wins.
+ */
+const CORE_SNAP_WINDOW = CORE_WIDTH_ALONG_BAR + 5.0;
 /** Lift bank slice across the bar (2 × 2.0 m shafts share the bay width; 2.3 m is the shaft depth) */
 const LIFT_BANK_DEPTH = 2.3;
 /** Lift lobby in front of the bank / at the head of the stair */
@@ -196,7 +212,7 @@ export interface SiteFrame {
 export function resolveFrame(
   spec: BuildingSpec,
   typology: TypologyDef,
-  warnings: string[],
+  sink: IssueSink,
   apps: PatternApplication[],
 ): SiteFrame {
   const boundary: Rect = { x: 0, y: 0, w: spec.site.width, h: spec.site.depth };
@@ -208,14 +224,18 @@ export function resolveFrame(
   // Relax setbacks that would leave nothing to build on.
   if (boundary.w - 2 * side < MIN_ENVELOPE) {
     const relaxed = Math.max(0, (boundary.w - MIN_ENVELOPE) / 2);
-    warnings.push(`Side setbacks ${side.toFixed(1)} m leave no buildable width on a ${boundary.w} m frontage; relaxed to ${relaxed.toFixed(1)} m (SIT-01).`);
+    sink.add(info(RULE.setbacks,
+      `Side setbacks ${side.toFixed(1)} m leave no buildable width on a ${boundary.w} m frontage; relaxed to ${relaxed.toFixed(1)} m (SIT-01).`,
+      { observed: side, limit: relaxed, source: 'SIT-01', resolution: { id: 'clamp', from: round(side), to: round(relaxed) } }));
     side = relaxed;
   }
   if (boundary.h - front - rear < MIN_ENVELOPE) {
     const total = front + rear;
     const budget = Math.max(0, boundary.h - MIN_ENVELOPE);
     const k = total > 0 ? budget / total : 0;
-    warnings.push(`Front+rear setbacks ${total.toFixed(1)} m leave no buildable depth on a ${boundary.h} m deep site; scaled to ${(k * 100).toFixed(0)}% (SIT-01).`);
+    sink.add(info(RULE.setbacks,
+      `Front+rear setbacks ${total.toFixed(1)} m leave no buildable depth on a ${boundary.h} m deep site; scaled to ${(k * 100).toFixed(0)}% (SIT-01).`,
+      { observed: round(total), limit: round(budget), source: 'SIT-01', resolution: { id: 'clamp', from: round(total), to: round(budget) } }));
     front = front * k;
     rear = rear * k;
   }
@@ -306,32 +326,44 @@ export function buildMassing(
   frame: SiteFrame,
   rng: Rng,
   ids: IdFactory,
-  warnings: string[],
+  sink: IssueSink,
   apps: PatternApplication[],
+  rules?: RuleSet,
 ): MassingResult {
   const env = frame.env;
   const storeysAbove = spec.massing.storeys;
-  if (storeysAbove > typology.storeys.max) {
-    warnings.push(`${storeysAbove} storeys exceeds the typology maximum of ${typology.storeys.max} for ${typology.name}.`);
-  }
-  if (storeysAbove < typology.storeys.min) {
-    warnings.push(`${storeysAbove} storeys is below the typology minimum of ${typology.storeys.min} for ${typology.name}.`);
+  // The typology band is ENFORCED by `normalizeSpec` (clamp, or an explicit
+  // `massing.allowStoreyOverride`); reaching here outside the band means the override was asked
+  // for (or a hand-built spec skipped normalisation), so it is recorded, not warned about twice.
+  if (storeysAbove > typology.storeys.max || storeysAbove < typology.storeys.min) {
+    const over = storeysAbove > typology.storeys.max;
+    sink.add(deviation(RULE.storeyBand,
+      `${storeysAbove} storeys is outside the ${typology.storeys.min}–${typology.storeys.max} storey band for ${typology.name}${spec.massing.allowStoreyOverride ? ' (override requested)' : ''}.`, {
+      observed: storeysAbove,
+      limit: over ? typology.storeys.max : typology.storeys.min,
+      source: 'typology.storeys',
+      resolution: over
+        ? { id: 'switch-highrise-ruleset', from: typology.storeys.max, to: storeysAbove, note: "rule profile 'high-rise' applied" }
+        : { id: 'none', from: typology.storeys.min, to: storeysAbove },
+    }));
   }
 
   // --- depth and length, clipped to the envelope (SIT-09) --------------------
-  const wantDepth = spec.massing.buildingDepth ?? typology.buildingDepth.default;
-  const wantLength = spec.massing.buildingLength ?? defaultLength(typology, env, wantDepth);
   const requested = spec.massing.footprintShape ?? typology.footprintShapes[0];
+  const dims = resolveDims(spec, typology, env);
+  const { wantDepth, wantLength, depth, length } = dims;
   let clipped = false;
-  let depth = clampNum(wantDepth, 4, env.h);
-  let length = clampNum(wantLength, 4, env.w);
   if (depth < wantDepth - 1e-6) {
     clipped = true;
-    warnings.push(`Building depth clipped from ${wantDepth.toFixed(1)} m to ${depth.toFixed(1)} m by the buildable envelope (${env.w.toFixed(1)} × ${env.h.toFixed(1)} m).`);
+    sink.add(info(RULE.buildingSize,
+      `Building depth clipped from ${wantDepth.toFixed(1)} m to ${depth.toFixed(1)} m by the buildable envelope (${env.w.toFixed(1)} × ${env.h.toFixed(1)} m).`,
+      { observed: round(wantDepth), limit: round(env.h), source: 'SIT-01 envelope', resolution: { id: 'clamp', from: round(wantDepth), to: round(depth) } }));
   }
   if (length < wantLength - 1e-6) {
     clipped = true;
-    warnings.push(`Building length clipped from ${wantLength.toFixed(1)} m to ${length.toFixed(1)} m by the buildable envelope.`);
+    sink.add(info(RULE.buildingSize,
+      `Building length clipped from ${wantLength.toFixed(1)} m to ${length.toFixed(1)} m by the buildable envelope.`,
+      { observed: round(wantLength), limit: round(env.w), source: 'SIT-01 envelope', resolution: { id: 'clamp', from: round(wantLength), to: round(length) } }));
   }
 
   // --- placement in Y (SIT-02 / SIT-04 / SIT-05 / SIT-06) -------------------
@@ -341,7 +373,7 @@ export function buildMassing(
   else if (frame.gardenSide === 'front') placeY = env.y + Math.max(0, env.h - depth); // SIT-04 flip
 
   // --- placement in X -------------------------------------------------------
-  const dw = dwellingsAcross(spec, typology, length, depth, storeysAbove, warnings);
+  const dw = houseRow(spec, typology, length, depth, storeysAbove, sink);
   let placeX = env.x + (env.w - length) / 2;
   if (typology.access === 'direct' && dw.count === 1 && typology.parking === 'garage-attached') {
     // A house with a garage hugs one side of the envelope so the bay fits beside it.
@@ -350,7 +382,7 @@ export function buildMassing(
   placeX = clampNum(placeX, env.x, env.x + Math.max(0, env.w - length));
 
   // --- shape decomposition --------------------------------------------------
-  const decomposed = decompose(requested, env, depth, length, placeX, placeY, rng, warnings, apps);
+  const decomposed = decomposeFootprint(requested, env, depth, length, placeX, placeY, rng, sink, apps);
   const shape = decomposed.shape;
   const rects = decomposed.parts.map(p => p.rect);
   const courtyardRect = decomposed.courtyard;
@@ -393,16 +425,7 @@ export function buildMassing(
   // outline would include a courtyard, because rectilinearOutline drops holes.)
   const plateArea = rects.reduce((s, r) => s + r.w * r.h, 0);
   const podiumArea = podiumRect ? podiumRect.w * podiumRect.h : plateArea;
-  let gfa = 0;
-  let residentialGfa = 0;
-  let residentialFloors = 0;
-  for (const f of spec.floors) {
-    if (f.index < 0) continue;                       // basements are not GFA
-    const area = f.index < podiumStoreys && podiumRect ? podiumArea : plateArea;
-    gfa += area;
-    if (f.use === 'residential') { residentialGfa += area; residentialFloors++; }
-    else if (f.use === 'lobby-residential') { residentialGfa += area * 0.8; residentialFloors++; }
-  }
+  const { gfa, residentialGfa, residentialFloors } = gfaBreakdown(spec, plateArea, podiumArea, podiumRect ? podiumStoreys : 0);
 
   const estimatedUnits = typology.access === 'direct'
     ? dw.count
@@ -414,6 +437,8 @@ export function buildMassing(
   // --- SIT-09: implied unit depth ------------------------------------------
   const corridorWidth = spec.massing.corridorWidth ?? typology.corridorWidth ?? 1.5;
   const impliedUnitDepth = impliedUnitDepthFor(typology.access, depth, corridorWidth);
+  const unitDepthMin = ruleNum(rules, RULE.unitDepthMin, UNIT_DEPTH_MIN);
+  const unitDepthMax = ruleNum(rules, RULE.unitDepthMax, UNIT_DEPTH_MAX);
   apps.push({
     patternId: 'SIT-09',
     storey: SITE_STOREY,
@@ -423,16 +448,24 @@ export function buildMassing(
       rule: ruleTextFor(typology.access),
     },
   });
-  if (impliedUnitDepth < UNIT_DEPTH_MIN) {
-    warnings.push(`Bar depth ${depth.toFixed(1)} m implies a ${impliedUnitDepth.toFixed(1)} m unit depth, below the ${UNIT_DEPTH_MIN} m minimum (SIT-09).`);
-  } else if (impliedUnitDepth > UNIT_DEPTH_MAX) {
-    warnings.push(`Bar depth ${depth.toFixed(1)} m implies a ${impliedUnitDepth.toFixed(1)} m unit depth, beyond the ${UNIT_DEPTH_MAX} m daylight limit (SIT-09).`);
+  if (impliedUnitDepth < unitDepthMin) {
+    sink.add(deviation(RULE.unitDepthMin,
+      `Bar depth ${depth.toFixed(1)} m implies a ${impliedUnitDepth.toFixed(1)} m unit depth, below the ${unitDepthMin} m minimum (SIT-09).`,
+      { observed: round(impliedUnitDepth), limit: unitDepthMin, source: 'SIT-09 unitDepthMin' }));
+  } else if (impliedUnitDepth > unitDepthMax) {
+    sink.add(deviation(RULE.unitDepthMax,
+      `Bar depth ${depth.toFixed(1)} m implies a ${impliedUnitDepth.toFixed(1)} m unit depth, beyond the ${unitDepthMax} m daylight limit (SIT-09).`,
+      { observed: round(impliedUnitDepth), limit: unitDepthMax, source: 'SIT-09 unitDepthMax' }));
   }
 
-  // --- corridors then cores -------------------------------------------------
+  // --- corridor graph, then cores in its break slots ------------------------
   const centroid = polygonCentroid(plateOutline);
-  const corridors = buildCorridors(bars, typology.access, corridorWidth, centroid, ids);
-  const coreOut = placeCores(spec, typology, bars, corridors, storeysAbove, estimatedUnits, unitsPerFloor, ids, warnings, apps);
+  const graph = buildCorridorGraph({
+    bars, access: typology.access, width: corridorWidth, footprintCentroid: centroid as Vec2,
+    shape, sprinklered: typology.sprinklered, rules, ids, sink,
+  });
+  const corridors = graph.spines;
+  const coreOut = placeCores(spec, typology, bars, corridors, storeysAbove, estimatedUnits, unitsPerFloor, ids, sink, apps, graph, rules);
 
   // --- roof -----------------------------------------------------------------
   const longest = bars.reduce((a, b) => (b.length > a.length ? b : a), bars[0]);
@@ -445,7 +478,9 @@ export function buildMassing(
   const heightAboveGrade = topOfFloors + roofRise;
 
   if (spec.site.maxHeight !== undefined && heightAboveGrade > spec.site.maxHeight + 1e-6) {
-    warnings.push(`Height ${heightAboveGrade.toFixed(1)} m exceeds the zoning limit of ${spec.site.maxHeight} m.`);
+    sink.add(deviation(RULE.maxHeight,
+      `Height ${heightAboveGrade.toFixed(1)} m exceeds the zoning limit of ${spec.site.maxHeight} m.`,
+      { observed: round(heightAboveGrade), limit: spec.site.maxHeight, source: 'spec.site.maxHeight' }));
   }
 
   // --- notional existing house in front of an ADU (SIT-05) ------------------
@@ -458,10 +493,14 @@ export function buildMassing(
     if (placeY - 1.5 >= 2.5) {
       existingHouseRect = { x: env.x, y: Math.max(0, placeY - separation - houseDepth), w: env.w, h: houseDepth };
     } else {
-      warnings.push('Lot is too shallow to show the notional main house in front of the ADU (SIT-05).');
+      sink.add(info(RULE.aduSeparation,
+        'Lot is too shallow to show the notional main house in front of the ADU (SIT-05).',
+        { source: 'SIT-05', resolution: { id: 'drop-band', note: 'notional context house omitted' } }));
     }
     if (existingHouseRect && separation + 1e-6 < ADU_SEPARATION) {
-      warnings.push(`ADU sits ${separation.toFixed(1)} m from the notional main house, below the ${ADU_SEPARATION} m separation target (SIT-05).`);
+      sink.add(deviation(RULE.aduSeparation,
+        `ADU sits ${separation.toFixed(1)} m from the notional main house, below the ${ADU_SEPARATION} m separation target (SIT-05).`,
+        { observed: round(separation), limit: ADU_SEPARATION, source: 'SIT-05' }));
     }
     apps.push({
       patternId: 'SIT-05',
@@ -487,7 +526,11 @@ export function buildMassing(
       params: { frontSetback: 0, buildToFraction: round(fraction, 3), frontageLength: round(frontWall) },
       note: fraction >= 0.7 ? 'Continuous street wall achieved.' : 'Street wall below the 70% build-to target.',
     });
-    if (fraction < 0.7) warnings.push(`Active street wall covers only ${(fraction * 100).toFixed(0)}% of the frontage (SIT-06 target 70%).`);
+    if (fraction < 0.7) {
+      sink.add(deviation(RULE.streetWall,
+        `Active street wall covers only ${(fraction * 100).toFixed(0)}% of the frontage (SIT-06 target 70%).`,
+        { observed: round(fraction, 3), limit: 0.7, source: 'SIT-06 buildToFraction' }));
+    }
   }
   apps.push({
     patternId: 'SIT-02',
@@ -525,6 +568,7 @@ export function buildMassing(
     towerFootprint: towerRect ? rectilinearOutline(rects) : undefined,
     cores: coreOut.cores,
     corridors,
+    corridorGraph: coreOut.graph,
     roof: { type: roofType, pitchRad, parapetHeight, ridgeAxis: longest.axis },
   };
 
@@ -533,12 +577,19 @@ export function buildMassing(
   const far = gfa / Math.max(1e-6, siteArea);
   const coverage = massing.footprintArea / Math.max(1e-6, siteArea);
   if (spec.site.maxFar !== undefined && far > spec.site.maxFar + 1e-6) {
-    warnings.push(`FAR ${far.toFixed(2)} exceeds the zoning limit of ${spec.site.maxFar}.`);
+    sink.add(deviation(RULE.maxFar, `FAR ${far.toFixed(2)} exceeds the zoning limit of ${spec.site.maxFar}.`,
+      { observed: round(far, 3), limit: spec.site.maxFar, source: 'spec.site.maxFar' }));
   }
   if (spec.site.maxCoverage !== undefined && coverage > spec.site.maxCoverage + 1e-6) {
-    warnings.push(`Site coverage ${(coverage * 100).toFixed(0)}% exceeds the zoning limit of ${(spec.site.maxCoverage * 100).toFixed(0)}%.`);
+    sink.add(deviation(RULE.maxCoverage,
+      `Site coverage ${(coverage * 100).toFixed(0)}% exceeds the zoning limit of ${(spec.site.maxCoverage * 100).toFixed(0)}%.`,
+      { observed: round(coverage, 3), limit: spec.site.maxCoverage, source: 'spec.site.maxCoverage' }));
   }
-  if (clipped) warnings.push('Footprint was clipped by the buildable envelope; check the massing against the intended dimensions.');
+  if (clipped) {
+    sink.add(info(RULE.buildingSize,
+      'Footprint was clipped by the buildable envelope; check the massing against the intended dimensions.',
+      { source: 'SIT-01 envelope', resolution: { id: 'clamp' } }));
+  }
 
   return {
     massing, footprintRect, plateRect, plateArea, podiumRect, towerRect, courtyardRect, existingHouseRect,
@@ -563,17 +614,18 @@ interface Decomposition { shape: FootprintShape; parts: BarPart[]; courtyard: Re
  * unbuildable geometry: a wing must be at least as long as the bar is deep, or it is a stub that
  * no corridor or core can serve.
  */
-function decompose(
+export function decomposeFootprint(
   shape: FootprintShape,
   env: Rect,
   depth: number,
   length: number,
   placeX: number,
   placeY: number,
-  rng: Rng,
-  warnings: string[],
-  apps: PatternApplication[],
+  rng?: Rng,
+  sink?: IssueSink,
+  apps?: PatternApplication[],
 ): Decomposition {
+  const report = sink ?? nullSink();
   const blockW = Math.min(length, env.w);
   const x0 = clampNum(placeX, env.x, env.x + Math.max(0, env.w - blockW));
   const barOnly = (): Decomposition => {
@@ -584,7 +636,11 @@ function decompose(
   if (shape === 'point') {
     const side = Math.min(depth, env.w, env.h);
     const r: Rect = { x: env.x + (env.w - side) / 2, y: env.y + (env.h - side) / 2, w: side, h: side };
-    if (side < depth - 1e-6) warnings.push(`Point plate side reduced from ${depth.toFixed(1)} m to ${side.toFixed(1)} m to fit the envelope.`);
+    if (side < depth - 1e-6) {
+      report.add(info(RULE.buildingSize,
+        `Point plate side reduced from ${depth.toFixed(1)} m to ${side.toFixed(1)} m to fit the envelope.`,
+        { observed: round(depth), limit: round(side), source: 'SIT-01 envelope', resolution: { id: 'clamp', from: round(depth), to: round(side) } }));
+    }
     return { shape: 'point', parts: [{ rect: r, axis: 'x' }], courtyard: null };
   }
 
@@ -602,18 +658,20 @@ function decompose(
       const rear: BarPart = { rect: { x: x0, y: env.y + env.h - depth, w: blockW, h: depth }, axis: 'x' };
       const left: BarPart = { rect: { x: x0, y: env.y + depth, w: depth, h: sideLen }, axis: 'y' };
       const right: BarPart = { rect: { x: x0 + blockW - depth, y: env.y + depth, w: depth, h: sideLen }, axis: 'y' };
-      apps.push({
+      apps?.push({
         patternId: 'SIT-03',
         params: { courtyardWidth: round(court.w), courtyardDepth: round(court.h), minClear: MIN_COURTYARD, area: round(court.w * court.h, 1) },
       });
       return { shape: 'O', parts: [front, left, right, rear], courtyard: court };
     }
-    warnings.push(`Courtyard would be only ${Math.max(0, Math.min(court.w, court.h)).toFixed(1)} m clear (minimum ${MIN_COURTYARD} m, side wings ${Math.max(0, sideLen).toFixed(1)} m long vs ${depth.toFixed(1)} m deep): perimeter block degraded to a U (SIT-03).`);
-    apps.push({
+    report.add(info(RULE.courtyard,
+      `Courtyard would be only ${Math.max(0, Math.min(court.w, court.h)).toFixed(1)} m clear (minimum ${MIN_COURTYARD} m, side wings ${Math.max(0, sideLen).toFixed(1)} m long vs ${depth.toFixed(1)} m deep): perimeter block degraded to a U (SIT-03).`,
+      { observed: round(Math.max(0, Math.min(court.w, court.h))), limit: MIN_COURTYARD, source: 'SIT-03 minCourtyard', resolution: { id: 'drop-band', from: 'O', to: 'U' } }));
+    apps?.push({
       patternId: 'SIT-03',
       params: { courtyardWidth: round(Math.max(0, court.w)), courtyardDepth: round(Math.max(0, court.h)), minClear: MIN_COURTYARD, degraded: 'U' },
     });
-    return decompose('U', env, depth, length, placeX, placeY, rng, warnings, apps);
+    return decomposeFootprint('U', env, depth, length, placeX, placeY, rng, sink, apps);
   }
 
   if (shape === 'U') {
@@ -623,17 +681,21 @@ function decompose(
       const court: Rect = { x: x0 + depth, y: env.y + depth, w: blockW - 2 * depth, h: wingLen };
       return { shape: 'U', parts: [front, left, right], courtyard: court };
     }
-    warnings.push(`U shape needs ${minWing.toFixed(1)} m of wing length and a ${MIN_U_OPENING} m court opening; degraded to an L.`);
-    return decompose('L', env, depth, length, placeX, placeY, rng, warnings, apps);
+    report.add(info(RULE.buildingSize,
+      `U shape needs ${minWing.toFixed(1)} m of wing length and a ${MIN_U_OPENING} m court opening; degraded to an L.`,
+      { observed: round(Math.max(0, wingLen)), limit: round(minWing), source: 'SIT-03', resolution: { id: 'drop-band', from: 'U', to: 'L' } }));
+    return decomposeFootprint('L', env, depth, length, placeX, placeY, rng, sink, apps);
   }
 
   if (shape === 'L') {
     if (wingLen >= minWing && blockW - depth >= MIN_WING) {
-      const side = rng.pick(['left', 'right'] as const);
+      const side = rng ? rng.pick(['left', 'right'] as const) : 'left';
       const wing: BarPart = { rect: { x: side === 'left' ? x0 : x0 + blockW - depth, y: env.y + depth, w: depth, h: wingLen }, axis: 'y' };
       return { shape: 'L', parts: [front, wing], courtyard: null };
     }
-    warnings.push(`L shape needs ${minWing.toFixed(1)} m of wing length; degraded to a bar.`);
+    report.add(info(RULE.buildingSize,
+      `L shape needs ${minWing.toFixed(1)} m of wing length; degraded to a bar.`,
+      { observed: round(Math.max(0, wingLen)), limit: round(minWing), source: 'SIT-02', resolution: { id: 'drop-band', from: 'L', to: 'bar' } }));
     return barOnly();
   }
 
@@ -642,7 +704,9 @@ function decompose(
     const wing: BarPart = { rect: { x: x0 + (blockW - depth) / 2, y: env.y + depth, w: depth, h: wingLen }, axis: 'y' };
     return { shape: 'T', parts: [front, wing], courtyard: null };
   }
-  warnings.push(`T shape needs ${minWing.toFixed(1)} m of wing length; degraded to a bar.`);
+  report.add(info(RULE.buildingSize,
+    `T shape needs ${minWing.toFixed(1)} m of wing length; degraded to a bar.`,
+    { observed: round(Math.max(0, wingLen)), limit: round(minWing), source: 'SIT-02', resolution: { id: 'drop-band', from: 'T', to: 'bar' } }));
   return barOnly();
 }
 
@@ -718,6 +782,50 @@ function ruleTextFor(access: AccessType): string {
 }
 
 /**
+ * Bar depth and length after clipping to the buildable envelope. Extracted so the parking solver
+ * can size demand from the same dimensions `buildMassing` builds (`estimateUnits` runs before the
+ * bars exist), and so the clip is measured in exactly one place.
+ */
+export function resolveDims(
+  spec: BuildingSpec,
+  typology: TypologyDef,
+  env: Rect,
+): { wantDepth: number; wantLength: number; depth: number; length: number } {
+  const wantDepth = spec.massing.buildingDepth ?? typology.buildingDepth.default;
+  const wantLength = spec.massing.buildingLength ?? defaultLength(typology, env, wantDepth);
+  return {
+    wantDepth,
+    wantLength,
+    depth: clampNum(wantDepth, 4, env.h),
+    length: clampNum(wantLength, 4, env.w),
+  };
+}
+
+/**
+ * GFA of the resolved floor list. Basements are not GFA; a podium floor takes the podium plate.
+ * Residential GFA counts a shared-entrance ground floor at 80 % (the lobby is not lettable), and
+ * `GFA_PER_UNIT` turns it into dwellings — the one unit-count rule site and the solver share.
+ */
+export function gfaBreakdown(
+  spec: BuildingSpec,
+  plateArea: number,
+  podiumArea: number,
+  podiumStoreys: number,
+): { gfa: number; residentialGfa: number; residentialFloors: number } {
+  let gfa = 0;
+  let residentialGfa = 0;
+  let residentialFloors = 0;
+  for (const f of spec.floors) {
+    if (f.index < 0) continue;                       // basements are not GFA
+    const area = f.index < podiumStoreys ? podiumArea : plateArea;
+    gfa += area;
+    if (f.use === 'residential') { residentialGfa += area; residentialFloors++; }
+    else if (f.use === 'lobby-residential') { residentialGfa += area * 0.8; residentialFloors++; }
+  }
+  return { gfa, residentialGfa, residentialFloors };
+}
+
+/**
  * Default bar length. Most typologies fill the buildable width, but a single dwelling does not
  * spread across its lot: a detached house or an ADU takes its own frontage (0.9–1.6 × its depth)
  * and leaves room for the garage bay and the side yards (SIT-02).
@@ -756,13 +864,13 @@ export interface HouseRow {
  * over the residential floors and the net bar depth, clamped to the template's own frontage band.
  * Anything else leaves the site's front doors and garages out of step with the dwellings.
  */
-function dwellingsAcross(
+export function houseRow(
   spec: BuildingSpec,
   typology: TypologyDef,
   length: number,
   depth: number,
   storeys: number,
-  warnings: string[],
+  sink?: IssueSink,
 ): HouseRow {
   const netDepth = Math.max(2, depth - EXTERNAL_WALL_PAIR);
   const mix = resolveUnitMix(spec, typology);
@@ -789,7 +897,9 @@ function dwellingsAcross(
     if (length / across < minF - 0.05) across = Math.max(1, Math.floor(length / Math.max(2, minF)));
     const band = typology.unitsPerFloor;
     if (across < band.min || across > band.max) {
-      warnings.push(`Row of ${across} dwellings at ${(length / across).toFixed(1)} m frontage sits outside the typology's ${band.min}–${band.max} dwellings-per-floor band for ${typology.name} (SIT-02).`);
+      sink?.add(deviation(RULE.dwellingBand,
+        `Row of ${across} dwellings at ${(length / across).toFixed(1)} m frontage sits outside the typology's ${band.min}–${band.max} dwellings-per-floor band for ${typology.name} (SIT-02).`,
+        { observed: across, limit: `${band.min}–${band.max}`, source: 'typology.unitsPerFloor' }));
     }
   }
   // Stacked flats put one dwelling per floor behind each front door.
@@ -798,61 +908,28 @@ function dwellingsAcross(
 }
 
 // ---------------------------------------------------------------------------
-// Corridors
+// Corridors: owned by corridor-graph.ts (spines, legs, knuckles, break slots, dead ends)
 // ---------------------------------------------------------------------------
-
-const CORRIDOR_ACCESS: AccessType[] = ['corridor-double', 'corridor-single', 'gallery', 'cluster'];
-
-/**
- * One spine per bar. Double-loaded and cluster corridors sit at mid-depth.
- *
- * Single-loaded and gallery spines sit HARD AGAINST the long face away from the street (or away
- * from the courtyard, for a bar in a ring): the centreline is half the deck width off that face,
- * i.e. always within 1 m of it. Architecture models the deck outside the envelope and gives the
- * whole bar depth to the dwellings, so a spine drawn anywhere else would describe a building that
- * is not built — and would push the core off the face it has to open onto.
- */
-export function buildCorridors(
-  bars: MassingBar[],
-  access: AccessType,
-  width: number,
-  footprintCentroid: [number, number],
-  ids: IdFactory,
-): CorridorSpine[] {
-  if (!CORRIDOR_ACCESS.includes(access)) return [];
-  const single = access === 'corridor-single' || access === 'gallery';
-  const out: CorridorSpine[] = [];
-  for (const bar of bars) {
-    const r = bar.rect;
-    const acrossIsY = bar.axis === 'x';
-    const barMid = acrossIsY ? r.y + r.h / 2 : r.x + r.w / 2;
-    const centroidAcross = acrossIsY ? footprintCentroid[1] : footprintCentroid[0];
-    let offset = bar.depth / 2;
-    let outwardSign = -1;                   // -1: outer (street / away-from-court) face is the across-min face
-    if (single) {
-      // The deck takes the inner face — the one looking at the rest of the block, or the rear of
-      // a lone bar — so every dwelling keeps the street / outward aspect.
-      if (centroidAcross < barMid - 0.5) outwardSign = 1;
-      offset = outwardSign < 0 ? bar.depth - width / 2 : width / 2;
-      offset = clampNum(offset, width / 2, bar.depth - width / 2);
-    }
-    const dir: [number, number] = acrossIsY ? [1, 0] : [0, 1];
-    const bandNormal: [number, number] = acrossIsY ? [0, outwardSign] : [outwardSign, 0];
-    const loaded: CorridorSpine['loaded'] = single ? (cross(dir, bandNormal) > 0 ? 'left' : 'right') : 'both';
-    const centerline = acrossIsY
-      ? { a: [r.x, r.y + offset] as [number, number], b: [r.x + r.w, r.y + offset] as [number, number] }
-      : { a: [r.x + offset, r.y] as [number, number], b: [r.x + offset, r.y + r.h] as [number, number] };
-    out.push({ id: ids.next(SITE_STOREY, 'CORR'), barId: bar.id, centerline, width, loaded });
-  }
-  return out;
-}
 
 // ---------------------------------------------------------------------------
 // SIT-08 Two Ways Out — cores
 // ---------------------------------------------------------------------------
 
-interface CoreResult { cores: CorePlacement[]; travelLimit: number; maxTravel: number }
+interface CoreResult {
+  cores: CorePlacement[];
+  travelLimit: number;
+  maxTravel: number;
+  /** The graph with the consumed break slots removed (slots and cores are disjoint) */
+  graph?: CorridorGraph;
+}
 
+/**
+ * SIT-08. v2: on a corridor the core stations come from the corridor graph's BREAK SLOTS first —
+ * a core dropped into a slot costs the corridor nothing, because the slot was already subtracted
+ * from the unit frontage — and only fall back to `alongPositions` when a bar has no slot to
+ * spend. The exit separation is checked against the chosen slot stations, and the slots a core
+ * takes are removed from the graph, so the architecture placer never puts a lounge in a core.
+ */
 export function placeCores(
   spec: BuildingSpec,
   typology: TypologyDef,
@@ -862,10 +939,15 @@ export function placeCores(
   estimatedUnits: number,
   unitsPerFloor: number,
   ids: IdFactory,
-  warnings: string[],
+  sink: IssueSink,
   apps: PatternApplication[],
+  graph?: CorridorGraph,
+  rules?: RuleSet,
 ): CoreResult {
-  const travelLimit = typology.sprinklered ? TRAVEL_SPRINKLERED : TRAVEL_UNSPRINKLERED;
+  const travelLimit = ruleNum(rules, travelRule(typology.sprinklered),
+    typology.sprinklered ? TRAVEL_SPRINKLERED : TRAVEL_UNSPRINKLERED);
+  const endClearance = ruleNum(rules, 'SIT-08.endClearance', CORE_END_CLEARANCE);
+  const separationFraction = ruleNum(rules, RULE.exitSeparation, typology.sprinklered ? 1 / 3 : 1 / 2);
   const access = typology.access;
   if (access === 'direct') {
     apps.push({
@@ -873,7 +955,7 @@ export function placeCores(
       storey: SITE_STOREY,
       params: { access, cores: 0, reason: 'every dwelling has its own door to the street; internal stairs only' },
     });
-    return { cores: [], travelLimit, maxTravel: 0 };
+    return { cores: [], travelLimit, maxTravel: 0, graph };
   }
 
   const elevatorTotal = typology.elevator
@@ -907,7 +989,9 @@ export function placeCores(
     };
     const maxTravel = Math.hypot(bar.rect.w, bar.rect.h) / 2;
     if (d + 1e-6 < stairRun) {
-      warnings.push(`Point core is only ${d.toFixed(1)} m deep; a dog-leg stair for a ${f2fMax.toFixed(1)} m floor-to-floor needs ${stairRun.toFixed(1)} m (SIT-08).`);
+      sink.add(deviation(RULE.coreFit,
+        `Point core is only ${d.toFixed(1)} m deep; a dog-leg stair for a ${f2fMax.toFixed(1)} m floor-to-floor needs ${stairRun.toFixed(1)} m (SIT-08).`,
+        { elementIds: [core.id], observed: round(d), limit: round(stairRun), source: 'SIT-08' }));
     }
     apps.push({
       patternId: 'SIT-08',
@@ -930,14 +1014,18 @@ export function placeCores(
       params: { shaftBayAlong: CORE_SHAFT_BAY, bayOn: 'long side of the point core', cores: 1 },
       note: 'The core rect reserves the M/E riser and refuse chute bay, so no shaft is taken out of a dwelling.',
     });
-    if (maxTravel > travelLimit) warnings.push(`Point plate travel distance ${maxTravel.toFixed(1)} m exceeds the ${travelLimit} m limit (SIT-08).`);
-    return { cores: [core], travelLimit, maxTravel };
+    if (maxTravel > travelLimit) {
+      sink.add(deviation(travelRule(typology.sprinklered),
+        `Point plate travel distance ${maxTravel.toFixed(1)} m exceeds the ${travelLimit} m limit (SIT-08).`,
+        { elementIds: [core.id], observed: round(maxTravel), limit: travelLimit, source: 'SIT-08 travelLimit' }));
+    }
+    return { cores: [core], travelLimit, maxTravel, graph };
   }
 
   // --- stair cores: one per core MODULE of frontage --------------------------
   if (access === 'stair-core') {
-    const out = placeStairCores(spec, typology, bars, storeys, unitsPerFloor, elevatorTotal, coreAcross, stairRun, f2fMax, ids, warnings, apps);
-    return { ...out, travelLimit };
+    const out = placeStairCores(spec, typology, bars, storeys, unitsPerFloor, elevatorTotal, coreAcross, stairRun, f2fMax, ids, sink, apps);
+    return { ...out, travelLimit, graph };
   }
 
   // --- corridor / gallery / cluster -----------------------------------------
@@ -953,13 +1041,17 @@ export function placeCores(
       : Math.max(2, Math.ceil(totalLength / travelLimit), Math.ceil(unitsPerFloor / 12));
   const fits = Math.max(1, Math.floor(totalLength / 10));   // a core needs ~10 m of corridor to serve
   if (total > fits) {
-    warnings.push(`${total} cores do not fit in ${totalLength.toFixed(1)} m of corridor; reduced to ${fits} (SIT-08).`);
+    sink.add(info(RULE.coreCount,
+      `${total} cores do not fit in ${totalLength.toFixed(1)} m of corridor; reduced to ${fits} (SIT-08).`,
+      { observed: total, limit: fits, source: 'SIT-08', resolution: { id: 'clamp', from: total, to: fits } }));
     total = fits;
   }
   total = clampNum(total, 1, fits);
 
   const allocation = allocate(total, bars.map(b => b.length));
   const cores: CorePlacement[] = [];
+  /** Break slots a core was dropped into, so the graph can drop them */
+  const takenSlots = new Set<string>();
   let maxTravel = 0;
   let minEndDistance = Infinity;
   const noCoreBars: MassingBar[] = [];
@@ -976,13 +1068,23 @@ export function placeCores(
     const frontBand = corridorOffset - corridorWidth / 2;
     const rearBand = bar.depth - (corridorOffset + corridorWidth / 2);
     const diagonal = Math.hypot(bar.length, bar.depth);
-    const requiredSeparation = diagonal * (typology.sprinklered ? 1 / 3 : 1 / 2);
-    let positions = alongPositions(bar.length, n, CORE_END_CLEARANCE);
+    const requiredSeparation = diagonal * separationFraction;
+    let positions = alongPositions(bar.length, n, endClearance);
     // A short bar cannot separate its exits with a 6 m end clearance; give the clearance up
     // before giving up the separation (IBC §1007.1.1).
     if (n >= 2 && positions.length === n && positions[n - 1] - positions[0] + 1e-6 < requiredSeparation) {
       const relaxed = alongPositions(bar.length, n, 2.0);
       if (relaxed[n - 1] - relaxed[0] > positions[n - 1] - positions[0]) positions = relaxed;
+    }
+    // v2: spend the corridor graph's break slots first — a core in a slot costs no corridor —
+    // and keep the ideal spacing when the slots would push the exits closer together.
+    const snapped = snapToSlots(positions, coreSlotsOn(graph, bar.id), bar.length, CORE_SNAP_WINDOW);
+    if (snapped && minSeparation(snapped.stations) >= Math.min(requiredSeparation, minSeparation(positions)) - 1e-6) {
+      positions = snapped.stations;
+      for (const id of snapped.slotIds) takenSlots.add(id);
+      sink.add(info(RULE.coreCount,
+        `${snapped.slotIds.length} core(s) on bar ${bar.id} placed in corridor break slot(s) at ${snapped.stations.map(v => v.toFixed(1)).join(', ')} m (ARC-03 / SIT-08).`,
+        { observed: snapped.slotIds.length, limit: n, source: 'ARC-03 break slots', resolution: { id: 'add-core' } }));
     }
     for (let k = 0; k < positions.length; k++) {
       // Alternate which side of the corridor the core sits on — the first core takes the wider
@@ -1001,7 +1103,9 @@ export function placeCores(
       } else {
         acrossLen = Math.min(required, bar.depth - 0.4);
         acrossStart = clampNum(corridorOffset - acrossLen / 2, 0.2, bar.depth - acrossLen - 0.2);
-        warnings.push(`Core on bar ${bar.id} cannot fit beside a ${corridorWidth.toFixed(1)} m corridor in a ${bar.depth.toFixed(1)} m bar; it straddles the corridor (SIT-08).`);
+        sink.add(info(RULE.coreFit,
+          `Core on bar ${bar.id} cannot fit beside a ${corridorWidth.toFixed(1)} m corridor in a ${bar.depth.toFixed(1)} m bar; it straddles the corridor (SIT-08).`,
+          { observed: round(band), limit: 4.0, source: 'SIT-08', resolution: { id: 'shift-lateral', note: 'core straddles the spine' } }));
       }
       cores.push({
         id: ids.next(SITE_STOREY, 'CORE'),
@@ -1017,7 +1121,9 @@ export function placeCores(
     if (positions.length >= 2) {
       const separation = positions[positions.length - 1] - positions[0];
       if (separation + 1e-6 < requiredSeparation) {
-        warnings.push(`Exits on bar ${bar.id} are ${separation.toFixed(1)} m apart, less than the required ${requiredSeparation.toFixed(1)} m (1/${typology.sprinklered ? 3 : 2} of the ${diagonal.toFixed(1)} m diagonal) (SIT-08).`);
+        sink.add(deviation(RULE.exitSeparation,
+          `Exits on bar ${bar.id} are ${separation.toFixed(1)} m apart, less than the required ${requiredSeparation.toFixed(1)} m (1/${typology.sprinklered ? 3 : 2} of the ${diagonal.toFixed(1)} m diagonal) (SIT-08).`,
+          { observed: round(separation), limit: round(requiredSeparation), source: 'SIT-08 exitSeparationFraction' }));
       }
     }
   }
@@ -1035,7 +1141,7 @@ export function placeCores(
       unitsPerFloor, storeys,
       sprinklered: typology.sprinklered, travelLimit,
       corridorSystemLength: round(totalLength), maxTravel: round(maxTravel),
-      endClearance: CORE_END_CLEARANCE,
+      endClearance: round(endClearance),
       coreAlongBar: CORE_WIDTH_ALONG_BAR, stairBayAlong: CORE_STAIR_BAY, shaftBayAlong: CORE_SHAFT_BAY,
       coreAcross: round(coreAcross), stairRun: round(stairRun), floorToFloor: round(f2fMax),
       liftBank: typology.elevator ? LIFT_BANK_DEPTH : 0, liftLobby: LIFT_LOBBY_DEPTH,
@@ -1053,9 +1159,113 @@ export function placeCores(
     });
   }
   if (maxTravel > travelLimit) {
-    warnings.push(`Travel distance ${maxTravel.toFixed(1)} m exceeds the ${travelLimit} m limit for ${typology.sprinklered ? 'a sprinklered' : 'an unsprinklered'} building; add a core (SIT-08).`);
+    sink.add(deviation(travelRule(typology.sprinklered),
+      `Travel distance ${maxTravel.toFixed(1)} m exceeds the ${travelLimit} m limit for ${typology.sprinklered ? 'a sprinklered' : 'an unsprinklered'} building; add a core (SIT-08).`,
+      { observed: round(maxTravel), limit: travelLimit, source: 'SIT-08 travelLimit' }));
   }
-  return { cores, travelLimit, maxTravel };
+  // The cores ARE the exits a dead end is measured to, so the dead-end pass runs last.
+  const placed = withoutCoreSlots(graph, takenSlots, cores, bars);
+  const resolved = placed
+    ? resolveDeadEnds({
+      graph: placed, bars, exits: coreStations(cores, bars),
+      sprinklered: typology.sprinklered, rules, sink,
+    })
+    : placed;
+  return { cores, travelLimit, maxTravel, graph: resolved };
+}
+
+/** Core centres — the exit list the dead-end check measures along each spine. */
+function coreStations(
+  cores: readonly CorePlacement[],
+  bars: readonly MassingBar[],
+): { barId: string; at: Vec2; length: number }[] {
+  const barById = new Map(bars.map(b => [b.id, b]));
+  const out: { barId: string; at: Vec2; length: number }[] = [];
+  for (const c of cores) {
+    const bar = barById.get(c.barId);
+    if (!bar) continue;
+    out.push({
+      barId: c.barId,
+      at: [c.rect.x + c.rect.w / 2, c.rect.y + c.rect.h / 2],
+      length: round(bar.axis === 'x' ? c.rect.w : c.rect.h, 3),
+    });
+  }
+  return out;
+}
+
+/**
+ * Assign each ideal core station to the nearest unclaimed break slot (slots wanting a core come
+ * first). Returns null when the bar has no slots, so the caller keeps `alongPositions`.
+ */
+function snapToSlots(
+  ideal: number[],
+  slots: BreakSlot[],
+  barLength: number,
+  window: number,
+): { stations: number[]; slotIds: string[] } | null {
+  if (slots.length === 0 || ideal.length === 0) return null;
+  const half = CORE_WIDTH_ALONG_BAR / 2;
+  const free = slots.filter(s => s.station >= half - 1e-6 && s.station <= barLength - half + 1e-6);
+  if (free.length === 0) return null;
+  const used = new Set<string>();
+  const stations: number[] = [];
+  const slotIds: string[] = [];
+  for (const want of ideal) {
+    let best: BreakSlot | null = null;
+    for (const s of free) {
+      if (used.has(s.id) || Math.abs(s.station - want) > window) continue;
+      if (best === null) { best = s; continue; }
+      const better = Math.abs(s.station - want) < Math.abs(best.station - want) - 1e-9
+        || (Math.abs(s.station - want) < Math.abs(best.station - want) + 1e-9 && s.want === 'core' && best.want !== 'core');
+      if (better) best = s;
+    }
+    if (best === null) { stations.push(want); continue; }
+    used.add(best.id);
+    stations.push(round(best.station, 3));
+    slotIds.push(best.id);
+  }
+  if (slotIds.length === 0) return null;
+  stations.sort((a, b) => a - b);
+  return { stations, slotIds };
+}
+
+/** Smallest gap between consecutive stations (Infinity for a single core). */
+function minSeparation(stations: number[]): number {
+  let min = Infinity;
+  for (let i = 1; i < stations.length; i++) min = Math.min(min, stations[i] - stations[i - 1]);
+  return min;
+}
+
+/**
+ * Break slots minus the ones a core took, and minus any slot a core now overlaps along its bar:
+ * what is left is what the architecture placer may fill with a lounge or a window bay.
+ */
+function withoutCoreSlots(
+  graph: CorridorGraph | undefined,
+  taken: Set<string>,
+  cores: CorePlacement[],
+  bars: MassingBar[],
+): CorridorGraph | undefined {
+  if (!graph) return graph;
+  const barById = new Map(bars.map(b => [b.id, b]));
+  const spans = new Map<string, { a: number; b: number }[]>();
+  for (const c of cores) {
+    const bar = barById.get(c.barId);
+    if (!bar) continue;
+    const a = bar.axis === 'x' ? c.rect.x - bar.rect.x : c.rect.y - bar.rect.y;
+    const w = bar.axis === 'x' ? c.rect.w : c.rect.h;
+    const list = spans.get(c.barId);
+    if (list) list.push({ a, b: a + w });
+    else spans.set(c.barId, [{ a, b: a + w }]);
+  }
+  const kept = graph.breakSlots.filter(s => {
+    if (taken.has(s.id)) return false;
+    for (const sp of spans.get(s.barId) ?? []) {
+      if (s.station + s.length / 2 > sp.a && sp.b > s.station - s.length / 2) return false;
+    }
+    return true;
+  });
+  return kept.length === graph.breakSlots.length ? graph : { ...graph, breakSlots: kept };
 }
 
 /**
@@ -1085,7 +1295,7 @@ function placeStairCores(
   stairRun: number,
   f2fMax: number,
   ids: IdFactory,
-  warnings: string[],
+  sink: IssueSink,
   apps: PatternApplication[],
 ): { cores: CorePlacement[]; maxTravel: number } {
   const perCore = Math.max(1, typology.unitsPerCore ?? 2);
@@ -1122,7 +1332,9 @@ function placeStairCores(
     counts = allocate(Math.max(override, bars.length), bars.map(b => b.length)).map(v => Math.max(1, v));
     source = 'spec.massing.coreCount';
     if (!singleAllowed && counts.reduce((a, b) => a + b, 0) < 2) {
-      warnings.push(`massing.coreCount asks for one stair core, but ${storeys} storeys / ${unitsPerFloor} units per floor need two ways out (SIT-08).`);
+      sink.add(deviation(RULE.coreCount,
+        `massing.coreCount asks for one stair core, but ${storeys} storeys / ${unitsPerFloor} units per floor need two ways out (SIT-08).`,
+        { observed: 1, limit: 2, source: 'spec.massing.coreCount' }));
     }
   } else if (!singleAllowed && counts.reduce((a, b) => a + b, 0) < 2) {
     const longest = bars.reduce((best, b, i) => (b.length > bars[best].length ? i : best), 0);
@@ -1131,7 +1343,9 @@ function placeStairCores(
       counts[longest] += 1;
       source = 'SIT-08 egress minimum (2 exits)';
     } else {
-      warnings.push(`${storeys} storeys / ${unitsPerFloor} units per floor need two ways out, but a ${bars[longest].length.toFixed(1)} m bar holds only one stair core and its landing (SIT-08).`);
+      sink.add(deviation(RULE.coreCount,
+        `${storeys} storeys / ${unitsPerFloor} units per floor need two ways out, but a ${bars[longest].length.toFixed(1)} m bar holds only one stair core and its landing (SIT-08).`,
+        { observed: 1, limit: 2, source: 'SIT-08 singleExitMaxStoreys' }));
     }
   }
 
@@ -1146,7 +1360,9 @@ function placeStairCores(
     // The landing sits beside the core ACROSS the bar, so the core may take the full bar depth.
     const acrossLen = Math.min(coreAcross, bar.depth - 0.5);
     if (acrossLen + 1e-6 < stairRun) {
-      warnings.push(`Stair core on bar ${bar.id} is only ${acrossLen.toFixed(1)} m across; a dog-leg stair for a ${f2fMax.toFixed(1)} m floor-to-floor needs ${stairRun.toFixed(1)} m (SIT-08).`);
+      sink.add(deviation(RULE.coreFit,
+        `Stair core on bar ${bar.id} is only ${acrossLen.toFixed(1)} m across; a dog-leg stair for a ${f2fMax.toFixed(1)} m floor-to-floor needs ${stairRun.toFixed(1)} m (SIT-08).`,
+        { observed: round(acrossLen), limit: round(stairRun), source: 'SIT-08' }));
     }
     for (const p of positions) {
       cores.push({
@@ -1162,7 +1378,9 @@ function placeStairCores(
     maxTravel = Math.max(maxTravel, travelOnBar(bar.length, positions));
     const side = (bar.length / n - CORE_WIDTH_ALONG_BAR) / 2;
     if (side < landing + 2.6) {
-      warnings.push(`${n} stair core(s) on bar ${bar.id} leave ${Math.max(0, side).toFixed(1)} m of frontage per landing side, too little for a landing plus a dwelling (SIT-08)${n > 1 ? '; set massing.coreCount lower' : ''}.`);
+      sink.add(deviation(RULE.coreFit,
+        `${n} stair core(s) on bar ${bar.id} leave ${Math.max(0, side).toFixed(1)} m of frontage per landing side, too little for a landing plus a dwelling (SIT-08)${n > 1 ? '; set massing.coreCount lower' : ''}.`,
+        { observed: round(Math.max(0, side)), limit: round(landing + 2.6), source: 'SIT-08' }));
     }
   }
 

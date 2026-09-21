@@ -3,31 +3,40 @@
  *
  * Surface parking is packed into the yards in preference order (rear → side → front, never the
  * front while another yard can hold it), in double-loaded 16.8 m modules off a single 6.0 m
- * aisle. Structured parking (podium / underground) fills the parking storey's outline with the
- * same module plus one ramp at the rear. Garage parking is a bay beside a detached house, or an
+ * aisle. Structured parking (podium / underground) fills EVERY parking storey's outline with the
+ * same module plus one ramp per level. Garage parking is a bay beside a detached house, or an
  * integral garage per dwelling in a row.
  *
  * `ParkingSpace.rect` is always the axis-aligned footprint of the stall (already transposed for
  * rows that run along +Y); `rotation` is the bearing of the stall's long axis — the direction a
  * parked car points — and must NOT be applied to `rect` a second time.
+ *
+ * v2: the demand and the level count are solved BEFORE the massing by `parking-solver.ts`, which
+ * also owns the one capacity function (`stallCapacity` / `stallSlots`). This file only builds what
+ * the plan says, so "required vs achieved" can no longer drift into a warning: a shortfall the
+ * solver could not resolve is already a `relax-parking-ratio` deviation, and a shortfall that only
+ * shows up at packing time is recorded here with the same resolution.
  */
 import type {
   BuildingSpec, TypologyDef, Rng, Rect, ParkingLot, ParkingSpace, ModelElement, Entrance,
-  PatternApplication, ParkingType,
+  PatternApplication, ParkingType, FloorSpec,
 } from '../../core/types.ts';
+import type { RuleSet } from '../../core/rules/types.ts';
 import { rectCenter, rectToPolygon, relativeTo, round } from '../../core/geometry.ts';
 import { SIZES } from '../../core/coordination.ts';
 import type { IdFactory } from '../../core/ids.ts';
 import { SITE_STOREY, storeyIdFor } from '../../core/ids.ts';
 import type { SiteFrame, MassingResult } from './massing.ts';
 import { clampNum, subtractRects, pset, SITE_COLORS } from './util.ts';
+import { RULE, deviation, info, type IssueSink } from './issues.ts';
+import {
+  accessibleFor, evEveryFor, parkingFloors, rampRect, stallCapacity, stallOptsFrom, stallSlots,
+  structuredZone, RAMP_W, type ParkingPlan, type StallOpts,
+} from './parking-solver.ts';
 
 const STALL_W = SIZES.parkingStallW;   // 2.6
 const STALL_L = SIZES.parkingStallL;   // 5.4
 const AISLE = SIZES.parkingAisleW;     // 6.0
-const ACC_W = SIZES.accessibleStallW;  // 3.6
-const RAMP_W = 3.5;
-const RAMP_L = 12.0;
 const GARAGE_SIDE = 6.0;               // detached double garage, 6 × 6
 const BIKE_AREA_PER_SPACE = 1.2;       // m² per bicycle in a two-tier rack room
 
@@ -59,7 +68,9 @@ export function buildParking(
   mainEntrance: Entrance | null,
   rng: Rng,
   ids: IdFactory,
-  warnings: string[],
+  sink: IssueSink,
+  plan?: ParkingPlan,
+  rules?: RuleSet,
 ): ParkingResult {
   const p = spec.site.parking ?? {};
   const type: ParkingType = p.type ?? typology.parking;
@@ -67,9 +78,12 @@ export function buildParking(
   const evShare = clampNum(p.evShare ?? 0.2, 0, 1);
   const bikeRatio = p.bikeRatio ?? typology.bikeRatio;
   const units = m.estimatedUnits;
-  // 'none' means the typology is deliberately car-free, so nothing is owed.
-  const required = type === 'none' ? 0 : Math.max(0, Math.ceil(units * ratio));
+  // 'none' means the typology is deliberately car-free, so nothing is owed. The solver already
+  // computed `required` from its own (pure) unit estimate; keep its number so demand and supply
+  // are quoted against the same figure.
+  const required = plan ? plan.required : type === 'none' ? 0 : Math.max(0, Math.ceil(units * ratio));
   const bikeSpaces = Math.max(0, Math.ceil(units * bikeRatio));
+  const opts: StallOpts = stallOptsFrom(rules);
   const apps: PatternApplication[] = [];
   const elements: ModelElement[] = [];
   const hardscape: Rect[] = [];
@@ -84,14 +98,14 @@ export function buildParking(
   let note = '';
 
   if (type === 'garage-attached') {
-    const g = buildGarages(frame, m, ids, warnings);
+    const g = buildGarages(frame, m, ids, sink);
     spaces = g.spaces; garages.push(...g.garages); driveway = g.driveway;
     for (const r of g.hardscape) hardscape.push(r);
     for (const e of g.entrances) extraEntrances.push(e);
     for (const el of g.elements) elements.push(el);
     note = g.note;
   } else if (type === 'podium' || type === 'underground') {
-    const s = structuredParking(spec, type, frame, m, required, evShare, ids, warnings);
+    const s = structuredParking(spec, type, frame, m, required, evShare, ids, opts);
     if (s) {
       spaces = s.spaces; aisles = s.aisles; storey = s.storey;
       for (const el of s.elements) elements.push(el);
@@ -102,15 +116,17 @@ export function buildParking(
         elements.push(pavingElement(ids, driveway, 'Driveway', SITE_COLORS.driveway, ['SIT-07', 'SIT-11']));
       }
     } else {
-      warnings.push(`${type} parking requested but no storey has use 'parking'; falling back to surface parking (SIT-07).`);
-      const surf = surfaceParking(frame, m, required, evShare, ids, warnings);
+      sink.add(info(RULE.parkingType,
+        `${type} parking requested but no storey has use 'parking'; falling back to surface parking (SIT-07).`,
+        { source: 'SIT-07', resolution: { id: 'clamp', from: type, to: 'surface' } }));
+      const surf = surfaceParking(frame, m, required, evShare, ids, sink, opts);
       spaces = surf.spaces; aisles = surf.aisles;
       for (const r of surf.hardscape) hardscape.push(r);
       builtType = surf.spaces.length > 0 ? 'surface' : 'none';
       note = `fallback from ${type}: ${surf.note}`;
     }
   } else if (type === 'surface') {
-    const surf = surfaceParking(frame, m, required, evShare, ids, warnings);
+    const surf = surfaceParking(frame, m, required, evShare, ids, sink, opts);
     spaces = surf.spaces; aisles = surf.aisles;
     for (const r of surf.hardscape) hardscape.push(r);
     note = surf.note;
@@ -130,8 +146,18 @@ export function buildParking(
   const achieved = spaces.length;
   const accessible = spaces.filter(s => s.type === 'accessible').length;
   const ev = spaces.filter(s => s.type === 'ev').length;
-  if (required > 0 && achieved < required) {
-    warnings.push(`Parking: ${required} spaces required (${units} units × ${ratio}), ${achieved} achieved (${note}).`);
+  // The solver records the shortfall it could not resolve; this catches the case where the
+  // packed geometry falls short of the capacity the solver predicted (a clipped plate, a yard
+  // the bars ate) so "achieved == required or a recorded deviation" always holds.
+  if (required > 0 && achieved < required && (!plan || plan.deferred || plan.achieved >= plan.required)) {
+    sink.add(deviation(RULE.parkingRatio,
+      `Parking: ${required} spaces required (${units} units × ${ratio}), ${achieved} achieved (${note}).`, {
+      storey,
+      observed: achieved,
+      limit: required,
+      source: 'SIT-07 parkingRatio',
+      resolution: { id: 'relax-parking-ratio', from: ratio, to: Number((achieved / Math.max(1, units)).toFixed(3)) },
+    }));
   }
 
   // --- stall + car elements -------------------------------------------------
@@ -218,6 +244,7 @@ export function buildParking(
     }
   }
 
+  const storeysUsed = [...new Set(spaces.map(s => s.storey))];
   apps.push({
     patternId: 'SIT-07',
     storey,
@@ -226,6 +253,11 @@ export function buildParking(
       units, ratio, accessible, ev, evShare,
       bikeSpaces, stallWidth: STALL_W, stallLength: STALL_L, aisleWidth: AISLE,
       rows: aisles.length, note,
+      levels: storeysUsed.length,
+      storeys: storeysUsed.join('+'),
+      basementStoreys: plan ? plan.basementStoreys : (spec.massing.basementStoreys ?? 0),
+      podiumStoreys: plan ? plan.podiumStoreys : (spec.massing.podiumStoreys ?? 0),
+      ratioApplied: plan ? plan.ratioApplied : round(achieved / Math.max(1, units), 3),
     },
   });
 
@@ -252,7 +284,8 @@ function surfaceParking(
   required: number,
   evShare: number,
   ids: IdFactory,
-  warnings: string[],
+  sink: IssueSink,
+  opts: StallOpts,
 ): PackResult {
   const spaces: ParkingSpace[] = [];
   const aisles: Rect[] = [];
@@ -268,114 +301,70 @@ function surfaceParking(
 
   const buildingFrontY = Math.min(...m.massing.bars.map(b => b.rect.y));
   const candidates = free
-    .map(r => ({ r, front: rectCenter(r)[1] < buildingFrontY, cap: capacityOf(r) }))
+    .map(r => ({ r, front: rectCenter(r)[1] < buildingFrontY, cap: stallCapacity(r, { ...opts, accessible: 0 }) }))
     .filter(c => c.cap > 0)
     .sort((a, b) => (a.front === b.front ? b.cap - a.cap : a.front ? 1 : -1));
 
-  const evEvery = evShare > 0 ? Math.max(1, Math.round(1 / evShare)) : 0;
-  let accessibleLeft = Math.ceil(required * 0.05);
+  const evEvery = evEveryFor(evShare);
+  let accessibleLeft = accessibleFor(required);
   let usedFront = false;
   for (const c of candidates) {
     if (spaces.length >= required) break;
-    const packed = packZone(c.r, required - spaces.length, accessibleLeft, evEvery, SITE_STOREY, ids);
+    const packed = packZone(c.r, required - spaces.length, { ...opts, accessible: accessibleLeft, evEvery }, SITE_STOREY, ids);
     if (packed.spaces.length === 0) continue;
     if (c.front) usedFront = true;
     accessibleLeft = Math.max(0, accessibleLeft - packed.spaces.filter(s => s.type === 'accessible').length);
     for (const s of packed.spaces) spaces.push(s);
     for (const a of packed.aisles) aisles.push(a);
   }
-  if (usedFront) warnings.push('Surface parking had to use the front yard: no other yard could hold it (SIT-07).');
+  if (usedFront) {
+    sink.add(deviation(RULE.parkingFit,
+      'Surface parking had to use the front yard: no other yard could hold it (SIT-07).',
+      { source: 'SIT-07 Parking Behind' }));
+  }
   const note = candidates.length === 0
-    ? 'no yard large enough for a 5.4 m stall row plus a 6.0 m aisle'
+    ? `no yard large enough for a ${STALL_L.toFixed(1)} m stall row plus a ${AISLE.toFixed(1)} m aisle`
     : `${aisles.length} aisle(s) across ${candidates.length} candidate yard(s)`;
   return { spaces, aisles, hardscape: [], note };
 }
 
-/** Upper bound on stalls in a rect, used to rank yards */
-function capacityOf(r: Rect): number {
-  const alongX = r.w >= r.h;
-  const along = alongX ? r.w : r.h;
-  const across = alongX ? r.h : r.w;
-  if (across < STALL_L + AISLE || along < STALL_W) return 0;
-  const modules = Math.floor(across / (2 * STALL_L + AISLE));
-  const rest = across - modules * (2 * STALL_L + AISLE);
-  const rows = modules * 2 + (rest >= STALL_L + AISLE ? 1 : 0);
-  return rows * Math.floor(along / STALL_W);
-}
-
 /**
- * Double-loaded rows in 16.8 m modules (row | aisle | row), then one single-loaded
- * module (row | aisle) if the leftover allows it.
+ * Stalls in a zone, capped at `want`. The geometry comes from `stallSlots` — the same function
+ * the solver measures capacity with — so a level never packs fewer stalls than it was sized for.
  */
 function packZone(
   zone: Rect,
   want: number,
-  accessibleLeft: number,
-  evEvery: number,
+  opts: StallOpts,
   storey: string,
   ids: IdFactory,
 ): { spaces: ParkingSpace[]; aisles: Rect[] } {
   const spaces: ParkingSpace[] = [];
-  const aisles: Rect[] = [];
-  if (want <= 0) return { spaces, aisles };
-  const alongX = zone.w >= zone.h;
-  const along = alongX ? zone.w : zone.h;
-  const across = alongX ? zone.h : zone.w;
-  const acrossStart = alongX ? zone.y : zone.x;
-  const alongStart = alongX ? zone.x : zone.y;
-
-  const rowOffsets: number[] = [];
-  let off = 0;
-  while (true) {
-    const remain = across - off;
-    if (remain >= 2 * STALL_L + AISLE - 1e-9) {
-      rowOffsets.push(off, off + STALL_L + AISLE);
-      aisles.push(bandRect(zone, alongX, off + STALL_L, AISLE));
-      off += 2 * STALL_L + AISLE;
-    } else if (remain >= STALL_L + AISLE - 1e-9) {
-      rowOffsets.push(off);
-      aisles.push(bandRect(zone, alongX, off + STALL_L, AISLE));
-      break;
-    } else break;
-  }
-
-  let acc = accessibleLeft;
-  let standardIdx = 0;
-  for (const rowOff of rowOffsets) {
-    let a = 0;
-    while (spaces.length < want) {
-      const useAcc = acc > 0 && a + ACC_W <= along + 1e-9;
-      const w = useAcc ? ACC_W : STALL_W;
-      if (a + w > along + 1e-9) break;
-      const kind: ParkingSpace['type'] = useAcc ? 'accessible' : (evEvery > 0 && standardIdx % evEvery === 0 ? 'ev' : 'standard');
-      if (useAcc) acc--; else standardIdx++;
-      const rect: Rect = alongX
-        ? { x: alongStart + a, y: acrossStart + rowOff, w, h: STALL_L }
-        : { x: acrossStart + rowOff, y: alongStart + a, w: STALL_L, h: w };
-      spaces.push({
-        id: ids.next(storey, 'PRK'),
-        rect,
-        rotation: alongX ? Math.PI / 2 : 0,
-        type: kind,
-        storey,
-      });
-      a += w;
-    }
+  if (want <= 0) return { spaces, aisles: [] };
+  const layout = stallSlots(zone, opts);
+  for (const slot of layout.slots) {
     if (spaces.length >= want) break;
+    spaces.push({
+      id: ids.next(storey, 'PRK'),
+      rect: slot.rect,
+      rotation: slot.rotation,
+      type: slot.type,
+      storey,
+    });
   }
-  return { spaces, aisles };
-}
-
-function bandRect(zone: Rect, alongX: boolean, offset: number, thickness: number): Rect {
-  return alongX
-    ? { x: zone.x, y: zone.y + offset, w: zone.w, h: thickness }
-    : { x: zone.x + offset, y: zone.y, w: thickness, h: zone.h };
+  return { spaces, aisles: layout.aisles };
 }
 
 // ---------------------------------------------------------------------------
 // Structured parking (podium / underground)
 // ---------------------------------------------------------------------------
 
+/**
+ * Every parking storey, packed in the order the solver sized them (the requested type's own
+ * levels first). Each level gets its own ramp down to the next; stalls fouling a ramp are never
+ * emitted, exactly as `stallCapacity` counted them. Packing stops once `required` is met, so a
+ * solver that added a level does not leave half a deck of unused stalls in the model.
+ */
 function structuredParking(
   spec: BuildingSpec,
   type: ParkingType,
@@ -384,48 +373,57 @@ function structuredParking(
   required: number,
   evShare: number,
   ids: IdFactory,
-  warnings: string[],
+  opts: StallOpts,
 ): { spaces: ParkingSpace[]; aisles: Rect[]; storey: string; ramp: Rect; elements: ModelElement[]; note: string } | null {
-  const wantBasement = type === 'underground';
-  const floors = spec.floors.filter(f => f.use === 'parking');
-  const floor = floors.find(f => (wantBasement ? f.index < 0 : f.index >= 0)) ?? floors[0];
-  if (!floor) return null;
-  const storey = storeyIdFor(floor.index);
-  // Underground levels follow the buildable envelope; a podium level follows the podium outline.
-  const outline = floor.index < 0 ? frame.env : (m.podiumRect ?? m.footprintRect);
-  const zone: Rect = { x: outline.x + 0.4, y: outline.y + 0.4, w: Math.max(1, outline.w - 0.8), h: Math.max(1, outline.h - 0.8) };
-  const ramp: Rect = {
-    x: clampNum(zone.x + zone.w - RAMP_W - 0.5, zone.x, zone.x + Math.max(0, zone.w - RAMP_W)),
-    y: clampNum(zone.y + zone.h - RAMP_L - 0.5, zone.y, zone.y + Math.max(0, zone.h - RAMP_L)),
-    w: Math.min(RAMP_W, zone.w), h: Math.min(RAMP_L, zone.h),
-  };
-  const evEvery = evShare > 0 ? Math.max(1, Math.round(1 / evShare)) : 0;
-  const packed = packZone(zone, required + 12, Math.ceil(required * 0.05), evEvery, storey, ids);
-  // Drop stalls fouling the ramp, then trim to what is required.
-  const clear = packed.spaces.filter(s => !overlaps(s.rect, ramp, 0.5)).slice(0, Math.max(0, required));
-  if (clear.length < required) {
-    warnings.push(`Structured parking on ${storey} fits ${clear.length} of ${required} spaces in a ${zone.w.toFixed(1)} × ${zone.h.toFixed(1)} m plate (SIT-07).`);
-  }
-  const storeyDef = m.massing.storeys.find(s => s.id === storey);
-  const elements: ModelElement[] = [{
-    id: ids.next(storey, 'RAMP'),
-    discipline: 'site',
-    ifcType: 'IfcRamp',
-    predefinedType: 'STRAIGHT',
-    name: 'Parking ramp',
-    objectType: 'ParkingRamp',
-    storey,
-    geometry: { kind: 'ramp', position: [ramp.x, ramp.y, 0], width: ramp.w, length: ramp.h, thickness: 0.2, rise: storeyDef ? storeyDef.height : 3.2 },
-    psets: [pset('Forma_Site', { Category: 'Parking', Element: 'Ramp', Width: round(ramp.w), Length: round(ramp.h) })],
-    color: SITE_COLORS.driveway,
-    patterns: ['SIT-07'],
-    tags: ['parking', 'ramp'],
-  }];
-  return { spaces: clear, aisles: packed.aisles, storey, ramp, elements, note: `${type} deck on ${storey}` };
-}
+  const floors: FloorSpec[] = parkingFloors(spec, type);
+  if (floors.length === 0) return null;
+  const evEvery = evEveryFor(evShare);
+  let accessibleLeft = accessibleFor(required);
+  const spaces: ParkingSpace[] = [];
+  const elements: ModelElement[] = [];
+  let aisles: Rect[] = [];
+  let firstRamp: Rect | null = null;
+  const used: string[] = [];
 
-function overlaps(a: Rect, b: Rect, pad = 0): boolean {
-  return a.x < b.x + b.w + pad && b.x - pad < a.x + a.w && a.y < b.y + b.h + pad && b.y - pad < a.y + a.h;
+  for (const floor of floors) {
+    if (spaces.length >= required && used.length > 0) break;
+    const storey = storeyIdFor(floor.index);
+    // Underground levels follow the buildable envelope; a podium level follows the podium outline.
+    const outline = floor.index < 0 ? frame.env : (m.podiumRect ?? m.footprintRect);
+    const zone = structuredZone(outline);
+    const ramp = rampRect(zone);
+    const packed = packZone(zone, Math.max(0, required - spaces.length), {
+      ...opts, accessible: accessibleLeft, evEvery, exclude: ramp,
+    }, storey, ids);
+    accessibleLeft = Math.max(0, accessibleLeft - packed.spaces.filter(s => s.type === 'accessible').length);
+    for (const s of packed.spaces) spaces.push(s);
+    if (firstRamp === null) { firstRamp = ramp; aisles = packed.aisles; }
+    used.push(storey);
+    const storeyDef = m.massing.storeys.find(s => s.id === storey);
+    elements.push({
+      id: ids.next(storey, 'RAMP'),
+      discipline: 'site',
+      ifcType: 'IfcRamp',
+      predefinedType: 'STRAIGHT',
+      name: 'Parking ramp',
+      objectType: 'ParkingRamp',
+      storey,
+      geometry: { kind: 'ramp', position: [ramp.x, ramp.y, 0], width: ramp.w, length: ramp.h, thickness: 0.2, rise: storeyDef ? storeyDef.height : 3.2 },
+      psets: [pset('Forma_Site', { Category: 'Parking', Element: 'Ramp', Width: round(ramp.w), Length: round(ramp.h) })],
+      color: SITE_COLORS.driveway,
+      patterns: ['SIT-07'],
+      tags: ['parking', 'ramp'],
+    });
+  }
+  const zone0 = structuredZone(floors[0].index < 0 ? frame.env : (m.podiumRect ?? m.footprintRect));
+  return {
+    spaces,
+    aisles,
+    storey: used[0],
+    ramp: firstRamp ?? rampRect(zone0),
+    elements,
+    note: `${type} deck on ${used.join('+')} (${zone0.w.toFixed(1)} × ${zone0.h.toFixed(1)} m plate)`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +434,7 @@ function buildGarages(
   frame: SiteFrame,
   m: MassingResult,
   ids: IdFactory,
-  warnings: string[],
+  sink: IssueSink,
 ): { spaces: ParkingSpace[]; garages: Rect[]; driveway: Rect | null; hardscape: Rect[]; entrances: Entrance[]; elements: ModelElement[]; note: string } {
   const spaces: ParkingSpace[] = [];
   const garages: Rect[] = [];
@@ -486,7 +484,11 @@ function buildGarages(
       }
     }
     note = `${garages.length} integral garages of ${gw.toFixed(1)} m in a ${dwellings}-dwelling row`;
-    if (garages.length < dwellings) warnings.push(`Only ${garages.length} of ${dwellings} dwellings could take an integral garage (SIT-07).`);
+    if (garages.length < dwellings) {
+      sink.add(deviation(RULE.parkingFit,
+        `Only ${garages.length} of ${dwellings} dwellings could take an integral garage (SIT-07).`,
+        { observed: garages.length, limit: dwellings, source: 'SIT-07' }));
+    }
   }
   return { spaces, garages, driveway, hardscape, entrances, elements, note };
 }

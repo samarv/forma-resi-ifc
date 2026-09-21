@@ -14,9 +14,11 @@ import { createRng } from '../../core/rng.ts';
 import { CROSS_PATTERNS } from '../../core/patterns.ts';
 import { polygonBounds, polygonArea, rectContainsRect, rectsOverlap } from '../../core/geometry.ts';
 import type { SiteModel, BuildingSpec, TypologyDef, Rect, SiteGenerator, MassingBar, CorridorSpine } from '../../core/types.ts';
+import type { Deviation, Issue, Ledger } from '../../core/rules/types.ts';
 import { UNIT_TEMPLATES } from '../architecture/templates.ts';
 import { generateSite, SITE_PATTERNS } from './index.ts';
 import { CORE_WIDTH_ALONG_BAR, CORE_SHAFT_BAY, coreAcrossFor, stairRunFor } from './massing.ts';
+import { legGraph } from './corridor-graph.ts';
 import { collectNumbers } from './util.ts';
 
 /** Compile-time conformance to the contract in core/types.ts */
@@ -599,4 +601,260 @@ test('every typology and footprint shape produces a sane model', () => {
     }
   }
   assert.ok(n >= 32, 'combination sweep did not run');
+});
+
+// ---------------------------------------------------------------------------
+// v2 resolutions: parking solver, storey band, corridor graph
+//
+// These are the "warnings → zero" invariants for site (plan rows 1, 2-3 and 25-27): a request the
+// generator cannot honour must be RESOLVED and recorded as an Issue, never merely reported.
+// ---------------------------------------------------------------------------
+
+/** Minimal Ledger so the tests can read the structured issues the pipeline will thread in. */
+function makeLedger(mirror: string[] = []): Ledger {
+  const issues: Issue[] = [];
+  const keys = new Map<string, Issue>();
+  const add = (d: Deviation): Issue => {
+    const issue: Issue = { id: `ISS-${String(issues.length + 1).padStart(4, '0')}`, ...d };
+    issues.push(issue);
+    if (issue.severity !== 'info') mirror.push(issue.message);
+    return issue;
+  };
+  return {
+    add,
+    addOnce: (key: string, d: Deviation): Issue | null => {
+      const seen = keys.get(key);
+      if (seen) { seen.count = (seen.count ?? 1) + 1; return null; }
+      const issue = add(d);
+      keys.set(key, issue);
+      return issue;
+    },
+    all: () => issues,
+    bySeverity: (s) => issues.filter(i => i.severity === s),
+    byRule: (ruleId) => issues.filter(i => i.ruleId === ruleId),
+    counts: () => ({
+      info: issues.filter(i => i.severity === 'info').length,
+      deviation: issues.filter(i => i.severity === 'deviation').length,
+      violation: issues.filter(i => i.severity === 'violation').length,
+      error: issues.filter(i => i.severity === 'error').length,
+    }),
+    warnings: (o) => issues.filter(i => (o?.includeInfo ?? false) || i.severity !== 'info').map(i => i.message),
+  };
+}
+
+interface Recorded extends Built { ledger: Ledger }
+
+function record(partial: PartialSpec): Recorded {
+  const spec = normalizeSpec(partial);
+  const typology = getTypology(spec.typology);
+  const warnings: string[] = [];
+  const ledger = makeLedger(warnings);
+  const t0 = performance.now();
+  const site = generateSite(spec, typology, createRng(spec.seed).fork('site'), warnings, undefined, ledger);
+  return { spec, typology, site, warnings, ms: performance.now() - t0, ledger };
+}
+
+const MAX_LEG = 45;
+
+test('parking: every preset builds what it owes, or records a relax-parking-ratio deviation', () => {
+  for (const p of PRESETS) {
+    const { site, ledger, spec } = record(p.spec);
+    const required = site.derived.parkingRequired;
+    const achieved = site.derived.parkingSpaces;
+    const relaxed = ledger.all().filter(i => i.resolution?.id === 'relax-parking-ratio');
+    if (achieved >= required) {
+      assert.deepEqual(relaxed, [], `${p.id}: ratio relaxed although ${achieved} >= ${required}`);
+    } else {
+      assert.equal(relaxed.length, 1, `${p.id}: ${achieved} of ${required} stalls with no recorded deviation`);
+      assert.equal(relaxed[0].severity, 'deviation');
+      assert.ok(Number(relaxed[0].limit) === required, `${p.id}: deviation limit ${relaxed[0].limit} != ${required}`);
+    }
+    // every added level is an `info` resolution, and the spec's storey stack carries it
+    for (const i of ledger.all().filter(x => x.resolution?.id === 'add-basement-level')) {
+      assert.equal(i.severity, 'info', `${p.id}: an added basement must not be a warning`);
+      assert.ok(spec.floors.some(f => f.index < 0 && f.use === 'parking'), `${p.id}: basement missing from the floors`);
+      assert.ok(site.massing.storeys.some(s => s.id === i.storey), `${p.id}: storey ${i.storey} not in the stack`);
+    }
+    // stalls only ever land on a storey that exists and is a parking (or site) storey
+    for (const s of site.parking!.spaces) {
+      assert.ok(site.massing.storeys.some(st => st.id === s.storey), `${p.id}: stall on unknown storey ${s.storey}`);
+    }
+  }
+});
+
+test('parking: the solver sizes the basements, and a shortfall is impossible to reach silently', () => {
+  // 0.7 cars/unit on a 121-unit tower needs 85 stalls; one basement plate holds 57.
+  const { site, ledger, spec } = record(preset('ca-point-tower').spec);
+  assert.equal(spec.massing.basementStoreys, 2);
+  assert.equal(site.derived.parkingSpaces, site.derived.parkingRequired);
+  assert.equal(site.derived.parkingRatioApplied, site.derived.parkingRatioRequested);
+  assert.equal(site.derived.parkingLevels, 2);
+  assert.deepEqual(ledger.all().filter(i => i.ruleId === 'SIT-07.parkingRatio'), []);
+  assert.equal(ledger.byRule('SIT-07.parkingLevels').length, 1);
+  assert.deepEqual(site.massing.storeys.filter(s => s.index < 0 && s.index > -100).map(s => s.id), ['B2', 'B1']);
+});
+
+test('storeys: every preset is inside its typology band, and an override is recorded as a deviation', () => {
+  for (const p of PRESETS) {
+    const { spec, typology, ledger } = record(p.spec);
+    assert.ok(spec.massing.storeys >= typology.storeys.min && spec.massing.storeys <= typology.storeys.max,
+      `${p.id}: ${spec.massing.storeys} storeys outside ${typology.storeys.min}–${typology.storeys.max}`);
+    assert.deepEqual(ledger.byRule('TYP-01.storeyBand'), [], `${p.id}: in-band spec should record nothing`);
+  }
+
+  // a request above the band is clamped …
+  const clamped = normalizeSpec({ typology: 'courtyard-block', seed: 3, massing: { storeys: 15, roof: 'flat' } });
+  assert.equal(clamped.massing.storeys, getTypology('courtyard-block').storeys.max);
+  assert.equal(clamped.rules?.profiles?.includes('high-rise') ?? false, false);
+
+  // … unless the override is asked for, which switches the rule profile and records a deviation
+  const over = record({ typology: 'courtyard-block', seed: 3, massing: { storeys: 15, roof: 'flat', allowStoreyOverride: true } });
+  assert.equal(over.spec.massing.storeys, 15);
+  assert.deepEqual(over.spec.rules?.profiles, ['high-rise']);
+  const band = over.ledger.byRule('TYP-01.storeyBand');
+  assert.equal(band.length, 1);
+  assert.equal(band[0].severity, 'deviation');
+  assert.equal(band[0].resolution?.id, 'switch-highrise-ruleset');
+  assert.equal(band[0].observed, 15);
+  assert.equal(band[0].limit, getTypology('courtyard-block').storeys.max);
+  assert.equal(over.site.derived.storeysAboveGrade, 15);
+
+  // below the band, honoured with the override, is a deviation without the high-rise profile
+  const under = record({ typology: 'mansion-block', seed: 3, massing: { storeys: 2, roof: 'flat', allowStoreyOverride: true } });
+  assert.equal(under.spec.massing.storeys, 2);
+  assert.equal(under.ledger.byRule('TYP-01.storeyBand')[0].resolution?.id, 'none');
+});
+
+test('corridors: no leg over 45 m, no dead end over the limit, break slots disjoint from the cores', () => {
+  for (const p of PRESETS) {
+    const { site, typology } = record(p.spec);
+    const graph = site.massing.corridorGraph;
+    if (!graph || graph.legs.length === 0) continue;
+    const deadEndLimit = typology.sprinklered ? 15 : 6;
+    for (const leg of graph.legs) {
+      assert.ok(leg.length <= MAX_LEG + 1e-6, `${p.id}: leg ${leg.id} is ${leg.length.toFixed(1)} m`);
+      assert.ok(leg.length > 0.5, `${p.id}: leg ${leg.id} is a stub of ${leg.length.toFixed(2)} m`);
+    }
+    for (const d of graph.deadEnds) {
+      assert.ok(d.length <= deadEndLimit + 1e-6, `${p.id}: ${d.length} m dead end at ${d.legId} (limit ${deadEndLimit})`);
+      assert.ok(graph.legs.some(l => l.id === d.legId), `${p.id}: dead end on unknown leg ${d.legId}`);
+    }
+    // a spine's legs cover it exactly once, in order, and stay inside the union of the bars
+    const byId = new Map(site.massing.bars.map(b => [b.id, b]));
+    for (const leg of graph.legs) {
+      const bar = byId.get(leg.barId);
+      assert.ok(bar, `${p.id}: leg ${leg.id} references unknown bar ${leg.barId}`);
+      for (const pt of [leg.centerline[0].a, leg.centerline[0].b]) {
+        assert.ok(site.massing.bars.some(b => pt[0] >= b.rect.x - 0.01 && pt[0] <= b.rect.x + b.rect.w + 0.01
+          && pt[1] >= b.rect.y - 0.01 && pt[1] <= b.rect.y + b.rect.h + 0.01),
+          `${p.id}: leg ${leg.id} end (${pt[0].toFixed(1)}, ${pt[1].toFixed(1)}) is outside every bar`);
+      }
+    }
+    // break slots: inside their bar, pairwise disjoint per bar, and clear of every core
+    for (const barId of new Set(graph.breakSlots.map(s => s.barId))) {
+      const bar = byId.get(barId)!;
+      const slots = graph.breakSlots.filter(s => s.barId === barId).sort((a, b) => a.station - b.station);
+      for (let i = 1; i < slots.length; i++) {
+        assert.ok(slots[i].station - slots[i].length / 2 >= slots[i - 1].station + slots[i - 1].length / 2 - 1e-6,
+          `${p.id}: break slots ${slots[i - 1].id} and ${slots[i].id} overlap`);
+      }
+      for (const s of slots) {
+        for (const core of site.massing.cores.filter(c => c.barId === barId)) {
+          const a = bar.axis === 'x' ? core.rect.x - bar.rect.x : core.rect.y - bar.rect.y;
+          const w = bar.axis === 'x' ? core.rect.w : core.rect.h;
+          const clear = s.station + s.length / 2 <= a + 1e-6 || s.station - s.length / 2 >= a + w - 1e-6;
+          assert.ok(clear, `${p.id}: break slot ${s.id} at ${s.station} overlaps core ${core.id} (${a}–${a + w})`);
+        }
+      }
+    }
+    assert.ok(graph.longestRunM >= Math.max(...graph.legs.map(l => l.length)) - 1e-6);
+  }
+});
+
+test('corridors: the ie-courtyard O-plan is one connected corridor with four knuckles', () => {
+  const { site } = record(preset('ie-courtyard').spec);
+  const graph = site.massing.corridorGraph!;
+  assert.equal(graph.spines.length, 4);
+  assert.equal(graph.knuckles.length, 4, `knuckles ${graph.knuckles.length}`);
+  const { adj, count } = legGraph(graph.legs, graph.spines[0].width);
+  const seen = new Set<number>([0]);
+  const queue = [0];
+  while (queue.length > 0) {
+    const at = queue.shift()!;
+    for (const e of adj.get(at) ?? []) {
+      if (seen.has(e.to)) continue;
+      seen.add(e.to);
+      queue.push(e.to);
+    }
+  }
+  assert.equal(seen.size, count, `the perimeter block is ${count - seen.size + 1} corridors, not one`);
+  assert.ok(graph.legs.length >= count, 'the loop is not cyclic');
+  assert.ok(graph.longestRunM > 150, `longest run ${graph.longestRunM} m should cross the whole block`);
+  // every knuckle rect sits inside the plate
+  for (const k of graph.knuckles) {
+    assert.ok(site.massing.bars.some(b => k.rect.x >= b.rect.x - 0.01 && k.rect.y >= b.rect.y - 0.01
+      && k.rect.x + k.rect.w <= b.rect.x + b.rect.w + 0.01 && k.rect.y + k.rect.h <= b.rect.y + b.rect.h + 0.01),
+      `knuckle ${k.id} is not inside a bar`);
+  }
+});
+
+test('corridors: cores prefer the break slots, and the spine still runs the full bar', () => {
+  const { site } = record(preset('us-5-over-1').spec);
+  const graph = site.massing.corridorGraph!;
+  const bar = site.massing.bars[0];
+  assert.equal(graph.legs.length, 2, 'a 72 m bar needs two legs');
+  const spine = site.massing.corridors[0];
+  assert.ok(Math.abs(spine.centerline.b[0] - spine.centerline.a[0] - bar.length) < 1e-6,
+    'v1 consumers still need the full-length centreline');
+  assert.deepEqual(spine.legs?.length, 2);
+  // the mid-bar break is left for a lounge; the cores sit clear of it
+  assert.equal(graph.breakSlots.length, 1);
+  assert.equal(graph.breakSlots[0].want, 'core');
+  assert.ok(site.derived.maxTravelDistance <= site.derived.travelLimit);
+  assert.equal(site.derived.corridorLegCount, 2);
+  assert.ok(site.derived.corridorLongestRun > 0);
+});
+
+test('corridors: every typology and shape keeps the leg and dead-end limits', () => {
+  const shapes = ['bar', 'L', 'U', 'O', 'T', 'point'] as const;
+  let checked = 0;
+  for (const tid of TYPOLOGY_IDS) {
+    const typology = getTypology(tid);
+    for (const shape of shapes) {
+      const { site } = record({
+        typology: tid, seed: 700 + checked, region: 'US',
+        massing: { storeys: typology.storeys.default, footprintShape: shape, roof: 'flat' },
+      });
+      const graph = site.massing.corridorGraph;
+      checked++;
+      if (!graph || graph.legs.length === 0) continue;
+      const limit = typology.sprinklered ? 15 : 6;
+      for (const leg of graph.legs) {
+        assert.ok(leg.length <= MAX_LEG + 1e-6, `${tid}/${shape}: leg ${leg.length.toFixed(1)} m`);
+      }
+      for (const d of graph.deadEnds) {
+        assert.ok(d.length <= limit + 1e-6, `${tid}/${shape}: dead end ${d.length} m over ${limit} m`);
+      }
+      assert.equal(graph.spines.length, site.massing.corridors.length);
+    }
+  }
+  assert.ok(checked >= 32, 'sweep did not run');
+});
+
+test('the resolutions are deterministic: same spec → same issues and same graph', () => {
+  for (const p of PRESETS) {
+    const a = record(p.spec);
+    const b = record(p.spec);
+    assert.equal(JSON.stringify(a.ledger.all()), JSON.stringify(b.ledger.all()), `${p.id} issues not deterministic`);
+    assert.equal(JSON.stringify(a.site.massing.corridorGraph), JSON.stringify(b.site.massing.corridorGraph),
+      `${p.id} corridor graph not deterministic`);
+    assert.deepEqual(a.warnings, b.warnings);
+  }
+});
+
+test('site generation stays inside its budget on the biggest plan', () => {
+  const p = preset('ie-courtyard');
+  record(p.spec);
+  const best = Math.min(...[record(p.spec), record(p.spec), record(p.spec)].map(r => r.ms));
+  assert.ok(best < 200, `ie-courtyard site generation took ${best.toFixed(1)} ms`);
 });

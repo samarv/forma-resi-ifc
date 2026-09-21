@@ -23,12 +23,20 @@
  *   `round(barLength / frontage)` with the same template maths architecture's `planHouses` uses.
  * - Gallery / deck-access spines sit within half a deck width of the long bar face away from the
  *   street, because architecture models the deck outside the envelope.
- * - Parking storeys: 'SITE' for surface and garage stalls, 'B1' for underground, the first
- *   above-grade floor whose `use` is 'parking' (normally 'L01') for podium decks.
+ * - Parking storeys: 'SITE' for surface and garage stalls, the basements the PARKING SOLVER sized
+ *   ('B1', 'B2', …) for underground, and the above-grade floors whose `use` is 'parking'
+ *   (normally 'L01') for podium decks. Every parking storey is packed.
+ *
+ * v2 pipeline order inside this file: frame → parking solver (level count, before any geometry)
+ * → massing (bars, corridor graph, cores in break slots, storeys) → entrances → parking →
+ * landscape. `solveParking` is the only step that writes back to the spec: it raises
+ * `massing.basementStoreys` / `massing.podiumStoreys` and re-resolves `spec.floors` ONCE, so the
+ * storey stack every later discipline reads already contains the parking levels.
  */
 import type {
   BuildingSpec, TypologyDef, Rng, SiteModel, ModelElement, PatternApplication, Rect, LandscapeZone, Entrance,
 } from '../../core/types.ts';
+import type { Ledger, RuleSet } from '../../core/rules/types.ts';
 import { rectToPolygon, relativeTo, rectContainsRect, rectsOverlap, round } from '../../core/geometry.ts';
 import { IdFactory, SITE_STOREY } from '../../core/ids.ts';
 import { resolveFrame, buildMassing, EXISTING_HOUSE_HEIGHT, type MassingResult, type SiteFrame } from './massing.ts';
@@ -36,39 +44,53 @@ import { buildEntrances } from './entrances.ts';
 import { buildParking } from './parking.ts';
 import { buildLandscape } from './landscape.ts';
 import { allFinite, pset, SITE_COLORS } from './util.ts';
+import { RULE, issueSink, violation, type IssueSink } from './issues.ts';
+import { applyParkingPlan, estimateUnits, solveParking } from './parking-solver.ts';
 
 export { SITE_PATTERNS, SITE_PATTERN_IDS } from './patterns.ts';
 export type { SiteFrame, MassingResult } from './massing.ts';
 
-/** Matches `SiteGenerator` in core/types.ts */
+/**
+ * Matches `SiteGenerator` in core/types.ts. `rules` / `ledger` are optional trailing parameters
+ * until `pipeline.ts` threads `ctx.rules` / `ctx.issues` in: without a ledger the issues are kept
+ * on the model's own sink and mirrored into `warnings` exactly as `Ledger.warnings()` would.
+ */
 export function generateSite(
   spec: BuildingSpec,
   typology: TypologyDef,
   rng: Rng,
   warnings: string[],
+  rules?: RuleSet,
+  ledger?: Ledger,
 ): SiteModel {
   const ids = new IdFactory('site');
   const patterns: PatternApplication[] = [];
   const elements: ModelElement[] = [];
+  const sink = issueSink(ledger, warnings);
 
   // 1. Frame: boundary, setbacks, envelope, orientation, garden side.
-  const frame = resolveFrame(spec, typology, warnings, patterns);
+  const frame = resolveFrame(spec, typology, sink, patterns);
 
-  // 2. Massing: shape → bars → corridors → cores → roof → storeys.
-  const m = buildMassing(spec, typology, frame, rng.fork('massing'), ids, warnings, patterns);
+  // 2. Parking demand, BEFORE any geometry: the level count is an input to the massing.
+  const units = estimateUnits(spec, typology, frame);
+  const plan = solveParking({ spec, typology, frame, estimatedUnits: units, rules, sink });
+  applyParkingPlan(spec, typology, plan);
 
-  // 3. Entrances (main / unit / service / courtyard); garages are appended by parking.
-  const ent = buildEntrances(spec, typology, frame, m, rng.fork('entrances'), ids, warnings);
+  // 3. Massing: shape → bars → corridor graph → cores → roof → storeys.
+  const m = buildMassing(spec, typology, frame, rng.fork('massing'), ids, sink, patterns, rules);
+
+  // 4. Entrances (main / unit / service / courtyard); garages are appended by parking.
+  const ent = buildEntrances(spec, typology, frame, m, rng.fork('entrances'), ids, sink);
   for (const a of ent.apps) patterns.push(a);
   const mainEntrance = ent.entrances.find(e => e.type === 'main') ?? ent.entrances[0] ?? null;
 
-  // 4. Parking and bicycles.
-  const parking = buildParking(spec, typology, frame, m, mainEntrance, rng.fork('parking'), ids, warnings);
+  // 5. Parking and bicycles: build what the plan solved for, on every parking storey.
+  const parking = buildParking(spec, typology, frame, m, mainEntrance, rng.fork('parking'), ids, sink, plan, rules);
   for (const a of parking.apps) patterns.push(a);
   for (const e of parking.elements) elements.push(e);
   const entrances: Entrance[] = [...ent.entrances, ...parking.extraEntrances];
 
-  // 5. Landscape: paths, yards, gardens, courtyard, trees, fences.
+  // 6. Landscape: paths, yards, gardens, courtyard, trees, fences.
   const hardscape: Rect[] = [...parking.hardscape, ...parking.garages];
   const siteStalls = parking.lot.spaces.filter(s => s.storey === SITE_STOREY).map(s => s.rect);
   if (siteStalls.length > 0) hardscape.push(boundsOf(siteStalls));
@@ -76,11 +98,11 @@ export function generateSite(
   for (const a of land.apps) patterns.push(a);
   for (const e of land.elements) elements.push(e);
 
-  // 6. Site works: the graded pad, plus the notional existing house in front of an ADU.
+  // 7. Site works: the graded pad, plus the notional existing house in front of an ADU.
   elements.unshift(sitePad(ids, frame));
   if (m.existingHouseRect) elements.push(existingHouse(ids, m.existingHouseRect));
 
-  // 7. Derived metrics.
+  // 8. Derived metrics.
   const siteArea = frame.boundary.w * frame.boundary.h;
   const buildableArea = frame.env.w * frame.env.h;
   const footprintArea = m.massing.footprintArea;
@@ -102,6 +124,10 @@ export function generateSite(
     hardscapeArea: round(hardscape.reduce((s, r) => s + r.w * r.h, 0), 2),
     parkingSpaces: parking.achieved,
     parkingRequired: parking.required,
+    parkingRatioRequested: plan.ratioRequested,
+    parkingRatioApplied: plan.ratioApplied,
+    parkingLevels: new Set(parking.lot.spaces.map(s => s.storey)).size,
+    basementStoreys: spec.massing.basementStoreys ?? 0,
     evSpaces: parking.ev,
     accessibleSpaces: parking.accessible,
     bikeSpaces: parking.lot.bikeSpaces,
@@ -124,6 +150,10 @@ export function generateSite(
     coreCount: m.massing.cores.length,
     elevatorCount,
     corridorCount: m.massing.corridors.length,
+    corridorLegCount: m.massing.corridorGraph ? m.massing.corridorGraph.legs.length : 0,
+    corridorLongestRun: m.massing.corridorGraph ? m.massing.corridorGraph.longestRunM : 0,
+    corridorBreakSlots: m.massing.corridorGraph ? m.massing.corridorGraph.breakSlots.length : 0,
+    corridorKnuckles: m.massing.corridorGraph ? m.massing.corridorGraph.knuckles.length : 0,
     barCount: m.massing.bars.length,
     maxTravelDistance: round(m.maxTravel, 2),
     travelLimit: m.travelLimit,
@@ -156,7 +186,7 @@ export function generateSite(
     derived,
   };
 
-  validate(model, frame, m, warnings);
+  validate(model, frame, m, sink);
   return model;
 }
 
@@ -219,43 +249,46 @@ function boundsOf(rects: Rect[]): Rect {
 // Self-checks (never throw: the caller collects warnings)
 // ---------------------------------------------------------------------------
 
-function validate(model: SiteModel, frame: SiteFrame, m: MassingResult, warnings: string[]): void {
+function validate(model: SiteModel, frame: SiteFrame, m: MassingResult, sink: IssueSink): void {
+  // A failure here is a generator bug, not a design report: 'violation' severity, and the string
+  // stays in `warnings` so the existing hard-warning assertions in site.test.ts still see it.
+  const bad = (message: string): void => { sink.add(violation(RULE.geometry, message, { source: 'site self-check' })); };
   const B = frame.boundary;
   const eps = 1e-3;
 
   if (!allFinite(model.massing.footprint) || !allFinite(model.derived)) {
-    warnings.push('Site geometry or metrics contain non-finite numbers.');
+    bad('Site geometry or metrics contain non-finite numbers.');
   }
   for (const e of model.elements) {
-    if (!allFinite(e.geometry)) warnings.push(`Element ${e.id} has non-finite geometry.`);
+    if (!allFinite(e.geometry)) bad(`Element ${e.id} has non-finite geometry.`);
   }
   for (const p of model.massing.footprint) {
     if (p[0] < B.x - eps || p[0] > B.x + B.w + eps || p[1] < B.y - eps || p[1] > B.y + B.h + eps) {
-      warnings.push('Massing footprint falls outside the site boundary.');
+      bad('Massing footprint falls outside the site boundary.');
       break;
     }
   }
   const bars = model.massing.bars;
   for (let i = 0; i < bars.length; i++) {
-    if (!rectContainsRect(B, bars[i].rect, eps)) warnings.push(`Bar ${bars[i].id} falls outside the site boundary.`);
+    if (!rectContainsRect(B, bars[i].rect, eps)) bad(`Bar ${bars[i].id} falls outside the site boundary.`);
     for (let j = i + 1; j < bars.length; j++) {
-      if (rectsOverlap(bars[i].rect, bars[j].rect, 1e-4)) warnings.push(`Bars ${bars[i].id} and ${bars[j].id} overlap.`);
+      if (rectsOverlap(bars[i].rect, bars[j].rect, 1e-4)) bad(`Bars ${bars[i].id} and ${bars[j].id} overlap.`);
     }
   }
   const barById = new Map(bars.map(b => [b.id, b]));
   for (const c of model.massing.cores) {
     const bar = barById.get(c.barId);
-    if (!bar) { warnings.push(`Core ${c.id} references unknown bar ${c.barId}.`); continue; }
-    if (!rectContainsRect(bar.rect, c.rect, 1e-3)) warnings.push(`Core ${c.id} is not contained in bar ${c.barId}.`);
+    if (!bar) { bad(`Core ${c.id} references unknown bar ${c.barId}.`); continue; }
+    if (!rectContainsRect(bar.rect, c.rect, 1e-3)) bad(`Core ${c.id} is not contained in bar ${c.barId}.`);
   }
   for (const co of model.massing.corridors) {
-    if (!barById.has(co.barId)) warnings.push(`Corridor ${co.id} references unknown bar ${co.barId}.`);
+    if (!barById.has(co.barId)) bad(`Corridor ${co.id} references unknown bar ${co.barId}.`);
   }
   if (model.parking) {
     for (const s of model.parking.spaces) {
-      if (!rectContainsRect(B, s.rect, 0.05)) warnings.push(`Parking space ${s.id} falls outside the site boundary.`);
+      if (!rectContainsRect(B, s.rect, 0.05)) bad(`Parking space ${s.id} falls outside the site boundary.`);
       else if (s.storey !== SITE_STOREY && !rectContainsRect(frame.env, s.rect, 0.5)) {
-        warnings.push(`Structured parking space ${s.id} falls outside the buildable envelope.`);
+        bad(`Structured parking space ${s.id} falls outside the buildable envelope.`);
       }
     }
   }
@@ -270,8 +303,8 @@ function validate(model: SiteModel, frame: SiteFrame, m: MassingResult, warnings
     ...(model.parking ? model.parking.spaces.map(s => s.id) : []),
   ];
   for (const id of allIds) {
-    if (seen.has(id)) warnings.push(`Duplicate site id ${id}.`);
+    if (seen.has(id)) bad(`Duplicate site id ${id}.`);
     seen.add(id);
   }
-  if (m.massing.storeys.length < 3) warnings.push('Storey stack is missing SITE / FND / ROOF levels.');
+  if (m.massing.storeys.length < 3) bad('Storey stack is missing SITE / FND / ROOF levels.');
 }
