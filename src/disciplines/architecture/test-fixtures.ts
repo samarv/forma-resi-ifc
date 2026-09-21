@@ -15,7 +15,7 @@
  * `resolveArchitectureDeps`).
  */
 import type {
-  BuildingSpec, CorePlacement, CorridorSpine, Entrance, FurnitureDef, FurnitureType, GenContext,
+  BuildingSpec, CorePlacement, CorridorSpine, DoorDef, Entrance, FurnitureDef, FurnitureType, GenContext,
   LandscapeZone, MassingBar, Polygon, Rect, RoomDef, RoomProgram, RoomType, Side, SiteModel,
   StoreyDef, UnitTemplateDef, UnitTemplateId, Vec2, WallDef,
 } from '../../core/types.ts';
@@ -25,6 +25,7 @@ import { normalizeSpec, buildStoreys, type PartialSpec } from '../../core/spec.t
 import { getTypology } from '../../core/typologies.ts';
 import { createRng } from '../../core/rng.ts';
 import { polygonArea, rectToPolygon, round } from '../../core/geometry.ts';
+import { reachRect, solveSwing } from '../../core/openings.ts';
 import { roomIsWet, roomZone } from './arch-elements.ts';
 
 // ============================================================================
@@ -427,10 +428,15 @@ export const stubLayoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout
     bathRooms.push(room);
     out.bathroomRoomIds.push(room.id);
     const divider = addWallAlong(b0, 0, serviceDepth, 'wet', SIZES.partitionT);
+    const bathSwing = solveSwing({
+      wall: divider, along: round(serviceDepth / 2), width: SIZES.doorBathroom, motion: 'swing',
+      into: reachRect(room.rect, divider),
+    });
     out.doors.push({
       id: nid('D'), storey: req.storey, wallId: divider.id, along: round(serviceDepth / 2),
       width: SIZES.doorBathroom, height: SIZES.doorHeight, type: 'interior',
-      operation: 'SINGLE_SWING_LEFT', fromRoomId: hall.id, toRoomId: room.id, unitId: req.unitId,
+      motion: 'swing', hinge: bathSwing.hinge, swing: bathSwing.swing, swingIntoRoomId: room.id,
+      fromRoomId: hall.id, toRoomId: room.id, unitId: req.unitId, ref: `hall1~${type}${i + 1}`,
     });
     room.wallIds.push(divider.id);
   }
@@ -459,10 +465,15 @@ export const stubLayoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout
     }
     // door from the hall through the wet wall
     const doorAlong = Math.abs(dotAlong(wetWall, r) );
+    const sol = solveSwing({
+      wall: wetWall, along: round(doorAlong), width: SIZES.doorInterior, motion: 'swing',
+      into: reachRect(room.rect, wetWall),
+    });
     out.doors.push({
       id: nid('D'), storey: req.storey, wallId: wetWall.id, along: round(doorAlong),
       width: SIZES.doorInterior, height: SIZES.doorHeight, type: 'interior',
-      operation: 'SINGLE_SWING_RIGHT', fromRoomId: hall.id, toRoomId: room.id, unitId: req.unitId,
+      motion: 'swing', hinge: sol.hinge, swing: sol.swing, swingIntoRoomId: room.id,
+      fromRoomId: hall.id, toRoomId: room.id, unitId: req.unitId, ref: `hall1~${weights[i].type}${i + 1}`,
     });
     cursor += len;
   }
@@ -472,10 +483,15 @@ export const stubLayoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout
   const accessWall = req.boundaryWalls[accessSide];
   if (accessWall && entryLevel) {
     const along = clampAlong(accessWall, projectRange(accessWall, hall.rect), SIZES.doorUnitEntry);
-    const d = {
+    const sol = solveSwing({
+      wall: accessWall, along: round(along), width: SIZES.doorUnitEntry, motion: 'swing',
+      into: reachRect(hall.rect, accessWall),
+    });
+    const d: DoorDef = {
       id: nid('D'), storey: req.storey, wallId: accessWall.id, along: round(along),
       width: SIZES.doorUnitEntry, height: SIZES.doorHeight, type: 'unit-entry' as const,
-      operation: 'SINGLE_SWING_LEFT', fromRoomId: hall.id, unitId: req.unitId, fireRated: true,
+      motion: 'swing', hinge: sol.hinge, swing: sol.swing, swingIntoRoomId: hall.id,
+      fromRoomId: hall.id, unitId: req.unitId, fireRated: true, ref: 'entry',
     };
     out.doors.push(d);
     out.entryDoorId = d.id;
@@ -523,10 +539,12 @@ export const stubLayoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout
     const host = habitable[0];
     if (wall && host) {
       const range = projectRange(wall, host.rect);
+      const balAlong = round(clampAlong(wall, range, 1.6));
+      const sol = solveSwing({ wall, along: balAlong, width: 1.6, motion: 'sliding', into: reachRect(host.rect, wall) });
       out.doors.push({
-        id: nid('D'), storey: req.storey, wallId: wall.id, along: round(clampAlong(wall, range, 1.6)),
-        width: 1.6, height: 2.2, type: 'balcony', operation: 'DOUBLE_DOOR_SLIDING',
-        fromRoomId: host.id, toRoomId: room.id, unitId: req.unitId,
+        id: nid('D'), storey: req.storey, wallId: wall.id, along: balAlong,
+        width: 1.6, height: 2.2, type: 'balcony', motion: 'sliding', hinge: sol.hinge, swing: sol.swing,
+        fromRoomId: host.id, toRoomId: room.id, unitId: req.unitId, ref: 'balcony',
       });
     }
   }

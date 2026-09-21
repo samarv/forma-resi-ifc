@@ -17,6 +17,8 @@ import {
   starPath, text, unionRect, wallQuad,
 } from './svg.ts';
 import { fmtArea, humanize, n3, slotFor } from './util.ts';
+import { doorOperation, hingePoint, latchPoint, leafTip, swingArc, swingNormal } from '../core/openings.ts';
+import { stretchKey, typeById } from '../core/furniture-3d.ts';
 
 export interface Hit {
   id: string;
@@ -70,19 +72,6 @@ const PIPE_COLOR: Record<string, string> = {
   storm: 'var(--s3)', sprinkler: 'var(--s8)', standpipe: 'var(--s2)', gas: 'var(--s4)',
 };
 
-const FURN_GLYPH: [RegExp, string][] = [
-  [/^bed-/, 'B'], [/^wardrobe/, 'W'], [/^nightstand/, 'n'], [/^dresser/, 'D'], [/^desk/, 'D'],
-  [/^sofa|armchair|lounge/, 'S'], [/^coffee-table/, 't'], [/^tv-unit/, 'TV'], [/^dining-table/, 'T'],
-  [/^dining-chair|^chair/, 'c'], [/^kitchen-counter/, 'K'], [/^kitchen-island/, 'KI'], [/^fridge/, 'R'],
-  [/^range/, 'O'], [/^dishwasher/, 'DW'], [/^kitchen-sink/, 'KS'], [/^wc/, 'WC'], [/^lavatory/, 'L'],
-  [/^vanity/, 'V'], [/^shower/, 'SH'], [/^bathtub/, 'BT'], [/^washer/, 'WM'], [/^dryer/, 'DR'],
-  [/^water-heater/, 'WH'], [/^shelving|bookcase/, 'Sh'], [/^car/, 'CAR'], [/^bike-rack/, 'BK'],
-];
-function furnGlyph(type: string): string {
-  for (const [re, g] of FURN_GLYPH) if (re.test(type)) return g;
-  return type.charAt(0).toUpperCase();
-}
-
 // element index cache (id → element) so tooltips can show psets/patterns
 const elIndexCache = new WeakMap<DesignModel, Map<string, ModelElement>>();
 export function elementIndex(model: DesignModel): Map<string, ModelElement> {
@@ -113,6 +102,9 @@ export function elementFootprint(g: ElementGeometry): Vec2[] | null {
     case 'column':
       return boxQuad(g.position[0] - g.width / 2, g.position[1] - g.depth / 2, g.width, g.depth, 0);
     case 'box':
+    // A mapped-item occurrence carries its own placed footprint, so the plan
+    // never has to resolve the furniture type just to draw an outline.
+    case 'instance':
       return boxQuad(g.position[0], g.position[1], g.width, g.depth, g.rotation ?? 0);
     case 'footing':
       return boxQuad(g.position[0] - g.width / 2, g.position[1] - g.depth / 2, g.width, g.depth, 0);
@@ -288,15 +280,28 @@ export function buildPlan(
       if (d.storey !== storeyId) continue;
       const w = wallIdx.get(d.wallId);
       if (!w) continue;
-      const { a, b, nrm, dir } = along(w, d.along, d.width);
+      const { a, b } = along(w, d.along, d.width);
       cut.push(polyPath(wallQuad(a, b, w.thickness * 1.6)));
-      const tip: Vec2 = [a[0] + nrm[0] * d.width, a[1] + nrm[1] * d.width];
-      leaf.push(linePath(a, tip));
-      arcs.push(arcPath(a[0], a[1], d.width, Math.atan2(nrm[1], nrm[0]), Math.atan2(dir[1], dir[0])));
+      // hinge, leaf and arc all come from the stored motion/hinge/swing (core/openings.ts) — nothing is
+      // inferred from the wall normal, and only a swing leaf gets a leaf line plus a quarter arc
+      const hinge = hingePoint(d, w);
+      const tip = leafTip(d, w);
+      const arc = swingArc(d, w);
+      if (arc) {
+        leaf.push(linePath(hinge, tip));
+        arcs.push(arcPath(arc.centre[0], arc.centre[1], arc.radius, arc.fromAngle, arc.toAngle));
+      } else if (d.motion === 'sliding' || d.motion === 'folding') {
+        // a sliding or folding leaf parks parallel to the wall on the side its pocket is on
+        const n = swingNormal(d, w) ?? [0, 0];
+        const off = Math.max(0.04, w.thickness * 0.35);
+        const latch = latchPoint(d, w);
+        leaf.push(linePath([hinge[0] + n[0] * off, hinge[1] + n[1] * off], [latch[0] + n[0] * off, latch[1] + n[1] * off]));
+      }
+      // 'rolling' and 'opening' draw the break in the wall only
       counts.doors = (counts.doors ?? 0) + 1;
       hits.push(hitFromPoints(d.id, 'Door', `${humanize(d.type)} ${d.width.toFixed(2)}×${d.height.toFixed(2)} m`,
-        [a, b, tip], elMeta(model, d.id, [
-          ['Type', humanize(d.type)], ['Operation', d.operation], ['Host wall', d.wallId],
+        arc ? [a, b, tip] : [a, b], elMeta(model, d.id, [
+          ['Type', humanize(d.type)], ['Operation', doorOperation(d)], ['Host wall', d.wallId],
           ...(d.fireRated ? [['Fire rated', 'yes'] as [string, string]] : []),
         ])));
     }
@@ -323,18 +328,29 @@ export function buildPlan(
   }
 
   // ---- furniture
+  // Every item draws the top-view SYMBOL of its 3D type (a bed reads as frame +
+  // pillows, a WC as bowl + cistern), transformed per instance into the same
+  // batched path as the footprint outline — so the layer is still one <path> and
+  // the letter glyphs are gone. `low` detail keeps the footprint ring only.
   if (layers.furniture && arch?.furniture?.length) {
     const outl: string[] = [];
-    const glyphs: string[] = [];
+    const symbolsOn = model.spec.options?.detail !== 'low';
     for (const f of arch.furniture) {
       if (f.storey !== storeyId) continue;
       const pts = boxQuad(f.position[0], f.position[1], f.width, f.depth, f.rotation);
       grow(pts);
       outl.push(polyPath(pts));
       counts.furniture = (counts.furniture ?? 0) + 1;
-      if (labelsOn && f.width * f.depth > 0.12) {
-        const c = centroid(pts);
-        glyphs.push(text(c[0], c[1] - 0.12, furnGlyph(f.type), { size: 0.34, fill: 'var(--ink-3)' }));
+      const type3d = symbolsOn ? typeById(stretchKey(f.type, f.width)) : undefined;
+      if (type3d) {
+        const cos = Math.cos(f.rotation);
+        const sin = Math.sin(f.rotation);
+        for (const ring of type3d.symbol) {
+          outl.push(polyPath(ring.map(p => [
+            f.position[0] + p[0] * cos - p[1] * sin,
+            f.position[1] + p[0] * sin + p[1] * cos,
+          ] as Vec2)));
+        }
       }
       hits.push(hitFromPoints(f.id, 'Furniture', humanize(f.type), pts, elMeta(model, f.id, [
         ['Type', humanize(f.type)], ['Size', `${f.width.toFixed(2)} × ${f.depth.toFixed(2)} m`],
@@ -344,7 +360,7 @@ export function buildPlan(
     }
     out.push(`<g class="l-furn">${pathEl(outl.join(''), {
       fill: 'none', stroke: 'var(--dwg-wall-part)', 'stroke-width': 0.9, ...HAIR, opacity: 0.95,
-    })}${glyphs.join('')}</g>`);
+    })}</g>`);
   }
 
   // ---- structure

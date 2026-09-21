@@ -12,6 +12,9 @@ import { buildAxon, ccw, project } from './axon-svg.ts';
 import { DEFAULT_LAYERS } from './state.ts';
 import { parseIdGuidMap } from './viewer-embed.ts';
 import { niceScaleLength, northScreenDeg } from './viewport.ts';
+import { arcPath } from './svg.ts';
+import { swingArc } from '../core/openings.ts';
+import type { Vec2 } from '../core/types.ts';
 
 const model = buildMockModel(PRESETS[0].spec);
 
@@ -93,6 +96,29 @@ test('opening placement along a wall', () => {
   assert.ok(Math.abs(nrm[0]) < 1e-12 && nrm[1] === 1);
 });
 
+test('door arcs are a quarter turn on all four wall directions', () => {
+  // v1 built the arc from two absolute atan2 angles, so a wall pointing -X wrapped to +270° and drew a
+  // three-quarter arc across the room (large=1, sweep=0). The sweep is normalised now, so every leaf is 90°.
+  const walls: [string, Vec2, Vec2][] = [
+    ['+X', [0, 0], [10, 0]], ['-X', [10, 0], [0, 0]], ['+Y', [0, 0], [0, 10]], ['-Y', [0, 10], [0, 0]],
+  ];
+  for (const [label, start, end] of walls) {
+    for (const hinge of ['start', 'end'] as const) {
+      for (const swing of ['left', 'right'] as const) {
+        const d = { along: 5, width: 0.9, motion: 'swing' as const, hinge, swing };
+        const arc = swingArc(d, { start, end });
+        assert.ok(arc, label);
+        const path = arcPath(arc!.centre[0], arc!.centre[1], arc!.radius, arc!.fromAngle, arc!.toAngle);
+        const flags = path.split('A')[1].trim().split(/\s+/);
+        assert.equal(flags[3], '0', `${label}/${hinge}/${swing}: large-arc flag set — the sweep wrapped`);
+        // the drawn endpoints are the closed leaf (latch) and the open leaf tip, 90° apart
+        const chord = Math.hypot(arc!.to[0] - arc!.from[0], arc!.to[1] - arc!.from[1]);
+        assert.ok(Math.abs(chord - 0.9 * Math.SQRT2) < 1e-9, `${label}: chord ${chord.toFixed(4)}`);
+      }
+    }
+  }
+});
+
 test('site plan and axon build', () => {
   const s = buildSite(model, 'metric', null);
   assert.ok(s.body.length > 500);
@@ -172,4 +198,44 @@ test('plan of a 20-storey-scale element load stays under 100 ms', () => {
   const ms = performance.now() - t0;
   assert.ok(ms < 100, `fat plan took ${ms.toFixed(1)} ms`);
   assert.ok(d.hits.length > 0);
+});
+
+test('furniture draws its 3D type symbol, batched into one path', () => {
+  const storey = model.arch.furniture[0]?.storey;
+  assert.ok(storey, 'the mock model has no furniture');
+  const items = model.arch.furniture.filter((f) => f.storey === storey);
+
+  const layerOf = (m: typeof model): string => {
+    const d = buildPlan(m, storey, DEFAULT_LAYERS, 'metric', null);
+    const layer = /<g class="l-furn">([\s\S]*?)<\/g>/.exec(d.body);
+    assert.ok(layer, 'no furniture layer');
+    return layer[1];
+  };
+
+  const full = layerOf(model);
+  // Still ONE <path> for the whole layer: the symbol rings go into the same
+  // batched outline array, not into per-item nodes.
+  assert.equal((full.match(/<path/g) ?? []).length, 1);
+  // The letter glyphs are gone.
+  assert.ok(!full.includes('<text'), 'furniture still emits text glyphs');
+
+  // Rings per item: the footprint plus the type symbol, and never more than the
+  // eight primitives a type may have.
+  const subpaths = (layer: string): number => (layer.match(/M/g) ?? []).length;
+  const low = layerOf({
+    ...model,
+    spec: { ...model.spec, options: { ...model.spec.options, detail: 'low' } },
+  });
+  assert.equal(subpaths(low), items.length, 'low detail draws the footprint ring only');
+  assert.ok(subpaths(full) > subpaths(low), 'no symbol rings were drawn');
+  assert.ok(subpaths(full) <= items.length * 9,
+    `${subpaths(full)} rings for ${items.length} items exceeds the budget`);
+
+  // A mapped-item occurrence is pickable and measured exactly like a box.
+  const instance = model.elements.find((e) => e.geometry.kind === 'instance');
+  assert.ok(instance, 'the mock model has no instance element');
+  const pts = elementFootprint(instance.geometry);
+  assert.ok(pts && pts.length === 4);
+  const axon = buildAxon(model);
+  assert.ok(axon.hits.some((h) => h.id === instance.id), 'instance missing from the axon');
 });

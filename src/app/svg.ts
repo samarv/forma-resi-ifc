@@ -49,13 +49,21 @@ export function circlePath(cx: number, cy: number, r: number): string {
   return `M${n3(cx - r)} ${n3(-cy)}a${n3(r)} ${n3(r)} 0 1 0 ${n3(2 * r)} 0a${n3(r)} ${n3(r)} 0 1 0 ${n3(-2 * r)} 0`;
 }
 
-/** Arc for a door swing: centre (cx,cy), radius r, from angle a0 to a1 (world radians). */
+/**
+ * Arc for a door swing: centre (cx,cy), radius r, from angle a0 to a1 (world radians), always taking the SHORT way
+ * round. `Math.atan2` returns (−π, π], so the raw difference of two absolute angles wraps — a 90° sweep on a wall
+ * pointing −X used to come out as +270° and drew a three-quarter arc across the room. Normalising the delta into
+ * (−π, π] first makes `large`/`sweep` correct on all four wall directions.
+ */
 export function arcPath(cx: number, cy: number, r: number, a0: number, a1: number): string {
   const x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
   const x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
-  const large = Math.abs(a1 - a0) > Math.PI ? 1 : 0;
+  let delta = (a1 - a0) % (2 * Math.PI);
+  if (delta > Math.PI) delta -= 2 * Math.PI;
+  if (delta <= -Math.PI) delta += 2 * Math.PI;
+  const large = Math.abs(delta) > Math.PI ? 1 : 0;
   // Y is negated, so the sweep flag flips relative to world orientation.
-  const sweep = a1 > a0 ? 0 : 1;
+  const sweep = delta > 0 ? 0 : 1;
   return `M${n3(x0)} ${n3(-y0)}A${n3(r)} ${n3(r)} 0 ${large} ${sweep} ${n3(x1)} ${n3(-y1)}`;
 }
 

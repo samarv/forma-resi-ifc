@@ -667,8 +667,7 @@ export type DoorSwing = 'left' | 'right' | 'none';
 /**
  * Door hosted in a wall. v2 convention (see core/openings.ts, the single owner of the geometry): hinge and swing are
  * derived ONCE by the producer with solveSwing() and stored; the 2D plan, the IFC writer, switch placement and the
- * furniture keep-out all read them. The IFC operation token is derived by doorOperation(); the operation field is legacy and
- * is removed once every producer writes motion/hinge/swing.
+ * furniture keep-out all read them. The IFC operation token is never authored — it is derived by doorOperation().
  */
 export interface DoorDef {
   id: string;
@@ -679,11 +678,10 @@ export interface DoorDef {
   width: number;
   height: number;
   type: 'unit-entry' | 'interior' | 'building-entry' | 'balcony' | 'garage' | 'exit' | 'closet' | 'service';
-  /** @deprecated legacy IFC token; derive with doorOperation() from motion/hinge/swing */
-  operation: string;
-  motion?: DoorMotion;
-  hinge?: DoorHinge;
-  swing?: DoorSwing;
+  /** How the leaf moves; only 'swing' | 'double-swing' draw an arc */
+  motion: DoorMotion;
+  hinge: DoorHinge;
+  swing: DoorSwing;
   /** Room whose floor the leaf sweeps over; required for swing motions, must be fromRoomId or toRoomId */
   swingIntoRoomId?: string;
   fromRoomId?: string;

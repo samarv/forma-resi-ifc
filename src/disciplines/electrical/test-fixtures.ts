@@ -28,6 +28,7 @@ import { createRng } from '../../core/rng.ts';
 import { buildStoreys, normalizeSpec } from '../../core/spec.ts';
 import { getTypology } from '../../core/typologies.ts';
 import { dist, polygonArea, rectToPolygon } from '../../core/geometry.ts';
+import { reachRect, solveSwing } from '../../core/openings.ts';
 
 // ---------------------------------------------------------------------------
 // Geometry constants
@@ -306,19 +307,27 @@ class StoreyBuilder {
     return best;
   }
 
-  door(axis: 'x' | 'y', at: number, pos: number, width: number, type: DoorDef['type'], from: RoomDef | null, to: RoomDef | null, opts: { unitId?: string; fireRated?: boolean; operation?: string } = {}): DoorDef | null {
+  door(axis: 'x' | 'y', at: number, pos: number, width: number, type: DoorDef['type'], from: RoomDef | null, to: RoomDef | null, opts: { unitId?: string; fireRated?: boolean; motion?: DoorDef['motion'] } = {}): DoorDef | null {
     const wall = this.findWall(axis, at, pos);
     if (!wall) return null;
     const point: Vec2 = axis === 'x' ? [pos, at] : [at, pos];
+    const along = Math.round(dist(wall.start, point) * 1000) / 1000;
+    const motion = opts.motion ?? 'swing';
+    // hinge + swing from geometry, exactly as the real producers do (core/openings.ts)
+    const into = to ?? from;
+    const sol = solveSwing({ wall, along, width, motion, into: into ? reachRect(into.rect, wall) : null });
     const door: DoorDef = {
       id: this.ids.next(this.storey.id, 'DOOR'),
       storey: this.storey.id,
       wallId: wall.id,
-      along: Math.round(dist(wall.start, point) * 1000) / 1000,
+      along,
       width,
       height: 2.1,
       type,
-      operation: opts.operation ?? 'SINGLE_SWING_LEFT',
+      motion,
+      hinge: sol.hinge,
+      swing: sol.swing,
+      ...(motion === 'swing' && into ? { swingIntoRoomId: into.id } : {}),
       fromRoomId: from?.id,
       toRoomId: to?.id,
       fireRated: opts.fireRated,
@@ -408,7 +417,9 @@ export function makeContextFixture(options: FixtureOptions = {}): Fixture {
     typology: 'corridor-midrise',
     seed: 7,
     region: options.region ?? 'US',
-    massing: { storeys: storeyCount },
+    // `allowStoreyOverride`: the fixture is deliberately built at 1..20 storeys on a typology
+    // whose band is 4..8, so it opts out of the v2 clamp in `normalizeSpec`.
+    massing: { storeys: storeyCount, allowStoreyOverride: true },
     options: { detail: options.detail ?? 'high' },
   });
   const typology = getTypology(spec.typology);
@@ -516,7 +527,7 @@ export function makeContextFixture(options: FixtureOptions = {}): Fixture {
     if (ground) {
       b.door('x', CORRIDOR_Y1, 49.5, 0.9, 'service', corridorRoom, elecRoom, { fireRated: true });
       b.door('x', 19.5, 49.5, 0.9, 'service', elecRoom, mechRoom);
-      b.door('x', BAR_Y0, 16.5, 1.8, 'building-entry', coreAFront, null, { operation: 'DOUBLE_DOOR_SINGLE_SWING' });
+      b.door('x', BAR_Y0, 16.5, 1.8, 'building-entry', coreAFront, null);
     } else {
       b.door('x', CORRIDOR_Y1, 49.5, 0.9, 'service', corridorRoom, b.roomByKey.get('CORE_B_R') ?? null);
     }
@@ -544,7 +555,6 @@ export function makeContextFixture(options: FixtureOptions = {}): Fixture {
         const d = b.door(axis, at, pos, ds.width, ds.type, from, to, {
           unitId: uid,
           fireRated: ds.type === 'unit-entry',
-          operation: ds.type === 'unit-entry' ? 'SINGLE_SWING_RIGHT' : 'SINGLE_SWING_LEFT',
         });
         if (d && ds.type === 'unit-entry') entryDoorId = d.id;
       }

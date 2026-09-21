@@ -28,6 +28,7 @@ import { normalizeSpec, buildStoreys } from '../../core/spec.ts';
 import { getTypology } from '../../core/typologies.ts';
 import { createRng } from '../../core/rng.ts';
 import { rectToPolygon, rectArea, rectCenter } from '../../core/geometry.ts';
+import { reachRect, solveSwing } from '../../core/openings.ts';
 import { roomId as makeRoomId, unitId as makeUnitId, ROOF_STOREY } from '../../core/ids.ts';
 
 export interface FixtureOptions {
@@ -127,7 +128,9 @@ export function makeContextFixture(opts: FixtureOptions = {}): GenContext {
     region: opts.region ?? 'US',
     typology: 'corridor-midrise',
     site: { width: 66, depth: 35, streetFacing: 'S', context: 'urban' },
-    massing: { storeys: storeyCount, footprintShape: 'bar', roof: 'flat', buildingDepth: BAR.h, buildingLength: BAR.w, corridorWidth: CORRIDOR_WIDTH },
+    // `allowStoreyOverride`: the fixture is deliberately built at 1..20 storeys on a typology
+    // whose band is 4..8, so it opts out of the v2 clamp in `normalizeSpec`.
+    massing: { storeys: storeyCount, allowStoreyOverride: true, footprintShape: 'bar', roof: 'flat', buildingDepth: BAR.h, buildingLength: BAR.w, corridorWidth: CORRIDOR_WIDTH },
     options: { detail: opts.detail ?? 'medium' },
   });
   const typology: TypologyDef = getTypology('corridor-midrise');
@@ -241,10 +244,14 @@ export function makeContextFixture(opts: FixtureOptions = {}): GenContext {
         storeyWallIds.push(extWall.id, corrWall.id, wetWall.id, hallLeft.id, hallInner.id);
         storeyExtWallIds.push(extWall.id);
 
-        // Entry door in the corridor wall
+        // Entry door in the corridor wall — hinge/swing derived, leaf into the dwelling (core/openings.ts)
+        const entrySwing = solveSwing({
+          wall: corrWall, along: 5.0, width: 0.9, motion: 'swing', into: reachRect(unitRect, corrWall),
+        });
         const entryDoor: DoorDef = {
           id: nextDoorId(), storey: st.id, wallId: corrWall.id, along: 5.0, width: 0.9, height: 2.1,
-          type: 'unit-entry', operation: 'SINGLE_SWING_LEFT', fireRated: true, unitId: uid,
+          type: 'unit-entry', motion: 'swing', hinge: entrySwing.hinge, swing: entrySwing.swing,
+          fireRated: true, unitId: uid, ref: 'entry',
         };
         doors.push(entryDoor);
 
@@ -307,9 +314,15 @@ export function makeContextFixture(opts: FixtureOptions = {}): GenContext {
             const along = lr.wet && lr.type !== 'laundry'
               ? lr.v + lr.d / 2
               : lr.exterior ? Math.min(2.9, Math.max(0.3, lr.u + lr.w / 2 - 3.4)) : Math.min(4.2, lr.v + lr.d / 2);
+            const motion: DoorDef['motion'] = lr.type === 'walk-in-closet' ? 'sliding' : 'swing';
+            const sol = solveSwing({
+              wall: host, along, width: lr.wet ? 0.75 : 0.8, motion, into: reachRect(room.rect, host),
+            });
             const door: DoorDef = {
               id: nextDoorId(), storey: st.id, wallId: host.id, along, width: lr.wet ? 0.75 : 0.8, height: 2.1,
-              type: lr.type === 'walk-in-closet' ? 'closet' : 'interior', operation: 'SINGLE_SWING_LEFT',
+              type: lr.type === 'walk-in-closet' ? 'closet' : 'interior',
+              motion, hinge: sol.hinge, swing: sol.swing,
+              ...(motion === 'swing' ? { swingIntoRoomId: room.id } : {}),
               fromRoomId: roomByName.get('Hall')?.id, toRoomId: room.id, unitId: uid,
             };
             doors.push(door);

@@ -59,6 +59,81 @@ function inRect(r: Rect, p: Vec2, tol = 1e-6): boolean {
 }
 
 /**
+ * The `into` rect a producer should pass to `solveSwing`: `room` stretched perpendicular to `wall` until it reaches
+ * half a probe depth PAST the wall centreline, so the 0.06 m probe answers "is the room on this side of the wall?" for
+ * any wall thickness. Needed because a boundary wall's centreline sits outside the net room rect by thickness/2 (a
+ * 0.2 m wet wall would otherwise put the probe inside the wall and outside every room). Axis-aligned walls only;
+ * a diagonal wall gets the rect unchanged.
+ */
+export function reachRect(room: Rect, wall: WallRef): Rect {
+  const f = frameOf(wall);
+  const half = PROBE_DEPTH / 2;
+  if (Math.abs(f.dir[1]) < 1e-6) {
+    const line = wall.start[1];
+    if (room.y + room.h / 2 >= line) {
+      const y0 = Math.min(room.y, line + half);
+      return { x: room.x, y: y0, w: room.w, h: room.y + room.h - y0 };
+    }
+    const y1 = Math.max(room.y + room.h, line - half);
+    return { x: room.x, y: room.y, w: room.w, h: y1 - room.y };
+  }
+  if (Math.abs(f.dir[0]) < 1e-6) {
+    const line = wall.start[0];
+    if (room.x + room.w / 2 >= line) {
+      const x0 = Math.min(room.x, line + half);
+      return { x: x0, y: room.y, w: room.x + room.w - x0, h: room.h };
+    }
+    const x1 = Math.max(room.x + room.w, line - half);
+    return { x: room.x, y: room.y, w: x1 - room.x, h: room.h };
+  }
+  return room;
+}
+
+/**
+ * Where to hang a door of `width` in `wall` so that it actually opens into `room`: the centre of the wall's overlap
+ * with the room, clamped clear of both ends. Falls back to the wall midpoint when the overlap is too short to hold
+ * the leaf. The midpoint alone (v1's only rule) misses whenever the room covers just part of the wall — a core's
+ * stair wall runs the whole depth of the core while the lift lobby is one bay of it.
+ */
+export function alongInWall(wall: WallRef, room: Rect, width: number): number {
+  const f = frameOf(wall);
+  const corners: Vec2[] = [
+    [room.x, room.y], [room.x + room.w, room.y], [room.x + room.w, room.y + room.h], [room.x, room.y + room.h],
+  ];
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const c of corners) {
+    const t = (c[0] - wall.start[0]) * f.dir[0] + (c[1] - wall.start[1]) * f.dir[1];
+    lo = Math.min(lo, t);
+    hi = Math.max(hi, t);
+  }
+  lo = Math.max(lo, 0);
+  hi = Math.min(hi, f.len);
+  if (hi - lo < width + 0.2) return f.len / 2;
+  const half = width / 2 + 0.1;
+  return Math.min(Math.max((lo + hi) / 2, lo + half), hi - half);
+}
+
+/** Fraction of the leaf width, from the hinge toward the latch, at which the swing probe sits */
+export const SWING_PROBE_ALONG = 0.3;
+
+/**
+ * The point every consumer and test probes to verify a swing: `SWING_PROBE_ALONG` of the leaf width from the hinge
+ * toward the latch, then 0.05 m onto the swing side. It must lie inside `swingIntoRoomId`'s room rect. null for
+ * motions that do not sweep a floor.
+ */
+export function swingProbe(d: DoorGeom, wall: WallRef): Vec2 | null {
+  const n = swingNormal(d, wall);
+  if (!n || !drawsArc(d)) return null;
+  const h = hingePoint(d, wall);
+  const l = latchPoint(d, wall);
+  return [
+    h[0] + (l[0] - h[0]) * SWING_PROBE_ALONG + n[0] * 0.05,
+    h[1] + (l[1] - h[1]) * SWING_PROBE_ALONG + n[1] * 0.05,
+  ];
+}
+
+/**
  * Derive hinge + swing from geometry. `into` is the world rect of the room the leaf must sweep into; `avoid` is a
  * world point the open leaf must stay clear of (centre of the wet-wall fixture run) — the hinge goes on the end of the
  * opening FARTHER from it, so the fully open leaf folds back onto the wall away from the fixtures.

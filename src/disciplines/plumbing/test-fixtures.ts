@@ -27,6 +27,7 @@ import { normalizeSpec, buildStoreys, type PartialSpec } from '../../core/spec.t
 import { getTypology } from '../../core/typologies.ts';
 import { createRng } from '../../core/rng.ts';
 import { rectToPolygon, round } from '../../core/geometry.ts';
+import { reachRect, solveSwing } from '../../core/openings.ts';
 import { unitId as makeUnitId, roomId as makeRoomId } from '../../core/ids.ts';
 
 // ---------------------------------------------------------------------------
@@ -120,7 +121,9 @@ export function makeContextFixture(opts: FixtureOptions = {}): GenContext {
     region: 'US',
     typology: 'corridor-midrise',
     site: { width: g.site.width, depth: g.site.depth, streetFacing: 'S', context: 'urban' },
-    massing: { storeys: storeyCount, footprintShape: 'bar', roof: opts.roofType ?? 'flat' },
+    // `allowStoreyOverride`: the fixture is deliberately built at 1..20 storeys on a typology
+    // whose band is 4..8, so it opts out of the v2 clamp in `normalizeSpec`.
+    massing: { storeys: storeyCount, allowStoreyOverride: true, footprintShape: 'bar', roof: opts.roofType ?? 'flat' },
   };
   const override: Partial<PartialSpec> = opts.spec ?? {};
   const spec: BuildingSpec = normalizeSpec({
@@ -362,11 +365,18 @@ function makeArch(spec: BuildingSpec, storeys: StoreyDef[], above: StoreyDef[], 
 
       // entry door in the corridor wall
       const entryDoorId = `ARC-${storey}-DOOR-U${i + 1}`;
+      const entryAlong = round(ux + 7.5 - (g.unitX0 - 4.7), 4);
+      const entrySwing = solveSwing({
+        wall: corridorWall, along: entryAlong, width: 0.9, motion: 'swing',
+        into: reachRect(rectOf(ux, g.unitY0, ux + g.unitW, g.unitY0 + g.unitH), corridorWall),
+      });
       doors.push({
         id: entryDoorId, storey, wallId: corridorWall.id,
-        along: round(ux + 7.5 - (g.unitX0 - 4.7), 4),
-        width: 0.9, height: 2.1, type: 'unit-entry', operation: 'SINGLE_SWING_LEFT',
-        toRoomId: makeRoomId(uid, 'HALL', 1), fromRoomId: corridorRoomId, fireRated: true, unitId: uid,
+        along: entryAlong,
+        width: 0.9, height: 2.1, type: 'unit-entry',
+        motion: 'swing', hinge: entrySwing.hinge, swing: entrySwing.swing,
+        swingIntoRoomId: makeRoomId(uid, 'HALL', 1),
+        toRoomId: makeRoomId(uid, 'HALL', 1), fromRoomId: corridorRoomId, fireRated: true, unitId: uid, ref: 'entry',
       });
 
       // rooms (half the dwellings get a store instead of a laundry)

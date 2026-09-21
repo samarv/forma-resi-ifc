@@ -7,10 +7,11 @@
  *   ELE-13 Light by Task not Watts          fixture counts from lux targets
  */
 import type {
-  Circuit, ElecDevice, ElecDeviceType, FurnitureDef, FurnitureType, RoomDef, RoomType, Vec2,
+  Circuit, DoorDef, ElecDevice, ElecDeviceType, FurnitureDef, FurnitureType, RoomDef, RoomType, Vec2,
 } from '../../core/types.ts';
 import { MOUNTING } from '../../core/coordination.ts';
 import { dist, segPointAt, projectOnSegment } from '../../core/geometry.ts';
+import { latchSide } from '../../core/openings.ts';
 import { APPLIANCE_VA, DEVICE_SPEC, LUX_TARGET } from './catalog.ts';
 import { fixturesForLux } from './load.ts';
 import { roomGroupOf } from './region.ts';
@@ -478,7 +479,7 @@ function roomSwitches(ec: ElecCtx, room: RoomDef, faces: RoomFace[], uc: UnitCon
 }
 
 /** The door a person enters the room through: the unit entry, else a door from circulation */
-function entryDoorOf(ec: ElecCtx, room: RoomDef, doors: { id: string; type: string; wallId: string; along: number; width: number; operation: string; fromRoomId?: string; toRoomId?: string }[]): typeof doors[number] | null {
+function entryDoorOf(ec: ElecCtx, room: RoomDef, doors: DoorDef[]): DoorDef | null {
   const fromCirculation = doors.find(d => {
     const other = d.fromRoomId === room.id ? d.toRoomId : d.fromRoomId;
     if (!other) return false;
@@ -488,16 +489,18 @@ function entryDoorOf(ec: ElecCtx, room: RoomDef, doors: { id: string; type: stri
   return doors.find(d => d.type === 'unit-entry') ?? fromCirculation ?? doors[0] ?? null;
 }
 
-function switchSpot(ec: ElecCtx, room: RoomDef, faces: RoomFace[], door: { wallId: string; along: number; width: number; operation: string }): { face: RoomFace; along: number } | null {
+/** ELE-05: the switch goes on the LATCH side of the door, 0.15 m clear of the opening (core/openings.ts) */
+function switchSpot(ec: ElecCtx, room: RoomDef, faces: RoomFace[], door: DoorDef): { face: RoomFace; along: number } | null {
   const wall = ec.wallById.get(door.wallId);
   const p = wall ? segPointAt({ a: wall.start, b: wall.end }, door.along) : null;
+  const latch = wall ? latchSide(door, wall) : null;
   const onWall = p ? faces.filter(f => f.wallId === door.wallId) : [];
   const candidates = onWall.length > 0 ? onWall : faces;
   let best: { face: RoomFace; along: number; d: number } | null = null;
   for (const face of candidates) {
     const at = p ? projectOnSegment(face.seg, p).along : face.length / 2;
-    const op = (door.operation ?? '').toUpperCase();
-    const sign = op.includes('RIGHT') ? -1 : 1;
+    // which way along the face the latch lies is geometry, not a token: latchSide() already carries the hinge
+    const sign = latch && projectOnSegment(face.seg, latch).along < at ? -1 : 1;
     const off = door.width / 2 + 0.15;
     const options = [at + sign * off, at - sign * off];
     for (const o of options) {

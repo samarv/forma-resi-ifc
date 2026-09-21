@@ -17,6 +17,11 @@ import type {
 } from '../../core/types.ts';
 import { IdFactory, roomId as makeRoomId } from '../../core/ids.ts';
 import { polygonArea, polygonBounds, rectToPolygon, relativeTo, round } from '../../core/geometry.ts';
+import { doorOperation } from '../../core/openings.ts';
+import { furnitureTypeDef, quantizeFurnitureWidth, stretchKey } from '../../core/furniture-3d.ts';
+
+/** At or above this clear width a door set is two leaves, so the IFC token gains its DOUBLE_DOOR_ prefix */
+const DOUBLE_LEAF_MIN = 1.35;
 
 // ----------------------------------------------------------------------------
 // Room taxonomy
@@ -381,15 +386,19 @@ export class ArchBuilder {
     this.patterns.push(app);
   }
 
-  /** Cross-link rooms ↔ doors/windows/furniture/walls once everything exists */
+  /** Cross-link rooms ↔ doors/windows/furniture/walls once everything exists (every list deduped: the
+   *  unit layout already registers its own doors, windows and furniture on the rooms it created) */
   crossLink(): void {
     const byId = new Map(this.rooms.map(r => [r.id, r] as const));
+    const addUnique = (list: string[] | undefined, id: string): void => {
+      if (list && !list.includes(id)) list.push(id);
+    };
     for (const d of this.doors) {
-      byId.get(d.fromRoomId ?? '')?.doorIds.push(d.id);
-      if (d.toRoomId && d.toRoomId !== d.fromRoomId) byId.get(d.toRoomId)?.doorIds.push(d.id);
+      addUnique(byId.get(d.fromRoomId ?? '')?.doorIds, d.id);
+      if (d.toRoomId && d.toRoomId !== d.fromRoomId) addUnique(byId.get(d.toRoomId)?.doorIds, d.id);
     }
-    for (const w of this.windows) byId.get(w.roomId)?.windowIds.push(w.id);
-    for (const f of this.furniture) byId.get(f.roomId)?.furnitureIds.push(f.id);
+    for (const w of this.windows) addUnique(byId.get(w.roomId)?.windowIds, w.id);
+    for (const f of this.furniture) addUnique(byId.get(f.roomId)?.furnitureIds, f.id);
     for (const w of this.walls) {
       for (const rid of [w.leftRoomId, w.rightRoomId]) {
         const r = rid ? byId.get(rid) : undefined;
@@ -496,6 +505,8 @@ export function emitElements(b: ArchBuilder, opts: EmitOptions): ModelElement[] 
     }
     const id = mint(d.id, d.storey, 'DOOR');
     const external = d.type === 'building-entry' || d.type === 'exit' || d.type === 'garage' || d.type === 'balcony';
+    // the IFC token is DERIVED from the stored motion/hinge/swing, never authored (core/openings.ts)
+    const operation = doorOperation(d, d.width >= DOUBLE_LEAF_MIN ? 2 : 1);
     out.push({
       id,
       discipline: 'architecture',
@@ -504,12 +515,12 @@ export function emitElements(b: ArchBuilder, opts: EmitOptions): ModelElement[] 
       name: `${cap(d.type.replace(/-/g, ' '))} door`,
       objectType: d.type,
       storey: d.storey,
-      geometry: { kind: 'door-in-wall', hostId: host, along: d.along, width: d.width, height: d.height, operation: d.operation },
+      geometry: { kind: 'door-in-wall', hostId: host, along: d.along, width: d.width, height: d.height, operation },
       psets: [{
         name: 'Pset_DoorCommon',
         properties: [
           { name: 'IsExternal', value: external },
-          { name: 'OperationType', value: d.operation },
+          { name: 'OperationType', value: operation },
           ...(d.fireRated ? [{ name: 'FireRating', value: d.type === 'exit' ? '90 min' : '30 min' }] : []),
           { name: 'Reference', value: d.type },
         ],
@@ -608,9 +619,30 @@ export function emitElements(b: ArchBuilder, opts: EmitOptions): ModelElement[] 
   }
 
   // ---- phase 5: furniture --------------------------------------------------
+  // `furniture-3d.ts` owns the 3D type of an item: its solids, its real bounding
+  // height, and the IFC class + PredefinedType that the type object and the
+  // occurrence must agree on. FURNITURE_IFC remains the fallback for a type the
+  // library does not cover.
+  const OCCURRENCE_CLASS: Record<string, string> = {
+    IfcFurnitureType: 'IfcFurnishingElement',
+    IfcSanitaryTerminalType: 'IfcSanitaryTerminal',
+    IfcElectricApplianceType: 'IfcElectricAppliance',
+    IfcBuildingElementProxyType: 'IfcBuildingElementProxy',
+  };
   for (const f of b.furniture) {
     const id = mint(f.id, f.storey, 'FURN');
-    const ifc = FURNITURE_IFC[f.type] ?? { ifcType: 'IfcFurnishingElement' };
+    const type3d = furnitureTypeDef(f.type);
+    // Stretchable runs (kitchen counters) are per-length TYPES, so the laid-out
+    // width is quantised HERE, once, and written back to the FurnitureDef — plan,
+    // axon and IFC then all describe the same run.
+    if (type3d?.stretch) f.width = round(quantizeFurnitureWidth(f.type, f.width), 4);
+    const ifc = type3d
+      ? {
+        ifcType: OCCURRENCE_CLASS[type3d.ifcType],
+        // IfcFurnishingElement has no PredefinedType attribute in IFC4.
+        predefinedType: type3d.ifcType === 'IfcFurnitureType' ? undefined : type3d.predefinedType,
+      }
+      : FURNITURE_IFC[f.type] ?? { ifcType: 'IfcFurnishingElement' };
     out.push({
       id,
       discipline: 'architecture',
@@ -619,7 +651,16 @@ export function emitElements(b: ArchBuilder, opts: EmitOptions): ModelElement[] 
       name: prettyFurniture(f.type),
       objectType: f.type,
       storey: f.storey,
-      geometry: { kind: 'box', position: [f.position[0], f.position[1], 0], width: f.width, depth: f.depth, height: f.height, rotation: f.rotation },
+      // At `low` detail (and for a type with no 3D definition) furniture stays a
+      // single bounding box; otherwise it is an occurrence of the type library,
+      // carrying its placed footprint so plan and axon need no type lookup.
+      geometry: type3d && opts.detail !== 'low'
+        ? {
+          kind: 'instance', typeId: stretchKey(f.type, f.width),
+          position: [f.position[0], f.position[1], 0],
+          width: f.width, depth: f.depth, height: type3d.height, rotation: f.rotation,
+        }
+        : { kind: 'box', position: [f.position[0], f.position[1], 0], width: f.width, depth: f.depth, height: f.height, rotation: f.rotation },
       psets: [{
         name: 'Forma_Architecture',
         properties: [

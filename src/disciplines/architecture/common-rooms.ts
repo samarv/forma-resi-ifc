@@ -5,9 +5,10 @@
  * A "program" is an ordered list of rooms with target areas; `sliceProgram` lays them out along a
  * reserved interval of a bar strip, in order, from the anchor (normally the entrance core) outward.
  */
-import type { Compass, FurnitureType, RoomDef, RoomType, Side, TypologyDef } from '../../core/types.ts';
+import type { Compass, DoorMotion, FurnitureType, RoomDef, RoomType, Side, TypologyDef } from '../../core/types.ts';
 import { SIZES } from '../../core/coordination.ts';
 import { rectEdges, round } from '../../core/geometry.ts';
+import { alongInWall, LEAF_MIN, reachRect, solveSwing } from '../../core/openings.ts';
 import type { ArchBuilder } from './arch-elements.ts';
 import { rampElement } from './arch-elements.ts';
 import { rectFromAC, sideSpan, type BarFrame, type Interval } from './bar-frame.ts';
@@ -201,10 +202,20 @@ export function buildCommonRoom(
       });
       room.wallIds.push(w.id);
       if (side === slot.accessSide) {
+        // a leaf may not be wider than the wall that hosts it; a remnant slice too narrow for one becomes a
+        // cased opening (no leaf, no arc) rather than a door hanging out past both ends of its wall
+        const len = 2 * wallMid(w);
+        const width = round(Math.min(slot.doorWidth ?? doorWidthFor(slot.type), Math.max(0.2, len - 0.1)));
+        const motion: DoorMotion = width >= LEAF_MIN.closet ? 'swing' : 'opening';
+        const along = round(alongInWall(w, slot.rect, width));
+        // the leaf sweeps this room's floor, not the corridor it is entered from
+        const sol = solveSwing({ wall: w, along, width, motion, into: reachRect(slot.rect, w) });
         b.addDoor({
-          storey: st, wallId: w.id, along: wallMid(w), width: slot.doorWidth ?? doorWidthFor(slot.type),
+          storey: st, wallId: w.id, along, width,
           height: SIZES.doorHeight, type: slot.type === 'lobby' ? 'interior' : 'service',
-          operation: 'SINGLE_SWING_LEFT', fromRoomId: room.id,
+          motion, hinge: sol.hinge, swing: sol.swing,
+          ...(motion === 'swing' ? { swingIntoRoomId: room.id } : {}),
+          fromRoomId: room.id,
           fireRated: slot.type === 'mech-room' || slot.type === 'elec-room' || slot.type === 'trash',
         });
       }
@@ -216,10 +227,13 @@ export function buildCommonRoom(
     const span = sideSpan(slot.rect, slot.entrance.side);
     const host = env.wallFor(slot.entrance.side, span.across, span.a0, span.a1);
     if (host) {
+      const along = wallMid(host);
+      // an entrance door swings OUT to the street in the direction of egress (IBC 1010.1.2.1)
+      const sol = solveSwing({ wall: host, along, width: slot.entrance.width, motion: 'swing', into: reachRect(slot.rect, host) });
       b.addDoor({
-        storey: st, wallId: host.id, along: wallMid(host), width: slot.entrance.width,
+        storey: st, wallId: host.id, along, width: slot.entrance.width,
         height: 2.4, type: slot.entrance.type === 'building-entry' ? 'building-entry' : 'service',
-        operation: slot.entrance.width > 1.4 ? 'DOUBLE_DOOR_SINGLE_SWING' : 'SINGLE_SWING_RIGHT',
+        motion: 'swing', hinge: sol.hinge, swing: sol.swing === 'left' ? 'right' : 'left',
         fromRoomId: room.id,
       });
     }

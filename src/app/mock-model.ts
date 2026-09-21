@@ -18,6 +18,8 @@ import type {
 import { normalizeSpec, buildStoreys, UNIT_TEMPLATE_IDS, type PartialSpec } from '../core/spec.ts';
 import { getTypology, TYPOLOGIES } from '../core/typologies.ts';
 import { CROSS_PATTERNS } from '../core/patterns.ts';
+import { doorOperation, reachRect, solveSwing } from '../core/openings.ts';
+import { stretchKey, typeById } from '../core/furniture-3d.ts';
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -138,7 +140,9 @@ function wallGeom(w: WallDef): ElementGeometry {
 }
 
 export function buildMockModel(input: PartialSpec): DesignModel {
-  const spec: BuildingSpec = normalizeSpec({ ...input, massing: { ...input.massing, storeys: 2 } });
+  // The mock always draws 2 storeys, whatever the typology's band says, so it declares the
+  // v2 storey-band override rather than being clamped up to the typology minimum.
+  const spec: BuildingSpec = normalizeSpec({ ...input, massing: { ...input.massing, storeys: 2, allowStoreyOverride: true } });
   const typology = getTypology(spec.typology);
   const storeys: StoreyDef[] = buildStoreys(spec, spec.floors, 1.2, spec.region);
   const above = storeys.filter((s) => s.index >= 0 && s.index < 100);
@@ -446,11 +450,11 @@ function buildArch(ctx: Ctx, spec: BuildingSpec, storeys: StoreyDef[], above: St
       direction: Math.PI / 2, risers: Math.round(f2f / 0.175), riserHeight: 0.175, tread: 0.28, width: 1.1, flights: 2, isExit: true,
     });
     if (isGround) {
-      mkRoom(rooms, sid, undefined, 'lobby', 'Entrance lobby', { x: coreRect.x + 0.2, y: coreRect.y + 0.2, w: 3.6, h: 1.2 }, st.height - 0.45);
-      doors.push({
+      const lobby = mkRoom(rooms, sid, undefined, 'lobby', 'Entrance lobby', { x: coreRect.x + 0.2, y: coreRect.y + 0.2, w: 3.6, h: 1.2 }, st.height - 0.45);
+      doors.push(mkDoor(walls, {
         id: `ARC-${sid}-DOOR-ENT`, storey: sid, wallId: `ARC-${sid}-WALL-E1`, along: 2.2, width: 1.8, height: 2.2,
-        type: 'building-entry', operation: 'DOUBLE_DOOR_SINGLE_SWING', fireRated: false,
-      });
+        type: 'building-entry', fireRated: false,
+      }, lobby, 'swing', true));
     }
 
     // two units per floor
@@ -485,18 +489,18 @@ function buildArch(ctx: Ctx, spec: BuildingSpec, storeys: StoreyDef[], above: St
       });
 
       // doors
-      doors.push({
+      doors.push(mkDoor(walls, {
         id: `ARC-${sid}-DOOR-U${u + 1}-ENT`, storey: sid, wallId: corrWallId, along: (u + 0.5) * unitW, width: 0.95, height: 2.1,
-        type: 'unit-entry', operation: 'SINGLE_SWING_LEFT', fireRated: true, unitId: uid, toRoomId: hall.id, fromRoomId: corrRoom.id,
-      });
-      doors.push({
+        type: 'unit-entry', fireRated: true, unitId: uid, toRoomId: hall.id, fromRoomId: corrRoom.id, ref: 'entry',
+      }, hall, 'swing'));
+      doors.push(mkDoor(walls, {
         id: `ARC-${sid}-DOOR-U${u + 1}-BATH`, storey: sid, wallId: `ARC-${sid}-WALL-U${u + 1}-1`, along: 1.4, width: 0.8, height: 2.05,
-        type: 'interior', operation: 'SINGLE_SWING_RIGHT', unitId: uid, fromRoomId: hall.id, toRoomId: bath.id,
-      });
-      doors.push({
+        type: 'interior', unitId: uid, fromRoomId: hall.id, toRoomId: bath.id, ref: 'hall1~bathroom1',
+      }, bath, 'swing'));
+      doors.push(mkDoor(walls, {
         id: `ARC-${sid}-DOOR-U${u + 1}-BED`, storey: sid, wallId: `ARC-${sid}-WALL-U${u + 1}-5`, along: 1.2, width: 0.85, height: 2.05,
-        type: 'interior', operation: 'SINGLE_SWING_LEFT', unitId: uid, fromRoomId: liv.id, toRoomId: bed.id,
-      });
+        type: 'interior', unitId: uid, fromRoomId: liv.id, toRoomId: bed.id, ref: 'livingkitchen1~bedroom1',
+      }, bed, 'swing'));
 
       // windows on the rear wall (index 2 of the perimeter = y = max)
       const rearWall = `ARC-${sid}-WALL-E3`;
@@ -556,9 +560,20 @@ function buildArch(ctx: Ctx, spec: BuildingSpec, storeys: StoreyDef[], above: St
             needsPower: ['fridge', 'range', 'washer'].includes(type),
           });
           roomOf.furnitureIds.push(fid);
+          // Two of the items are mapped-item occurrences of the furniture type
+          // library (as the real generator emits above `detail: 'low'`), so the
+          // renderers' `instance` paths are exercised without a pipeline run.
+          const type3d = type === 'bed-queen' || type === 'wc' ? typeById(stretchKey(type, w)) : undefined;
           push(ctx, {
-            discipline: 'architecture', ifcType: 'IfcFurnishingElement', name: type, storey: sid, id: fid,
-            geometry: { kind: 'box', position: [x, y, 0], width: w, depth: d, height: h, rotation: 0 },
+            discipline: 'architecture', name: type, storey: sid, id: fid,
+            ifcType: type === 'wc' ? 'IfcSanitaryTerminal' : 'IfcFurnishingElement',
+            predefinedType: type === 'wc' ? 'TOILETPAN' : undefined,
+            geometry: type3d
+              ? {
+                kind: 'instance', typeId: type3d.id, position: [x, y, 0],
+                width: w, depth: d, height: type3d.height, rotation: 0,
+              }
+              : { kind: 'box', position: [x, y, 0], width: w, depth: d, height: h, rotation: 0 },
             unitId: uid, roomId: roomOf.id, color: [0.62, 0.6, 0.56], patterns: ['ARC-11'],
           });
         }
@@ -591,7 +606,7 @@ function buildArch(ctx: Ctx, spec: BuildingSpec, storeys: StoreyDef[], above: St
     for (const d of doors.filter((x) => x.storey === sid)) {
       push(ctx, {
         discipline: 'architecture', ifcType: 'IfcDoor', predefinedType: 'DOOR', name: d.type, storey: sid, id: d.id,
-        geometry: { kind: 'door-in-wall', hostId: d.wallId, along: d.along, width: d.width, height: d.height, operation: d.operation },
+        geometry: { kind: 'door-in-wall', hostId: d.wallId, along: d.along, width: d.width, height: d.height, operation: doorOperation(d, d.width >= 1.35 ? 2 : 1) },
         unitId: d.unitId, color: [0.45, 0.35, 0.25],
       });
     }
@@ -664,6 +679,24 @@ function buildArch(ctx: Ctx, spec: BuildingSpec, storeys: StoreyDef[], above: St
     elements: ctx.els.filter((e) => e.discipline === 'architecture'),
     patterns,
     derived: { unitCount: units.length, nia: units.reduce((a, u) => a + u.area, 0) },
+  };
+}
+
+/**
+ * Mock doors carry the same derived hinge/swing as the real generator: solveSwing against the room the leaf sweeps
+ * (`outward` mirrors it, for an entrance door that must open in the direction of egress).
+ */
+function mkDoor(
+  walls: WallDef[], d: Omit<DoorDef, 'motion' | 'hinge' | 'swing'>, into: RoomDef, motion: DoorDef['motion'],
+  outward = false,
+): DoorDef {
+  const wall = walls.find(w => w.id === d.wallId);
+  if (!wall) return { ...d, motion, hinge: 'start', swing: motion === 'rolling' || motion === 'opening' ? 'none' : 'left' };
+  const sol = solveSwing({ wall, along: d.along, width: d.width, motion, into: reachRect(into.rect, wall) });
+  const swing = outward && sol.swing !== 'none' ? (sol.swing === 'left' ? 'right' : 'left') : sol.swing;
+  return {
+    ...d, motion, hinge: sol.hinge, swing,
+    ...(motion === 'swing' && !outward ? { swingIntoRoomId: into.id } : {}),
   };
 }
 
