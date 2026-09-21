@@ -4,3 +4,6 @@ node_modules/
 dist/samples/*.ifc
 # Built bundle lives in docs/index.html for GitHub Pages
 dist/forma-resi-ifc.html
+
+# Agent scratch space (never committed)
+.scratch/
