@@ -1,17 +1,31 @@
 /**
- * Cross-discipline coordination rules (implements pattern XD-02 Corridor Service Spine).
- * Every MEP discipline uses these lanes so runs never clash with each other or with structure.
+ * v1 compatibility shim — deleted in wave 3.
  *
- * Vertical bands in a corridor ceiling plenum (all storey-local Z, measured from THIS storey's floor):
+ * The facts this file used to own now live in the coordination kernel:
+ *   `MOUNTING`      → `core/kernel/mounting.ts` (moved verbatim);
+ *   `SIZES`         → `core/kernel/sizes.ts` as `ELEMENT_SIZES`, **minus `slabT` and `coreWallT`**, which are
+ *                     structural facts owned by `StructuralPresize` (`byStorey.get(s).slabTAbove`, `coreWallT`).
+ *                     The two doomed keys are still exported here so architecture, structure and site can migrate
+ *                     one file at a time;
+ *   `plenumBands`   → `core/kernel/profiles.ts` (`stackProfile`), where the corridor ceiling is an OUTPUT of the
+ *                     ceiling profile rather than an input;
+ *   `DEFAULT_LANES` → `core/kernel/lanes.ts`, where a lane has a width as well as an offset;
+ *   `lanePath`      → `core/kernel/lanes.ts` (`lanePathIn`), which also takes the allocator's lateral shift.
  *
- *   floorToFloor ─────────────────────────── underside of slab above = floorToFloor - slabT
- *                 beam zone (if beams)        [soffit - beamDepth, soffit]
- *                 duct band                   top of duct = soffit - beamDepth - 0.05
- *                 pipe / tray band            below ducts, sprinkler main at same height as pipes
- *   ceiling ──────────────────────────────── corridor ceiling height (ceilingHeight)
+ * Until M1/M2 route their runs through `kernel.reserveLaneRun` / `reserveCrossing`, the four v1 numbers this file
+ * returns must stay bit-identical, so `plenumBands` keeps the v1 offsets (0.05 + 0.15 under the structure, pipes
+ * 0.25 under the duct axis) and anchors them on the profile's resolved `soffitZ` / `structureBottomZ`, and
+ * `DEFAULT_LANES` projects the frozen v1 lane offsets. A literal projection of the v2 lane table would move the
+ * duct axis down 100 mm (the sprinkler band now sits ABOVE the ducts, where NFPA 13 wants it) and the pressure lane
+ * out to −0.62 m, which is a wave-2 change with wave-2 tests, not a wave-1 one.
  */
-import type { Vec2, Vec3, Segment2 } from './types.ts';
-import { add, scale, perp, segDir } from './geometry.ts';
+import type { Segment2, Vec3 } from './types.ts';
+import { EMPTY_RULE_SET } from './rules/engine.ts';
+import { createProfileBook, stackProfile } from './kernel/profiles.ts';
+import { LANE_OFFSETS_V1, lanePathIn } from './kernel/lanes.ts';
+import { ELEMENT_SIZES } from './kernel/sizes.ts';
+
+export { MOUNTING } from './kernel/mounting.ts';
 
 export interface PlenumBands {
   soffitZ: number;
@@ -29,22 +43,46 @@ export interface PlenumBands {
 }
 
 export interface LaneOffsets {
-  /** Lateral offsets from the corridor centreline, positive = toward the corridor's left side (left of centreline direction) */
+  /** Lateral offsets from the corridor centreline, positive = toward the corridor's left side */
   duct: number;
   pipe: number;
   sprinkler: number;
   tray: number;
 }
 
-export const DEFAULT_LANES: LaneOffsets = { duct: 0, pipe: -0.35, sprinkler: -0.15, tray: 0.35 };
+/** v1 lane offsets, projected from `kernel/lanes.ts` (which is now their single owner). */
+export const DEFAULT_LANES: LaneOffsets = {
+  duct: LANE_OFFSETS_V1.duct,
+  pipe: LANE_OFFSETS_V1.pipe,
+  sprinkler: LANE_OFFSETS_V1.sprinkler,
+  tray: LANE_OFFSETS_V1.tray,
+};
+
+/** v1 geometry constants, kept here (and nowhere else) so the wave-3 deletion removes them with the shim. */
+const V1_DUCT_TOP_GAP = 0.05;
+const V1_DUCT_HALF = 0.15;
+const V1_PIPE_BELOW_DUCT = 0.25;
+const V1_DUCT_MIN_ABOVE_CEILING = 0.15;
+const V1_PIPE_MIN_ABOVE_CEILING = 0.05;
+
+const BOOK = createProfileBook(EMPTY_RULE_SET);
 
 export function plenumBands(floorToFloor: number, slabT: number, beamDepth: number, corridorCeiling: number): PlenumBands {
-  const soffitZ = floorToFloor - slabT;
-  const structureBottom = soffitZ - beamDepth;
-  // 300 mm deep duct with a 50 mm gap under structure, but never below the ceiling + 150 mm
-  const ductZ = Math.max(structureBottom - 0.05 - 0.15, corridorCeiling + 0.15);
-  // Wet pipes / sprinkler main / cable tray share a band 250 mm below the duct axis, never below ceiling + 50 mm
-  const pipeZ = Math.max(ductZ - 0.25, corridorCeiling + 0.05);
+  const { resolved } = stackProfile({
+    profile: BOOK.profile('resi-corridor'),
+    storey: 'v1-shim',
+    floorToFloor,
+    slabTAbove: slabT,
+    beamDAbove: beamDepth,
+    beamDAboveUnit: beamDepth,
+    transferZoneDepth: 0,
+    ceilingWanted: corridorCeiling,
+    rules: EMPTY_RULE_SET,
+  });
+  const soffitZ = resolved.soffitZ;
+  const structureBottom = resolved.structureBottomZ;
+  const ductZ = Math.max(structureBottom - V1_DUCT_TOP_GAP - V1_DUCT_HALF, corridorCeiling + V1_DUCT_MIN_ABOVE_CEILING);
+  const pipeZ = Math.max(ductZ - V1_PIPE_BELOW_DUCT, corridorCeiling + V1_PIPE_MIN_ABOVE_CEILING);
   return {
     soffitZ,
     ductZ,
@@ -56,68 +94,19 @@ export function plenumBands(floorToFloor: number, slabT: number, beamDepth: numb
   };
 }
 
-/** A lane polyline (Vec3) parallel to a corridor centreline at lateral offset and height */
+/** A lane polyline (Vec3) parallel to a corridor centreline at a lateral offset and height. */
 export function lanePath(centerline: Segment2[], lateral: number, z: number): Vec3[] {
-  const pts: Vec3[] = [];
-  for (let i = 0; i < centerline.length; i++) {
-    const s = centerline[i];
-    const n = perp(segDir(s));
-    const a: Vec2 = add(s.a, scale(n, lateral));
-    const b: Vec2 = add(s.b, scale(n, lateral));
-    if (i === 0) pts.push([a[0], a[1], z]);
-    pts.push([b[0], b[1], z]);
-  }
-  return pts;
+  return lanePathIn(centerline, {
+    id: 'v1', owner: 'mechanical', bandPurpose: 'service', offset: lateral, width: 0, minWidth: 0, height: 0,
+    vAlign: 'top', allows: [], systemOrder: [], source: 'v1',
+  }, z, 0);
 }
 
-/**
- * Standard mounting heights (storey-local Z, metres). Region-neutral defaults that satisfy
- * NEC/ADA and BS 7671/Part M ranges.
- */
-export const MOUNTING = {
-  receptacle: 0.4,
-  counterReceptacle: 1.1,
-  switch: 1.2,
-  thermostat: 1.5,
-  panelBottom: 1.2,
-  wallLight: 2.0,
-  ceilingLightDrop: 0.0,
-  smokeAlarmDrop: 0.0,
-  windowSill: 0.9,
-  doorHeight: 2.1,
-  unitEntryDoorHeight: 2.1,
-  lavatoryRim: 0.85,
-  showerValve: 1.1,
-  hoseBibb: 0.5,
-  sprinklerHeadDrop: 0.05,
-} as const;
-
-/** Standard element sizes (m) */
+/** Standard element sizes (m). `slabT` and `coreWallT` are owned by `StructuralPresize`; both go in wave 3. */
 export const SIZES = {
-  exteriorWallT: 0.3,
-  partyWallT: 0.25,
-  corridorWallT: 0.2,
-  partitionT: 0.12,
-  wetWallT: 0.2,
-  coreWallT: 0.25,
-  shaftWallT: 0.15,
+  ...ELEMENT_SIZES,
+  /** @deprecated read `ctx.presize.byStorey.get(storey).slabTAbove` */
   slabT: 0.2,
-  doorInterior: 0.8,
-  doorBathroom: 0.75,
-  doorUnitEntry: 0.9,
-  doorBuildingEntry: 1.8,
-  doorHeight: 2.1,
-  windowHeight: 1.4,
-  windowSill: 0.9,
-  stairWidth: 1.1,
-  stairRiserMax: 0.18,
-  stairTreadMin: 0.28,
-  elevatorCarW: 1.6,
-  elevatorCarD: 1.5,
-  elevatorShaftW: 2.0,
-  elevatorShaftD: 2.2,
-  parkingStallW: 2.6,
-  parkingStallL: 5.4,
-  parkingAisleW: 6.0,
-  accessibleStallW: 3.6,
+  /** @deprecated read `ctx.presize.coreWallT` */
+  coreWallT: 0.25,
 } as const;
