@@ -1,16 +1,20 @@
 /**
- * The floor organiser: massing bars + cores + corridor spines → dwelling slots, corridors and
- * common rooms, then dwelling instances via the unit-layout engine.
+ * The floor organiser: massing bars + cores + the site's corridor graph → a `FloorLayout` v2 of placed MODULES, then
+ * dwelling instances via the unit-layout engine.
  *
- * Two stages, deliberately separated so the typical floor can be planned once and repeated:
- *   1. `planFloorLayout` produces an ABSTRACT layout (rects + template ids, no ids, no storey).
- *      Identical (use, outline, mix, targetUnits) floors share one plan → wet walls and shafts
- *      stack automatically (ARC-08).
- *   2. `instantiateFloor` realises a plan on one storey: envelope walls, cores, corridors, units
- *      (calling `layoutUnit`), common rooms, balconies.
+ * Three stages now, deliberately separated so the typical floor is planned once, edited once and repeated:
+ *   1. `planFloorLayout` produces the editable document: strips (the one place `netDepth` is defined), slots (one
+ *      module each, stable ids, resolved ports), the corridor graph, the grid handshake and the mix report. It is a
+ *      pure function of the spec, so identical floors share one plan → wet walls, stacks and shafts stack (ARC-08).
+ *   2. `applyOverrides(base, spec.overrides, ctx)` (placer/apply-overrides.ts) edits it deterministically.
+ *   3. `instantiateFloor` realises the document on one storey: envelope walls, cores, corridors, units (calling
+ *      `layoutUnit` with the module's feasibility witness), common rooms, balconies.
+ *
+ * Template PICKING is gone. The packer draws modules whose admissible frontage at the strip's own net depth contains
+ * the width it hands them, so "below the minimum for that template at D m depth" has nothing left to report.
  */
 import type {
-  BalconyDef, Compass, CorridorDef, DoorDef, FurnitureDef, GenContext, Rect,
+  BalconyDef, Compass, CorridorDef, DoorDef, FurnitureDef, GenContext, Rect, RoomDef,
   RoomType, Side, Segment2, UnitInstance, UnitTemplateDef, UnitTemplateId, Vec2, WallDef, WindowDef,
 } from '../../core/types.ts';
 import type { UnitBoundaryWalls, UnitLayoutFn, UnitLayoutRequest } from './unit-layout-types.ts';
@@ -19,11 +23,12 @@ import {
   exposureOf, insetSides, oppositeSide, polygonArea, polygonBounds, rectContainsRect, rectEdges,
   rectToPolygon, rectsOverlap, round, segDir, sideNormal, dist,
 } from '../../core/geometry.ts';
+import { alongInWall, reachRect, solveSwing } from '../../core/openings.ts';
 import { createRng } from '../../core/rng.ts';
 import { unitId as makeUnitId } from '../../core/ids.ts';
 import {
-  alongRange, acrossRange, apportion, ivLen, rectFromAC, sideSpan, subtractIntervals,
-  type BarFrame, type Interval,
+  alongRange, acrossRange, apportion, frameOfRect, ivLen, mergeIntervals, rectFromAC, sideSpan,
+  subtractIntervals, type BarFrame, type Interval,
 } from './bar-frame.ts';
 import { ArchBuilder, railingElement, slabElement } from './arch-elements.ts';
 import { buildCoreOnFloor, coreAcrossIn, coreBlockedIn, coresFor, deckRailing, type CoreLayout } from './cores.ts';
@@ -33,12 +38,27 @@ import {
   groundProgram, programLength, retailProgram, sliceProgram, type ProgramItem,
 } from './common-rooms.ts';
 import type {
-  CommonRoomSlot, CorridorSlot, FloorCtx, FloorLayout, SideWallSpec, UnitSlot,
+  CommonRoomSlot, CorridorSlot, FloorCtx, SideWallSpec,
 } from './types-internal.ts';
+import type { Deviation } from '../../core/rules/types.ts';
+import type { Rng } from '../../core/types.ts';
+import type { Feasibility, FeasibilityOpts, ProgramGraph } from './program/types.ts';
+import type { ModuleCatalogue } from '../../modules/types.ts';
+import type { BayGrid } from '../structure/presize.ts';
+import type { CorridorGraph } from '../site/corridor-graph.ts';
+import type { FloorLayout, Slot, StripDef } from './placer/types.ts';
+import { templateOf } from '../../modules/ids.ts';
+import { canonicalJson, fnv1a } from '../../core/overrides.ts';
+import { packStrip as packModules } from './placer/packer.ts';
+import { blockersFor, freeIntervals, makeStrip, type StripSide } from './placer/strips.ts';
+import { instantiateBreaks, legCentrelines } from './placer/corridors.ts';
+import type { QuotaState } from './placer/quota.ts';
 
 export interface OrganizerDeps {
   templates: Map<UnitTemplateId, UnitTemplateDef>;
   layoutUnit: UnitLayoutFn;
+  /** the module catalogue, so instantiation can name a slot's module without rebuilding it */
+  catalogue?: ModuleCatalogue;
 }
 
 const EXT = SIZES.exteriorWallT;
@@ -51,6 +71,15 @@ const WALL_CORR: SideWallSpec = { type: 'corridor', thickness: CORR };
 const WALL_PART: SideWallSpec = { type: 'partition', thickness: SIZES.partitionT };
 /** ARC-07: depth of a stair landing measured across the bar */
 const LANDING_DEPTH = 2.6;
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+/** Stable hash of a slot's unit edits — part of the per-unit RNG label and of the canonical layout cache key */
+function hashUnitEdits(edits: readonly import('../../core/overrides.ts').UnitEdit[]): string {
+  return fnv1a(canonicalJson(edits));
+}
 
 // ============================================================================
 // Stage 1 — abstract plan
@@ -65,6 +94,15 @@ export interface PlanArgs {
   /** number of dwellings expected in the whole building, for sizing common program */
   unitsInBuilding: number;
   hasAmenityFloor: boolean;
+  /** the module catalogue, memoised per rule set */
+  catalogue: ModuleCatalogue;
+  /** the structural handshake: planning module, admissible bay band, wall thicknesses */
+  grid: BayGrid;
+  /** BUILDING-WIDE mix ledger, carried across strips and storeys */
+  quota: QuotaState;
+  /** the site's corridor topology (legs, break slots, knuckles), or null before it lands */
+  graph: CorridorGraph | null;
+  opts: FeasibilityOpts;
 }
 
 export function planFloorLayout(a: PlanArgs): FloorLayout {
@@ -92,11 +130,24 @@ export function planFloorLayout(a: PlanArgs): FloorLayout {
  * back to a double-loaded plan.
  */
 function clusterMode(a: PlanArgs): 'double' | 'single' {
-  const t = a.deps.templates.get('coliving-cluster');
-  const depth = Math.min(...a.f.bars.map(fr => fr.depth));
   const corridor = a.ctx.spec.massing.corridorWidth ?? a.ctx.typology.corridorWidth ?? 1.6;
-  if (!t || !Number.isFinite(depth)) return 'double';
-  return depth - corridor - EXT * 2 >= t.depth.min ? 'single' : 'double';
+  const clusters = a.catalogue.units.filter(m => m.variant === 'cluster');
+  if (clusters.length === 0 || a.f.bars.length === 0) return 'double';
+  // Load the corridor on one side only when a cluster module is admissible at the resulting depth AND the bar has a
+  // free run long enough for its minimum frontage. Otherwise the cores have cut the plate into bays too short for a
+  // cluster and the honest plan is a double-loaded corridor of small dwellings — which is a mix deviation, recorded,
+  // not a squeezed cluster with six windowless bedrooms.
+  for (const frame of a.f.bars) {
+    const netDepth = round(frame.depth - corridor - EXT * 2 - CORR, 3);
+    const blocks = coresFor(a.cores, frame).map(c => coreBlockedIn(c, frame));
+    const runs = subtractIntervals({ s: frame.a0 + EXT / 2, e: frame.a1 - EXT / 2 }, blocks, 3.0);
+    const longest = runs.reduce((m, iv) => Math.max(m, ivLen(iv)), 0);
+    for (const m of clusters) {
+      const r = a.catalogue.frontageAt(m.id, netDepth, a.opts);
+      if (r && longest >= r.min - 0.05) return 'single';
+    }
+  }
+  return 'double';
 }
 
 export function planKey(f: FloorCtx, ctx: GenContext): string {
@@ -115,227 +166,29 @@ export function planKey(f: FloorCtx, ctx: GenContext): string {
   ].join('|');
 }
 
-function emptyLayout(key: string): FloorLayout {
-  return { key, units: [], corridors: [], commons: [], blocked: {}, remnantArea: 0 };
-}
-
-// ---------------------------------------------------------------------------
-// Template picking
-// ---------------------------------------------------------------------------
-
-interface Pick {
-  templateId: UnitTemplateId;
-  template: UnitTemplateDef;
-  frontage: number;
-}
-
-interface MixPool {
-  ids: UnitTemplateId[];
-  weights: number[];
-  templates: UnitTemplateDef[];
-  cornerId: UnitTemplateId;
-  corner: UnitTemplateDef;
-  largest: UnitTemplateDef;
-  /** the whole single-level catalogue, used only to rescue a bay the mix cannot fill */
-  catalogue: UnitTemplateDef[];
-}
-
-function mixPool(a: PlanArgs): MixPool | null {
-  const mix = { ...(a.ctx.typology.defaultUnitMix ?? {}), ...(a.ctx.spec.unitMix ?? {}), ...(a.f.unitMix ?? {}) };
-  const ids: UnitTemplateId[] = [];
-  const weights: number[] = [];
-  const templates: UnitTemplateDef[] = [];
-  for (const [id, w] of Object.entries(mix) as [UnitTemplateId, number | undefined][]) {
-    const t = a.deps.templates.get(id);
-    if (!t || !w || w <= 0) continue;
-    ids.push(id);
-    weights.push(w);
-    templates.push(t);
-  }
-  if (ids.length === 0) {
-    const fallback = a.deps.templates.get('1b1b') ?? [...a.deps.templates.values()][0];
-    if (!fallback) return null;
-    ids.push(fallback.id);
-    weights.push(1);
-    templates.push(fallback);
-    a.b.warn(`floor ${a.f.storeyId}: unit mix empty — falling back to ${fallback.id}`);
-  }
-  const largest = templates.reduce((m, t) => (t.area.target > m.area.target ? t : m), templates[0]);
-  const cornerIdx = ids.indexOf('corner-2b2b');
-  const corner = cornerIdx >= 0 ? templates[cornerIdx] : largest;
-  const catalogue = [...a.deps.templates.values()]
-    .filter(t => t.storeysInUnit === 1)
-    .sort((p, q) => p.frontage.min - q.frontage.min);
-  return { ids, weights, templates, cornerId: corner.id, corner, largest, catalogue };
-}
-
-/**
- * The narrowest frontage a template tolerates AT THIS DEPTH. A template's `frontage.min` assumes
- * its own `depth` band; a dwelling that spans a much deeper bar (a mansion flat across the full
- * 15 m depth, say) reaches the same area on a proportionally narrower bay.
- */
-function minFrontage(t: UnitTemplateDef, depth: number): number {
-  const k = clamp(t.depth.max / Math.max(1, depth), 0.45, 1);
-  return Math.max(2.6, round(t.frontage.min * k, 3));
-}
-
-function frontageOf(t: UnitTemplateDef, depth: number, levels = 1): number {
-  const raw = t.area.target / Math.max(2, depth * levels);
-  return clamp(raw, minFrontage(t, depth), t.frontage.max);
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
-}
-
-/**
- * Choose templates for one strip interval, then fit their frontages to the available length.
- * Corner units (two exterior sides) take the corner template (ARC-05).
- */
-function choosePicks(
-  pool: MixPool, avail: number, depth: number, rng: { next(): number; weighted<T>(i: readonly T[], w: readonly number[]): T },
-  cornerAtStart: boolean, cornerAtEnd: boolean, targetCount?: number,
-): { picks: Pick[]; remnant: number } {
-  const mk = (t: UnitTemplateDef): Pick => ({ templateId: t.id, template: t, frontage: frontageOf(t, depth) });
-
-  // 1. how many bays fit — from the mix's weighted average frontage at this depth
-  let n = targetCount;
-  if (n === undefined) {
-    const wTotal = pool.weights.reduce((a, c) => a + c, 0) || 1;
-    const avg = pool.templates.reduce((a, t, i) => a + frontageOf(t, depth) * pool.weights[i], 0) / wTotal;
-    const narrowest = Math.min(...pool.templates.map(t => minFrontage(t, depth)));
-    // the absolute floor is the narrowest template in the whole catalogue, not just in the mix:
-    // a bay too narrow for the mix can still be rescued by a smaller template
-    const floorMin = Math.min(narrowest, ...pool.catalogue.map(t => minFrontage(t, depth)));
-    n = Math.max(1, Math.round(avail / Math.max(2, avg)));
-    n = Math.min(n, Math.max(1, Math.floor(avail / Math.max(1.5, narrowest))));
-    if (avail < floorMin * 0.9) return { picks: [], remnant: avail };
-  }
-  if (n <= 0) return { picks: [], remnant: avail };
-
-  // 2. draw templates that can take that bay width; the corner bays take the largest of them
-  const per = avail / n;
-  const usable = narrowPool(pool, per, depth);
-  const cornerIdx = usable.ids.indexOf('corner-2b2b');
-  const cornerT = cornerIdx >= 0
-    ? usable.templates[cornerIdx]
-    : usable.templates.reduce((m, t) => (t.area.target > m.area.target ? t : m), usable.templates[0]);
-  const picks: Pick[] = [];
-  for (let i = 0; i < n; i++) {
-    const isCorner = (i === 0 && cornerAtStart) || (i === n - 1 && cornerAtEnd);
-    picks.push(mk(isCorner ? cornerT : usable.templates[weightedIndex(usable.weights, rng.next())]));
-  }
-  return fitFrontages(picks, avail, usable, depth, pool.catalogue);
-}
-
-/**
- * Templates whose frontage range can take a bay `per` metres wide: the minimum must fit (with a
- * 12% tolerance, since `fitFrontages` can stretch or squeeze a bay), and the maximum should not be
- * so small that the bay has to be stretched to twice the template's width. Falls back, in order,
- * to "minimum fits" and then to the narrowest template in the mix.
- */
-function narrowPool(pool: MixPool, per: number, depth: number): MixPool {
-  const keep: number[] = [];
-  const cap = per * 1.12 + 0.05;
-  for (let i = 0; i < pool.templates.length; i++) {
-    const t = pool.templates[i];
-    if (minFrontage(t, depth) <= cap && t.frontage.max >= per * 0.55) keep.push(i);
-  }
-  if (keep.length === 0) {
-    for (let i = 0; i < pool.templates.length; i++) if (minFrontage(pool.templates[i], depth) <= cap) keep.push(i);
-  }
-  if (keep.length === 0) {
-    const narrowIdx = pool.templates.reduce(
-      (m, t, i) => (minFrontage(t, depth) < minFrontage(pool.templates[m], depth) ? i : m), 0,
-    );
-    keep.push(narrowIdx);
-  }
+function emptyLayout(a: PlanArgs, key: string): FloorLayout {
   return {
-    ids: keep.map(i => pool.ids[i]),
-    weights: keep.map(i => pool.weights[i]),
-    templates: keep.map(i => pool.templates[i]),
-    cornerId: pool.cornerId,
-    corner: pool.corner,
-    largest: pool.largest,
-    catalogue: pool.catalogue,
+    version: 2,
+    key,
+    layoutKey: `${key}#0`,
+    strips: [],
+    slots: [],
+    corridor: a.graph,
+    corridorSlots: [],
+    commons: [],
+    grid: { module: a.grid.module, bay: { min: a.grid.bay.min, max: a.grid.bay.max }, lines: {} },
+    mix: a.quota.report(),
+    blocked: {},
+    remnantArea: 0,
+    deviations: [],
   };
 }
 
-function weightedIndex(weights: number[], r: number): number {
-  const total = weights.reduce((x, y) => x + y, 0);
-  let acc = r * total;
-  for (let i = 0; i < weights.length; i++) {
-    acc -= weights[i];
-    if (acc <= 0) return i;
-  }
-  return weights.length - 1;
-}
-
-/** Scale frontages onto `avail`, honouring template min/max; anything left over is the remnant. */
-function fitFrontages(
-  picks: Pick[], avail: number, usable?: MixPool, depth = 9, catalogue: UnitTemplateDef[] = [],
-): { picks: Pick[]; remnant: number } {
-  const list = [...picks];
-  // If the minima do not fit, swap the widest bay for the largest template that DOES fit the
-  // budget left by the other bays; only drop a bay when no substitution helps.
-  let guard = 0;
-  while (list.length > 0 && guard++ < list.length * 3 + 4) {
-    const minTotal = list.reduce((a, p) => a + minFrontage(p.template, depth), 0);
-    if (minTotal <= avail + 1e-6) break;
-    let wi = 0;
-    for (let i = 1; i < list.length; i++) {
-      if (minFrontage(list[i].template, depth) > minFrontage(list[wi].template, depth)) wi = i;
-    }
-    const budget = avail - (minTotal - minFrontage(list[wi].template, depth));
-    const pick = (pool: UnitTemplateDef[]): UnitTemplateDef | null => {
-      const c = pool.filter(t => minFrontage(t, depth) <= budget + 1e-6);
-      return c.length > 0 ? c.reduce((m, t) => (t.area.target > m.area.target ? t : m), c[0]) : null;
-    };
-    const best = pick(usable?.templates ?? []) ?? pick(catalogue);
-    if (best && minFrontage(best, depth) < minFrontage(list[wi].template, depth) - 1e-6) {
-      list[wi] = { templateId: best.id, template: best, frontage: frontageOf(best, depth) };
-    } else {
-      list.pop();
-    }
-  }
-  if (list.length === 0) return { picks: [], remnant: avail };
-  let total = list.reduce((a, p) => a + p.frontage, 0);
-  if (total > avail) {
-    // shrink toward the minima
-    const slack = total - avail;
-    const room = list.map(p => p.frontage - minFrontage(p.template, depth));
-    const roomTotal = room.reduce((a, c) => a + c, 0);
-    if (roomTotal > 0) {
-      for (let i = 0; i < list.length; i++) list[i].frontage -= (slack * room[i]) / roomTotal;
-    }
-    total = list.reduce((a, p) => a + p.frontage, 0);
-    if (total > avail + 0.01) {
-      const k = avail / total;
-      for (const p of list) p.frontage *= k;
-      total = avail;
-    }
-  } else if (total < avail) {
-    // ARC-02: the biggest bays absorb the leftover so the typical bay keeps its module
-    let slack = avail - total;
-    const order = list.map((p, i) => i).sort((p, q) => list[q].template.area.target - list[p].template.area.target);
-    for (const i of order) {
-      if (slack <= 0.01) break;
-      const give = Math.min(slack, Math.max(0, list[i].template.frontage.max - list[i].frontage));
-      list[i].frontage += give;
-      slack -= give;
-    }
-    if (slack > 0.01) {
-      const room = list.map(p => Math.max(0, p.template.frontage.max * 1.2 - p.frontage));
-      const roomTotal = room.reduce((a, c) => a + c, 0);
-      if (roomTotal > 0.01) {
-        const give = Math.min(slack, roomTotal);
-        for (let i = 0; i < list.length; i++) list[i].frontage += (give * room[i]) / roomTotal;
-        slack -= give;
-      }
-    }
-    return { picks: list.map(p => ({ ...p, frontage: round(p.frontage, 3) })), remnant: round(Math.max(0, slack), 3) };
-  }
-  return { picks: list.map(p => ({ ...p, frontage: round(p.frontage, 3) })), remnant: 0 };
+/** Column lines of a bar, accumulated across its strips and returned to structure as `ArchModel.partyLines` */
+function addLines(layout: FloorLayout, barId: string, boundaries: readonly { at: number; column: boolean }[]): void {
+  const list = layout.grid.lines[barId] ?? [];
+  for (const b of boundaries) if (b.column) list.push(round(b.at, 4));
+  layout.grid.lines[barId] = [...new Set(list)].sort((x, y) => x - y);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,16 +210,36 @@ interface StripArgs {
   startWall: SideWallSpec;
   endWall: SideWallSpec;
   accessWall: SideWallSpec;
-  pool: MixPool;
-  rng: { next(): number; weighted<T>(i: readonly T[], w: readonly number[]): T };
+  rng: Rng;
   targetCount?: number;
-  indexRef: { n: number };
   coreId?: string;
+  levels?: number;
+  levelsExact?: boolean;
+  storeySpan?: string[];
+  stairRect?: Rect;
+  legId?: string;
+  blocked?: Interval[];
+  /** which face of the bar the strip is on, and its index, for the stable strip id */
+  side: StripSide;
+  stripIndex: number;
+  /** running slot number inside the strip */
+  seq: { n: number };
 }
 
-function packStrip(s: StripArgs): { units: UnitSlot[]; commons: CommonRoomSlot[]; remnant: number } {
-  const { frame, iv, cLow, cHigh } = s;
-  const boundaryDepth = cHigh - cLow;
+interface StripResult {
+  strip: StripDef;
+  slots: Slot[];
+  deviations: Deviation[];
+  boundaries: { at: number; column: boolean }[];
+  remnantArea: number;
+}
+
+/**
+ * Build the `StripDef` — the ONE place `netDepth` is computed, from the boundary depth less half of each bounding
+ * wall — and hand it to the placer's packer.
+ */
+function packInto(s: StripArgs): StripResult {
+  const { a, frame, iv, cLow, cHigh } = s;
   // the two across-side wall specs are the same for every unit in the strip
   const acrossSpec = {} as Record<Side, SideWallSpec>;
   if (s.accessSide === frame.lowSide) {
@@ -379,75 +252,58 @@ function packStrip(s: StripArgs): { units: UnitSlot[]; commons: CommonRoomSlot[]
     acrossSpec[frame.lowSide] = s.baseExterior.includes(frame.lowSide) ? WALL_EXT : WALL_PARTY;
     acrossSpec[frame.highSide] = s.baseExterior.includes(frame.highSide) ? WALL_EXT : WALL_PARTY;
   }
-  const netDepth = boundaryDepth - acrossSpec[frame.lowSide].thickness / 2 - acrossSpec[frame.highSide].thickness / 2;
-  if (netDepth < 4.0 || ivLen(iv) < 2.0) return { units: [], commons: [], remnant: ivLen(iv) };
+  const strip = makeStrip({
+    frame,
+    side: s.side,
+    along: iv,
+    cLow,
+    cHigh,
+    accessSide: s.accessSide,
+    exteriorSides: s.baseExterior,
+    lowSpec: acrossSpec[frame.lowSide],
+    highSpec: acrossSpec[frame.highSide],
+    legId: s.legId,
+    blocked: s.blocked,
+    index: s.stripIndex,
+  });
+  const res = packModules({
+    strip,
+    interval: iv,
+    frame,
+    catalogue: a.catalogue,
+    grid: a.grid,
+    quota: a.quota,
+    rng: s.rng,
+    opts: a.opts,
+    typology: a.ctx.typology.id,
+    region: a.ctx.spec.region,
+    lowSpec: acrossSpec[frame.lowSide],
+    highSpec: acrossSpec[frame.highSide],
+    startWall: s.startWall,
+    endWall: s.endWall,
+    accessWall: s.accessWall,
+    partyWall: WALL_PARTY,
+    extWall: WALL_EXT,
+    atStart: s.atStart,
+    atEnd: s.atEnd,
+    targetCount: s.targetCount,
+    coreId: s.coreId,
+    levels: s.levels,
+    levelsExact: s.levelsExact,
+    storeySpan: s.storeySpan,
+    stairRect: s.stairRect,
+    seq: s.seq,
+  });
+  return { strip, ...res };
+}
 
-  const cornerAtStart = s.atStart;
-  const cornerAtEnd = s.atEnd;
-  const { picks, remnant } = choosePicks(s.pool, ivLen(iv), netDepth, s.rng, cornerAtStart, cornerAtEnd, s.targetCount);
-  const units: UnitSlot[] = [];
-  const commons: CommonRoomSlot[] = [];
-  let cursor = iv.s;
-  for (let k = 0; k < picks.length; k++) {
-    const p = picks[k];
-    const a0 = cursor;
-    const a1 = k === picks.length - 1 && remnant <= 0.001 ? iv.e : cursor + p.frontage;
-    cursor = a1;
-    const boundary = rectFromAC(frame, a0, a1, cLow, cHigh);
-    const first = k === 0;
-    const last = k === picks.length - 1;
-    const sides = {} as Record<Side, SideWallSpec>;
-    sides[frame.lowSide] = acrossSpec[frame.lowSide];
-    sides[frame.highSide] = acrossSpec[frame.highSide];
-    sides[frame.startSide] = first ? (s.atStart ? WALL_EXT : s.startWall) : WALL_PARTY;
-    sides[frame.endSide] = last ? (s.atEnd ? WALL_EXT : s.endWall) : WALL_PARTY;
-    if (s.accessSide === frame.startSide || s.accessSide === frame.endSide) sides[s.accessSide] = s.accessWall;
-
-    const exteriorSides = [...s.baseExterior];
-    if (first && s.atStart) exteriorSides.push(frame.startSide);
-    if (last && s.atEnd) exteriorSides.push(frame.endSide);
-
-    const alongLen = a1 - a0;
-    const minF = minFrontage(p.template, netDepth);
-    if (alongLen < minF - 0.05) {
-      s.a.b.warn(`unit ${p.templateId} on ${s.a.f.storeyId} has ${round(alongLen, 2)} m frontage, below the ${round(minF, 2)} m minimum for that template at ${round(netDepth, 2)} m depth`);
-    }
-    units.push({
-      index: s.indexRef.n++,
-      templateId: p.templateId,
-      boundary,
-      accessSide: s.accessSide,
-      exteriorSides,
-      sides,
-      barId: frame.barId,
-      coreId: s.coreId,
-      // a fixed offset from the wet-wall start: identical slot rects on every storey make
-      // this the same distance on every floor, so the plumbing stacks align (XD-01)
-      stackAlong: round(Math.min(1.6, alongLen * 0.3), 3),
-    });
-  }
-  if (remnant > 0.01) {
-    if (remnant <= 1.6 && units.length > 0) {
-      // widen the last unit rather than leave a sliver
-      const u = units[units.length - 1];
-      const r = alongRange(frame, u.boundary);
-      u.boundary = rectFromAC(frame, r.s, iv.e, cLow, cHigh);
-      if (u.sides[frame.endSide].type === 'party' && s.atEnd) u.sides[frame.endSide] = WALL_EXT;
-      return { units, commons, remnant: 0 };
-    }
-    const ext: Side[] = [...s.baseExterior];
-    if (s.atEnd) ext.push(frame.endSide);
-    commons.push({
-      rect: rectFromAC(frame, iv.e - remnant, iv.e, cLow, cHigh),
-      type: remnant >= 3.0 ? 'flex' : 'storage',
-      name: remnant >= 3.0 ? 'Flexible Room' : 'Store',
-      exteriorSides: ext,
-      accessSide: s.accessSide,
-      sides: { [s.accessSide]: s.accessWall } as Partial<Record<Side, SideWallSpec>>,
-    });
-    s.a.b.warn(`floor ${s.a.f.storeyId}: ${round(remnant, 2)} m of frontage left over on bar ${frame.barId} — placed as a ${remnant >= 3 ? 'flex room' : 'store'}`);
-  }
-  return { units, commons, remnant };
+/** Fold one strip's result into the floor document */
+function absorb(layout: FloorLayout, r: StripResult): void {
+  layout.strips.push(r.strip);
+  layout.slots.push(...r.slots);
+  layout.deviations.push(...r.deviations);
+  layout.remnantArea = round(layout.remnantArea + r.remnantArea, 3);
+  addLines(layout, r.strip.barId, r.boundaries);
 }
 
 // ---------------------------------------------------------------------------
@@ -477,11 +333,7 @@ function spinesFor(a: PlanArgs, frame: BarFrame): { across: number; width: numbe
 }
 
 function planCorridorFloor(a: PlanArgs, key: string, mode: 'double' | 'single' | 'gallery'): FloorLayout {
-  const layout = emptyLayout(key);
-  const pool = mixPool(a);
-  if (!pool) return layout;
-  const rng = createRng(`${a.ctx.spec.seed}:${key}`);
-  const indexRef = { n: 0 };
+  const layout = emptyLayout(a, key);
   const isCluster = a.ctx.typology.access === 'cluster';
 
   for (const frame of a.f.bars) {
@@ -557,18 +409,35 @@ function planCorridorFloor(a: PlanArgs, key: string, mode: 'double' | 'single' |
       s: Math.max(eStart, Math.min(spine.along.s, eStart + 2)),
       e: Math.min(eEnd, Math.max(spine.along.e, eEnd - 2)),
     };
-    for (const seg of subtractIntervals(corridorSpan, corridorBlocks, 1.2)) {
+    // Two bars meeting at a knuckle both reach the corner. The bar listed FIRST on the knuckle owns it and runs
+    // through; the other stops at its edge, so the corner is one corridor room rather than two overlapping ones.
+    const knuckleCuts = (a.graph?.knuckles ?? [])
+      .filter(k => k.barIds.includes(frame.barId) && k.barIds[0] !== frame.barId)
+      .map(k => alongRange(frame, k.rect));
+    for (const seg of subtractIntervals(corridorSpan, [...corridorBlocks, ...knuckleCuts], 1.2)) {
       const rect = rectFromAC(frame, seg.s, seg.e, corridorAcross.s, corridorAcross.e);
       const daylit: Side[] = [];
       if (seg.s <= eStart + 0.3) daylit.push(frame.startSide);
       if (seg.e >= eEnd - 0.3) daylit.push(frame.endSide);
-      layout.corridors.push({
+      layout.corridorSlots!.push({
         rect, barId: frame.barId, spineId: spine.id, width,
         wallSides: corridorExternal ? [] : strips.map(st => oppositeSide(st.accessSide)),
         external: corridorExternal, daylitEnds: daylit,
         outerSide: deckSide ?? undefined,
       });
     }
+
+
+    // Blockers BEFORE anything is placed: cores with their shaft bay, the corridor graph's knuckles and its break
+    // slots. The ground programme is sited around them too, so a residents' lounge can never land on the bay the
+    // graph reserved for an exit stair.
+    const stripBlockers = strips.map(st => blockersFor({
+      frame,
+      cores: blockingCores(barCores, frame, st.cLow, st.cHigh).map(c => coreBlockedIn(c, frame)),
+      graph: a.graph,
+      cLow: st.cLow,
+      cHigh: st.cHigh,
+    }));
 
     // ---- ground-floor common program -----------------------------------------
     const reserved: Record<number, Interval[]> = {};
@@ -588,11 +457,7 @@ function planCorridorFloor(a: PlanArgs, key: string, mode: 'double' | 'single' |
         if (items.length === 0) continue;
         const depth = st.cHigh - st.cLow - EXT / 2 - st.accessWall.thickness / 2;
         const need = Math.min(programLength(items, depth), (eEnd - eStart) * 0.55);
-        const free = subtractIntervals(
-          { s: eStart, e: eEnd },
-          blockingCores(barCores, frame, st.cLow, st.cHigh).map(c => coreBlockedIn(c, frame)),
-          1.0,
-        );
+        const free = subtractIntervals({ s: eStart, e: eEnd }, [...stripBlockers[si]], 1.0);
         const target = pickInterval(free, anchor, need);
         if (!target) continue;
         const from: 'start' | 'end' = anchor - target.s < target.e - anchor ? 'start' : 'end';
@@ -613,35 +478,69 @@ function planCorridorFloor(a: PlanArgs, key: string, mode: 'double' | 'single' |
     }
 
     // ---- pack the unit strips -------------------------------------------------
-    const stripIntervals: { si: number; iv: Interval }[] = [];
+    // Blockers first: cores with their shaft bay, the corridor graph's knuckles and its break slots, plus whatever
+    // the ground programme reserved. Only then does any dwelling get a metre of frontage.
+    const stripDefs: { st: typeof strips[number]; def: StripDef; side: StripSide; seq: { n: number } }[] = [];
     for (let si = 0; si < strips.length; si++) {
       const st = strips[si];
-      const blocks = [
-        ...blockingCores(barCores, frame, st.cLow, st.cHigh).map(c => coreBlockedIn(c, frame)),
-        ...(reserved[si] ?? []),
-      ];
-      for (const iv of subtractIntervals({ s: eStart, e: eEnd }, blocks, 3.0)) stripIntervals.push({ si, iv });
+      const blocked = mergeIntervals([...stripBlockers[si], ...(reserved[si] ?? [])], 0.05);
+      const side: StripSide = st.accessSide === frame.lowSide ? 'high' : st.accessSide === frame.highSide ? 'low' : 'start';
+      stripDefs.push({
+        st,
+        side,
+        seq: { n: 1 },
+        def: makeStrip({
+          frame, side, along: { s: eStart, e: eEnd }, cLow: st.cLow, cHigh: st.cHigh,
+          accessSide: st.accessSide, exteriorSides: [...st.baseExterior],
+          lowSpec: st.accessSide === frame.lowSide ? st.accessWall : WALL_EXT,
+          highSpec: st.accessSide === frame.highSide ? st.accessWall : WALL_EXT,
+          blocked, index: si + 1,
+        }),
+      });
+    }
+    layout.blocked[frame.barId] = stripDefs[0]?.def.blocked ?? [];
+
+    // break modules go into the reserved slots, which is what resets the ARC-03 leg counter
+    const usedByCore = new Set<string>();
+    for (const sd of stripDefs) {
+      const br = instantiateBreaks({
+        frame, strip: sd.def, graph: a.graph, catalogue: a.catalogue, usedBy: usedByCore,
+        lowSpec: sd.def.accessSide === frame.lowSide ? WALL_CORR : WALL_EXT,
+        highSpec: sd.def.accessSide === frame.highSide ? WALL_CORR : WALL_EXT,
+        partyWall: WALL_PARTY, seq: sd.seq,
+      });
+      layout.slots.push(...br.slots);
+      layout.deviations.push(...br.deviations);
+    }
+
+    const intervals: { i: number; iv: Interval }[] = [];
+    for (let i = 0; i < stripDefs.length; i++) {
+      for (const iv of freeIntervals(stripDefs[i].def, 3.0)) intervals.push({ i, iv });
     }
     const counts = a.f.targetUnits !== undefined
-      ? apportion(a.f.targetUnits, stripIntervals.map(x => ivLen(x.iv)))
-      : stripIntervals.map(() => undefined as number | undefined);
+      ? apportion(a.f.targetUnits, intervals.map(x => ivLen(x.iv)))
+      : intervals.map(() => undefined as number | undefined);
 
-    for (let i = 0; i < stripIntervals.length; i++) {
-      const { si, iv } = stripIntervals[i];
-      const st = strips[si];
-      const res = packStrip({
-        a, frame, iv, cLow: st.cLow, cHigh: st.cHigh, accessSide: st.accessSide,
-        baseExterior: [...st.baseExterior],
+    for (let k = 0; k < intervals.length; k++) {
+      const { i, iv } = intervals[k];
+      const sd = stripDefs[i];
+      const res = packInto({
+        a, frame, iv, cLow: sd.st.cLow, cHigh: sd.st.cHigh, accessSide: sd.st.accessSide,
+        baseExterior: [...sd.st.baseExterior],
         atStart: iv.s <= eStart + 0.05, atEnd: iv.e >= eEnd - 0.05,
-        startWall: WALL_PART, endWall: WALL_PART, accessWall: st.accessWall,
-        pool, rng, targetCount: counts[i], indexRef,
+        startWall: WALL_PART, endWall: WALL_PART, accessWall: sd.st.accessWall,
+        rng: a.ctx.rng.fork(`strip:${sd.def.id}`), targetCount: counts[k],
         coreId: nearestCore(barCores, frame, (iv.s + iv.e) / 2)?.id,
+        side: sd.side, stripIndex: i + 1, seq: sd.seq, blocked: sd.def.blocked,
       });
-      layout.units.push(...res.units);
-      layout.commons.push(...res.commons);
-      layout.remnantArea += res.remnant * (st.cHigh - st.cLow);
+      layout.slots.push(...res.slots);
+      layout.deviations.push(...res.deviations);
+      layout.remnantArea = round(layout.remnantArea + res.remnantArea, 3);
+      addLines(layout, frame.barId, res.boundaries);
     }
+    for (const sd of stripDefs) layout.strips.push(sd.def);
   }
+  layout.mix = a.quota.report();
   return layout;
 }
 
@@ -692,13 +591,8 @@ function nearestCore(cores: CoreLayout[], frame: BarFrame, along: number): CoreL
 // ---------------------------------------------------------------------------
 
 function planStairCoreFloor(a: PlanArgs, key: string): FloorLayout {
-  const layout = emptyLayout(key);
-  const pool = mixPool(a);
-  if (!pool) return layout;
-  const rng = createRng(`${a.ctx.spec.seed}:${key}`);
-  const indexRef = { n: 0 };
-  const perCore = clamp(a.ctx.typology.unitsPerCore ?? 2, 2, 4);
-  const acrossStrips = perCore >= 4 ? 2 : 1;
+  const layout = emptyLayout(a, key);
+
 
   for (const frame of a.f.bars) {
     const eStart = frame.a0 + EXT / 2;
@@ -731,7 +625,7 @@ function planStairCoreFloor(a: PlanArgs, key: string): FloorLayout {
           rect: rectFromAC(frame, cAl.s, cAl.e, l0, l1), type: 'lobby', name: 'Stair Landing',
           exteriorSides: room - landingDepth < 0.35 ? [useLow ? frame.lowSide : frame.highSide] : [],
           accessSide: undefined, open: false,
-          sides: { [useLow ? frame.highSide : frame.lowSide]: { type: 'core', thickness: SIZES.coreWallT } } as Partial<Record<Side, SideWallSpec>>,
+          sides: { [useLow ? frame.highSide : frame.lowSide]: { type: 'core', thickness: a.ctx.presize?.coreWallT ?? SIZES.coreWallT } } as Partial<Record<Side, SideWallSpec>>,
         });
         // pocket beyond the landing, and the shallow side, become resident storage
         const pockets: { c0: number; c1: number; ext: Side }[] = [];
@@ -766,66 +660,50 @@ function planStairCoreFloor(a: PlanArgs, key: string): FloorLayout {
       blocks.push({ core, iv });
     }
 
+    // Each landing side is packed in full: the packer draws modules whose admissible frontage at THIS depth fills the
+    // interval, so there is no "core spacing leaves only N m per landing side" to report and no slack to dump into a
+    // shared flex room. The core footprint the site reserved is the only thing that decides how much is left.
+    /*
+     * A flat off a landing is entered from its END, so its FRONTAGE runs across the bar and its DEPTH runs along the
+     * bar away from the landing. The packer therefore works in a frame ROTATED 90° from the bar: `along` is the bar's
+     * depth (flats side by side, front to back) and `across` is the run from the landing. v1 packed along the bar and
+     * then measured the template minimum against that length, so the frontage the packer allocated and the frontage
+     * the unit solver saw were two different dimensions — the "core spacing leaves only N m per landing side" family.
+     */
     const free = subtractIntervals({ s: eStart, e: eEnd }, blocks.map(x => x.iv), 3.0);
-    const maxFrontage = pool.largest.frontage.max;
-    const minSeg = Math.min(...pool.templates.map(t => minFrontage(t, eHigh - eLow - EXT)));
+    const rotAxis: 'x' | 'y' = frame.axis === 'x' ? 'y' : 'x';
+    const deepest = Math.max(6, ...a.catalogue.units.filter(u => u.variant !== 'cluster').map(u => u.depth.max));
+    let stripIndex = 0;
     for (const iv of free) {
       const bounding = blocks.filter(x => Math.abs(x.iv.e - iv.s) < 0.3 || Math.abs(x.iv.s - iv.e) < 0.3);
-      const groups = Math.max(1, Math.min(bounding.length, Math.floor(ivLen(iv) / Math.max(1, minSeg)) || 1));
+      const core = bounding[0] ?? { core: barCores[0], iv: coreBlockedIn(barCores[0], frame) };
+      const towardEnd = Math.abs(core.iv.s - iv.e) < Math.abs(core.iv.e - iv.s);
+      // one landing block per group: nothing may be deeper than the deepest admissible dwelling
+      const groups = Math.max(1, Math.ceil(ivLen(iv) / deepest - 1e-9));
       const segLen = ivLen(iv) / groups;
-      for (let g = 0; g < groups; g++) {
-        const gs = iv.s + g * segLen;
-        const ge = gs + segLen;
-        const core = bounding[g] ?? bounding[0] ?? { core: barCores[0], iv: coreBlockedIn(barCores[0], frame) };
-        const towardEnd = Math.abs(core.iv.s - ge) < Math.abs(core.iv.e - gs);
-        const accessSide = towardEnd ? frame.endSide : frame.startSide;
-        // units take at most one template frontage; the landing absorbs the slack
-        if (segLen < minSeg - 0.05) {
-          a.b.warn(`bar ${frame.barId}: core spacing leaves only ${round(segLen, 2)} m per landing side — below the ${round(minSeg, 2)} m minimum for the mix; reduce massing.coreCount`);
-        }
-        const useLen = Math.min(segLen, maxFrontage);
-        const u0 = towardEnd ? ge - useLen : gs;
-        const u1 = u0 + useLen;
-        if (useLen < segLen - 0.2) {
-          const slackRect = towardEnd
-            ? rectFromAC(frame, gs, u0, eLow, eHigh)
-            : rectFromAC(frame, u1, ge, eLow, eHigh);
-          layout.commons.push({
-            rect: slackRect, type: 'flex', name: 'Shared Flexible Room',
-            exteriorSides: [frame.lowSide, frame.highSide], open: false,
-            accessSide,
-          });
-          a.b.warn(`bar ${frame.barId}: core spacing leaves ${round(segLen - useLen, 2)} m beyond the ${maxFrontage} m maximum frontage — placed as a shared flex room (increase massing.coreCount)`);
-        }
-        const bands = acrossStrips === 1
-          ? [{ c0: eLow, c1: eHigh, ext: [frame.lowSide, frame.highSide] as Side[] }]
-          : [
-            { c0: eLow, c1: (eLow + eHigh) / 2 - SIZES.partitionT / 2, ext: [frame.lowSide] as Side[] },
-            { c0: (eLow + eHigh) / 2 + SIZES.partitionT / 2, c1: eHigh, ext: [frame.highSide] as Side[] },
-          ];
-        for (const band of bands) {
-          const res = packStrip({
-            a, frame, iv: { s: u0, e: u1 }, cLow: band.c0, cHigh: band.c1,
-            accessSide, baseExterior: band.ext,
-            atStart: u0 <= eStart + 0.05, atEnd: u1 >= eEnd - 0.05,
-            startWall: WALL_PART, endWall: WALL_PART,
-            accessWall: accessSide === frame.startSide || accessSide === frame.endSide
-              ? { type: 'partition', thickness: SIZES.partitionT } : WALL_CORR,
-            pool, rng, targetCount: 1, indexRef, coreId: core.core.id,
-          });
-          for (const u of res.units) {
-            u.sides[accessSide] = { type: 'partition', thickness: SIZES.partitionT };
-            if (acrossStrips === 2) {
-              const inner = band.ext.includes(frame.lowSide) ? frame.highSide : frame.lowSide;
-              u.sides[inner] = WALL_PARTY;
-            }
-          }
-          layout.units.push(...res.units);
-          layout.commons.push(...res.commons);
-        }
+      for (let gi = 0; gi < groups; gi++) {
+        stripIndex++;
+        const seg: Interval = { s: iv.s + gi * segLen, e: iv.s + (gi + 1) * segLen };
+        const rect = rectFromAC(frame, seg.s, seg.e, eLow, eHigh);
+        const bf = frameOfRect(frame.barId, rect, rotAxis, [frame.lowSide, frame.highSide]);
+        // the landing is at the end of the block nearest the core; that face carries the flats' entry doors
+        const accessSide = towardEnd === (gi === groups - 1) ? bf.highSide : bf.lowSide;
+        const exterior: Side[] = [accessSide === bf.highSide ? bf.lowSide : bf.highSide];
+        const res = packInto({
+          a, frame: bf, iv: { s: bf.a0, e: bf.a1 }, cLow: bf.c0, cHigh: bf.c1,
+          accessSide, baseExterior: exterior,
+          atStart: true, atEnd: true,
+          startWall: WALL_EXT, endWall: WALL_EXT,
+          accessWall: { type: 'partition', thickness: SIZES.partitionT },
+          rng: a.ctx.rng.fork(`stair:${frame.barId}:${stripIndex}`),
+          coreId: core.core.id, side: accessSide === bf.highSide ? 'low' : 'high',
+          stripIndex, seq: { n: 1 },
+        });
+        absorb(layout, res);
       }
     }
   }
+  layout.mix = a.quota.report();
   return layout;
 }
 
@@ -834,11 +712,7 @@ function planStairCoreFloor(a: PlanArgs, key: string): FloorLayout {
 // ---------------------------------------------------------------------------
 
 function planPointCoreFloor(a: PlanArgs, key: string): FloorLayout {
-  const layout = emptyLayout(key);
-  const pool = mixPool(a);
-  if (!pool) return layout;
-  const rng = createRng(`${a.ctx.spec.seed}:${key}`);
-  const indexRef = { n: 0 };
+  const layout = emptyLayout(a, key);
   const ring = 1.6;
 
   for (const frame of a.f.bars) {
@@ -864,7 +738,7 @@ function planPointCoreFloor(a: PlanArgs, key: string): FloorLayout {
       { x: round(zone.x + zone.w), y: zone.y, w: round(ringOuter.x + ringOuter.w - (zone.x + zone.w)), h: zone.h },
     ].filter(r => r.w > 0.4 && r.h > 0.4);
     for (const rb of ringBands) {
-      layout.corridors.push({
+      layout.corridorSlots!.push({
         rect: rb, barId: frame.barId, spineId: `${frame.barId}-RING`, width: ring,
         wallSides: [], external: false, daylitEnds: [],
       });
@@ -905,16 +779,18 @@ function planPointCoreFloor(a: PlanArgs, key: string): FloorLayout {
       };
       const atStart = band.along === 'x' ? band.rect.x <= outer.x + 0.05 : band.rect.y <= outer.y + 0.05;
       const atEnd = band.along === 'x' ? band.rect.x + band.rect.w >= outer.x + outer.w - 0.05 : band.rect.y + band.rect.h >= outer.y + outer.h - 0.05;
-      const res = packStrip({
+      const res = packInto({
         a, frame: bf, iv: { s: bf.a0, e: bf.a1 }, cLow: bf.c0, cHigh: bf.c1,
         accessSide: band.accessSide, baseExterior: [...band.ext],
         atStart, atEnd, startWall: WALL_PARTY, endWall: WALL_PARTY, accessWall: WALL_CORR,
-        pool, rng, targetCount: counts[i], indexRef, coreId: core.id,
+        rng: a.ctx.rng.fork(`point:${frame.barId}:${i}`), targetCount: counts[i], coreId: core.id,
+        side: band.along === 'x' ? (band.accessSide === 'rear' ? 'low' : 'high') : (band.accessSide === 'right' ? 'low' : 'high'),
+        stripIndex: i + 1, seq: { n: 1 },
       });
-      layout.units.push(...res.units);
-      layout.commons.push(...res.commons);
+      absorb(layout, res);
     }
   }
+  layout.mix = a.quota.report();
   return layout;
 }
 
@@ -924,12 +800,10 @@ function planPointCoreFloor(a: PlanArgs, key: string): FloorLayout {
 
 export function planHouses(a: PlanArgs, residentialStoreys: string[]): FloorLayout {
   const key = `houses|${a.ctx.typology.id}|${residentialStoreys.join(',')}`;
-  const layout = emptyLayout(key);
-  const pool = mixPool(a);
-  if (!pool) return layout;
-  const indexRef = { n: 0 };
+  const layout = emptyLayout(a, key);
   const stacked = a.ctx.typology.id === 'stacked-townhouse';
-  const levels = stacked ? Math.max(1, residentialStoreys.length - 1) : residentialStoreys.length;
+  const groundLevels = stacked ? 1 : residentialStoreys.length;
+  const upperStoreys = stacked ? residentialStoreys.slice(1) : [];
 
   for (const frame of a.f.bars) {
     const eStart = frame.a0 + EXT / 2;
@@ -937,27 +811,27 @@ export function planHouses(a: PlanArgs, residentialStoreys: string[]): FloorLayo
     const eLow = frame.c0 + EXT / 2;
     const eHigh = frame.c1 - EXT / 2;
     const entrySide: Side = frame.axis === 'x' ? 'front' : 'left';
-    const depthNet = eHigh - eLow - EXT;
-    const template = pool.templates.reduce((m, t) => (t.area.target > m.area.target ? t : m), pool.templates[0]);
+    const targetCount = a.ctx.typology.id === 'detached-house' || a.ctx.typology.id === 'adu-laneway'
+      ? 1
+      : a.ctx.typology.id === 'semi-detached' ? 2 : undefined;
 
-    let n: number;
-    switch (a.ctx.typology.id) {
-      case 'detached-house':
-      case 'adu-laneway': n = 1; break;
-      case 'semi-detached': n = 2; break;
-      default: {
-        const target = frontageOf(template, depthNet, levels);
-        const len = eEnd - eStart;
-        n = Math.max(1, Math.round(len / target));
-        const minF = minFrontage(template, depthNet);
-        if (len / n < minF - 0.05) n = Math.max(1, Math.floor(len / minF));
-        break;
-      }
-    }
-    const frontage = (eEnd - eStart) / n;
-    if (frontage < minFrontage(template, depthNet) - 0.05) {
-      a.b.warn(`house frontage ${round(frontage, 2)} m is below the ${round(minFrontage(template, depthNet), 2)} m minimum for ${template.id}`);
-    }
+    // A terrace is one strip the whole depth of the bar, entered from the street. The packer only offers modules
+    // whose own program is feasible over EVERY level at this depth, so a house is never given a frontage its
+    // staircase and its bedrooms cannot both live with.
+    const res = packInto({
+      a, frame, iv: { s: eStart, e: eEnd }, cLow: eLow, cHigh: eHigh,
+      accessSide: entrySide, baseExterior: [frame.lowSide, frame.highSide],
+      atStart: true, atEnd: true,
+      startWall: WALL_EXT, endWall: WALL_EXT, accessWall: WALL_EXT,
+      rng: a.ctx.rng.fork(`houses:${frame.barId}`),
+      targetCount,
+      levels: groundLevels,
+      levelsExact: !stacked,
+      storeySpan: stacked ? [residentialStoreys[0]] : residentialStoreys,
+      side: 'low', stripIndex: 1, seq: { n: 1 },
+    });
+    absorb(layout, res);
+
     const unitEntrances = a.ctx.site.entrances
       .filter(e => e.type === 'unit')
       .map(e => (frame.axis === 'x' ? e.position[0] : e.position[1]))
@@ -967,93 +841,75 @@ export function planHouses(a: PlanArgs, residentialStoreys: string[]): FloorLayo
       .map(e => (frame.axis === 'x' ? e.position[0] : e.position[1]))
       .sort((p, q) => p - q);
 
-    for (let k = 0; k < n; k++) {
-      const a0 = eStart + k * frontage;
-      const a1 = a0 + frontage;
-      const first = k === 0;
-      const last = k === n - 1;
-      const stairStrip = stacked ? Math.min(1.5, frontage * 0.22) : 0;
-      const groundA1 = a1 - stairStrip;
+    const houses = res.slots.filter(sl => sl.kind === 'unit');
+    for (let k = 0; k < houses.length; k++) {
+      const sl = houses[k];
+      const al = alongRange(frame, sl.boundary);
+      // an internal stair on every level of a multi-level house, identical footprint (ARC-22)
+      if (!stacked && residentialStoreys.length > 1) {
+        sl.stairRect = houseStairRect(frame, al.s, al.e, eLow, eHigh, entrySide);
+      }
+      const templateId = templateOf(sl.moduleId);
+      const template = templateId ? a.deps.templates.get(templateId) : undefined;
+      const wantGarage = !!template && (template.id === 'townhouse-3s' || template.rooms.some(r => r.type === 'garage'));
+      if (wantGarage) {
+        const width = al.e - al.s;
+        sl.extraDoors = [{
+          side: entrySide, width: 2.6, height: 2.2, type: 'garage',
+          offset: garageEntrances[k] !== undefined ? garageEntrances[k] - al.s : (k === houses.length - 1 ? width - 1.6 : 1.6),
+        }];
+      }
+      if (unitEntrances[k] !== undefined) sl.notes = 'street door at the site entrance';
+    }
 
-      const sides = {} as Record<Side, SideWallSpec>;
-      sides[frame.lowSide] = WALL_EXT;
-      sides[frame.highSide] = WALL_EXT;
-      sides[frame.startSide] = first ? WALL_EXT : WALL_PARTY;
-      sides[frame.endSide] = last ? WALL_EXT : WALL_PARTY;
-      const exteriorSides: Side[] = [frame.lowSide, frame.highSide];
-      if (first) exteriorSides.push(frame.startSide);
-      if (last) exteriorSides.push(frame.endSide);
-
-      const wantGarage = template.id === 'townhouse-3s' || template.rooms.some(r => r.type === 'garage');
-      const doorAt = unitEntrances[k] !== undefined ? unitEntrances[k] - a0 : undefined;
-      const stairRect = houseStairRect(frame, a0, groundA1, eLow, eHigh, entrySide);
-
-      if (stacked) {
-        // ground dwelling + maisonette above, each with its own street door
-        layout.units.push({
-          index: indexRef.n++, templateId: pickHouseTemplate(pool, false), boundary: rectFromAC(frame, a0, groundA1, eLow, eHigh),
-          accessSide: entrySide, exteriorSides: exteriorSides.filter(s => s !== frame.endSide || last), sides,
-          barId: frame.barId, stackAlong: round(Math.min(1.4, frontage * 0.25), 3),
-          storeySpan: [residentialStoreys[0]],
-          extraDoors: doorAt !== undefined ? [] : [],
-          notes: 'ground flat',
-        });
-        // private stair to the upper dwelling
-        layout.commons.push({
-          rect: rectFromAC(frame, groundA1, a1, eLow, eLow + Math.min(5.0, eHigh - eLow)),
-          type: 'stair', name: 'Private Stair to Upper Flat',
-          exteriorSides: [frame.lowSide, ...(last ? [frame.endSide] : [])],
-          entrance: { side: entrySide, width: SIZES.doorUnitEntry, type: 'building-entry' },
-          sides: { [frame.highSide]: WALL_PART } as Partial<Record<Side, SideWallSpec>>,
-        });
-        if (eHigh - (eLow + Math.min(5.0, eHigh - eLow)) > 1.8) {
-          layout.commons.push({
-            rect: rectFromAC(frame, groundA1, a1, eLow + Math.min(5.0, eHigh - eLow), eHigh),
-            type: 'storage', name: 'Garden Store',
-            exteriorSides: [frame.highSide, ...(last ? [frame.endSide] : [])],
-          });
-        }
-        const upperSides = { ...sides };
-        layout.units.push({
-          index: indexRef.n++, templateId: pickHouseTemplate(pool, true), boundary: rectFromAC(frame, a0, a1, eLow, eHigh),
-          accessSide: entrySide, exteriorSides, sides: upperSides, barId: frame.barId,
-          stackAlong: round(Math.min(1.4, frontage * 0.25), 3),
-          storeySpan: residentialStoreys.slice(1),
-          stairRect: houseStairRect(frame, a0, a1, eLow, eHigh, entrySide),
+    // ---- stacked townhouse: a maisonette over each ground flat, on the same party lines --------
+    if (stacked && upperStoreys.length > 0) {
+      const strip = res.strip;
+      for (const sl of houses) {
+        const al = alongRange(frame, sl.boundary);
+        const frontage = al.e - al.s;
+        const upper = upperModuleFor(a, strip.netDepth, frontage, upperStoreys.length, [frame.lowSide, frame.highSide]);
+        if (!upper) continue;
+        layout.slots.push({
+          ...sl,
+          // derived from its anchor, exactly like an inserted slot, so the id stays stable
+          id: `${sl.id}.u`,
+          moduleId: upper,
+          storeySpan: [...upperStoreys],
+          stairRect: houseStairRect(frame, al.s, al.e, eLow, eHigh, entrySide),
+          extraDoors: undefined,
           notes: 'maisonette over',
         });
-      } else {
-        layout.units.push({
-          index: indexRef.n++, templateId: template.id, boundary: rectFromAC(frame, a0, a1, eLow, eHigh),
-          accessSide: entrySide, exteriorSides, sides, barId: frame.barId,
-          stackAlong: round(Math.min(1.4, frontage * 0.25), 3),
-          storeySpan: residentialStoreys,
-          stairRect: residentialStoreys.length > 1 ? stairRect : undefined,
-          extraDoors: wantGarage
-            ? [{
-              side: entrySide, width: 2.6, height: 2.2, type: 'garage',
-              offset: garageEntrances[k] !== undefined ? garageEntrances[k] - a0 : (last ? frontage - 1.6 : 1.6),
-            }]
-            : undefined,
-        });
+        a.quota.record(templateOf(upper) ?? '');
       }
-      void doorAt;
+      for (const sl of houses) sl.notes = 'ground flat';
     }
   }
+  layout.mix = a.quota.report();
   return layout;
+}
+
+/** The multi-level module a maisonette over a ground flat can use at this frontage and depth */
+function upperModuleFor(
+  a: PlanArgs, netDepth: number, frontage: number, levels: number, exteriorSides: Side[],
+): string | null {
+  const pool = a.catalogue
+    .candidatesFor({ netDepth, atStart: true, atEnd: true, exteriorSides, levels, typology: a.ctx.typology.id, region: a.ctx.spec.region })
+    .filter(m => m.levels > 1)
+    .filter(m => {
+      const r = a.catalogue.frontageAt(m.id, netDepth, a.opts);
+      return !!r && frontage >= r.min - 0.05 && frontage <= r.max + 0.05;
+    });
+  if (pool.length === 0) return null;
+  return a.quota.order(pool.map(m => m.templateId))
+    .map(t => pool.find(m => m.templateId === t))
+    .filter((m): m is NonNullable<typeof m> => !!m)[0]?.id ?? null;
 }
 
 function unionOf(a: Rect, b: Rect): Rect {
   const x = Math.min(a.x, b.x);
   const y = Math.min(a.y, b.y);
   return { x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y };
-}
-
-function pickHouseTemplate(pool: MixPool, upper: boolean): UnitTemplateId {
-  const maison = pool.templates.find(t => t.storeysInUnit > 1);
-  const flat = pool.templates.find(t => t.storeysInUnit === 1);
-  if (upper) return (maison ?? pool.largest).id;
-  return (flat ?? pool.templates[0]).id;
 }
 
 function houseStairRect(frame: BarFrame, a0: number, a1: number, c0: number, c1: number, entrySide: Side): Rect {
@@ -1078,7 +934,7 @@ function fullDepthFree(a: PlanArgs, frame: BarFrame): Interval[] {
 }
 
 function planServiceFloor(a: PlanArgs, key: string): FloorLayout {
-  const layout = emptyLayout(key);
+  const layout = emptyLayout(a, key);
   for (const frame of a.f.bars) {
     const eLow = frame.c0 + EXT / 2;
     const eHigh = frame.c1 - EXT / 2;
@@ -1104,7 +960,7 @@ function planServiceFloor(a: PlanArgs, key: string): FloorLayout {
 }
 
 function planRetailFloor(a: PlanArgs, key: string): FloorLayout {
-  const layout = emptyLayout(key);
+  const layout = emptyLayout(a, key);
   for (const frame of a.f.bars) {
     const eStart = frame.a0 + EXT / 2;
     const eEnd = frame.a1 - EXT / 2;
@@ -1159,7 +1015,7 @@ function planRetailFloor(a: PlanArgs, key: string): FloorLayout {
 }
 
 function planAmenityFloor(a: PlanArgs, key: string): FloorLayout {
-  const layout = emptyLayout(key);
+  const layout = emptyLayout(a, key);
   for (const frame of a.f.bars) {
     const eLow = frame.c0 + EXT / 2;
     const eHigh = frame.c1 - EXT / 2;
@@ -1190,6 +1046,54 @@ export interface InstantiateArgs {
   /** unit instances keyed by slot key, for multi-storey dwellings */
   unitRegistry: Map<string, UnitInstance>;
   emitSlabs: boolean;
+  /** the feasibility WITNESS for a module at the slot's own frontage and depth — the gate on producing a layout */
+  fitFor?: (moduleId: string, frontage: number, depth: number, level: number) => Feasibility | null;
+  /** the module's program graph, for the v2 solver */
+  programFor?: (moduleId: string) => ProgramGraph | undefined;
+}
+
+/** A non-dwelling slot rendered as a common room: breaks, declared remnants, MEP rooms and amenities */
+function commonFromSlot(slot: Slot, args: InstantiateArgs): CommonRoomSlot {
+  const halves: Partial<Record<Side, number>> = {};
+  for (const side of ['front', 'rear', 'left', 'right'] as Side[]) {
+    halves[side] = (slot.sides[side]?.thickness ?? EXT) / 2;
+  }
+  const mod = args.deps.catalogue?.byId(slot.moduleId);
+  const name = mod?.name;
+  return {
+    rect: slot.boundary,
+    type: slot.roomType ?? 'flex',
+    name,
+    exteriorSides: [...slot.exteriorSides],
+    accessSide: slot.accessSide,
+    sides: { [slot.accessSide]: slot.sides[slot.accessSide] } as Partial<Record<Side, SideWallSpec>>,
+    open: false,
+  };
+}
+
+/** The graph's leg segments clipped to one corridor rect, so a `CorridorDef` carries the leg it belongs to */
+function clipLegs(legs: readonly Segment2[], rect: Rect): Segment2[] {
+  const out: Segment2[] = [];
+  for (const seg of legs) {
+    const horizontal = Math.abs(seg.b[0] - seg.a[0]) >= Math.abs(seg.b[1] - seg.a[1]);
+    if (horizontal) {
+      const y = (seg.a[1] + seg.b[1]) / 2;
+      if (y < rect.y - 0.6 || y > rect.y + rect.h + 0.6) continue;
+      const s = Math.max(rect.x, Math.min(seg.a[0], seg.b[0]));
+      const e = Math.min(rect.x + rect.w, Math.max(seg.a[0], seg.b[0]));
+      if (e - s > 0.3) out.push({ a: [round(s, 3), round(rect.y + rect.h / 2, 3)], b: [round(e, 3), round(rect.y + rect.h / 2, 3)] });
+    } else {
+      const x = (seg.a[0] + seg.b[0]) / 2;
+      if (x < rect.x - 0.6 || x > rect.x + rect.w + 0.6) continue;
+      const s = Math.max(rect.y, Math.min(seg.a[1], seg.b[1]));
+      const e = Math.min(rect.y + rect.h, Math.max(seg.a[1], seg.b[1]));
+      if (e - s > 0.3) out.push({ a: [round(rect.x + rect.w / 2, 3), round(s, 3)], b: [round(rect.x + rect.w / 2, 3), round(e, 3)] });
+    }
+  }
+  if (out.length > 0) return out;
+  return [rect.w >= rect.h
+    ? { a: [rect.x, rect.y + rect.h / 2], b: [rect.x + rect.w, rect.y + rect.h / 2] }
+    : { a: [rect.x + rect.w / 2, rect.y], b: [rect.x + rect.w / 2, rect.y + rect.h] }];
 }
 
 export interface FloorResult {
@@ -1209,10 +1113,11 @@ export function instantiateFloor(args: InstantiateArgs): FloorResult {
   const streetFacing = ctx.site.streetFacing;
   const env = new EnvelopeBuilder(f.outline, st, f.wallHeight, streetFacing);
 
+  const corridorSlots = layout.corridorSlots ?? [];
   // ---- register every break BEFORE the envelope is cut --------------------
-  for (const u of layout.units) registerBreaks(env, u.boundary, u.exteriorSides);
+  for (const u of layout.slots) registerBreaks(env, u.boundary, u.exteriorSides);
   for (const c of layout.commons) registerBreaks(env, c.rect, c.exteriorSides);
-  for (const c of layout.corridors) if (!c.external) registerBreaks(env, c.rect, ['front', 'rear', 'left', 'right']);
+  for (const c of corridorSlots) if (!c.external) registerBreaks(env, c.rect, ['front', 'rear', 'left', 'right']);
   for (const c of cores) registerBreaks(env, c.rect, c.exteriorSides);
   env.build(b);
 
@@ -1224,12 +1129,13 @@ export function instantiateFloor(args: InstantiateArgs): FloorResult {
   // ---- cores --------------------------------------------------------------
   for (const c of cores) {
     if (!c.storeys.includes(st)) continue;
-    buildCoreOnFloor(b, c, f, streetFacing, env);
+    buildCoreOnFloor(b, c, f, streetFacing, env, ctx.presize?.coreWallT);
     result.coreArea += c.rect.w * c.rect.h;
   }
 
   // ---- corridors ----------------------------------------------------------
-  for (const cs of layout.corridors) {
+  const legLines = legCentrelines(layout.corridor, corridorSlots[0]?.barId ?? '');
+  for (const cs of corridorSlots) {
     const room = b.addRoom({
       storey: st, type: 'corridor', rect: cs.rect, height: f.ceilingHeight,
       name: cs.external ? 'Access Deck' : 'Corridor',
@@ -1239,9 +1145,9 @@ export function instantiateFloor(args: InstantiateArgs): FloorResult {
     result.circulationArea += room.area;
     const len = Math.max(cs.rect.w, cs.rect.h);
     result.corridorLength += len;
-    const centerline: Segment2[] = [cs.rect.w >= cs.rect.h
-      ? { a: [cs.rect.x, cs.rect.y + cs.rect.h / 2], b: [cs.rect.x + cs.rect.w, cs.rect.y + cs.rect.h / 2] }
-      : { a: [cs.rect.x + cs.rect.w / 2, cs.rect.y], b: [cs.rect.x + cs.rect.w / 2, cs.rect.y + cs.rect.h] }];
+    // the centreline is the corridor GRAPH's leg polyline clipped to this rect, not one segment per rect: that is
+    // what makes the ARC-03 run length and the travel distance the same number the site graph reports
+    const centerline: Segment2[] = clipLegs(legLines.length > 0 ? legLines : legCentrelines(layout.corridor, cs.barId), cs.rect);
     const def: CorridorDef = {
       id: b.ids.next(st, 'CORR'), storey: st, polygon: rectToPolygon(cs.rect), centerline,
       width: cs.width, roomId: room.id,
@@ -1267,14 +1173,25 @@ export function instantiateFloor(args: InstantiateArgs): FloorResult {
   }
 
   // ---- units --------------------------------------------------------------
-  for (const slot of layout.units) {
+  for (const slot of layout.slots) {
+    if (slot.kind !== 'unit') continue;
     const span = slot.storeySpan;
     if (span && !span.includes(st)) continue;
-    const slotKey = `${layout.key}|${slot.index}`;
+    const slotKey = `${layout.layoutKey}|${slot.id}`;
     const existing = span && span.length > 1 ? args.unitRegistry.get(slotKey) : undefined;
     const level = span ? Math.max(0, span.indexOf(st)) : 0;
     const inst = buildUnit(args, env, slot, level, span?.length ?? 1, existing, slotKey);
     if (inst) result.unitIds.push(inst.id);
+  }
+
+  // ---- non-dwelling slots (breaks, remnants, MEP rooms, amenities) --------
+  for (const slot of layout.slots) {
+    if (slot.kind === 'unit' || slot.kind === 'core') continue;
+    const { room, glazedArea } = buildCommonRoom(b, f, commonFromSlot(slot, args), env, streetFacing);
+    furnishCommonRoom(b, room, ctx.spec.options.detail);
+    result.commonRoomIds.push(room.id);
+    result.windowArea += glazedArea;
+    if (room.zone === 'circulation') result.circulationArea += room.area;
   }
 
   // ---- common rooms -------------------------------------------------------
@@ -1310,14 +1227,15 @@ function registerBreaks(env: EnvelopeBuilder, rect: Rect, sides: Side[]): void {
 // ---------------------------------------------------------------------------
 
 function buildUnit(
-  args: InstantiateArgs, env: EnvelopeBuilder, slot: UnitSlot, level: number, levelsTotal: number,
+  args: InstantiateArgs, env: EnvelopeBuilder, slot: Slot, level: number, levelsTotal: number,
   existing: UnitInstance | undefined, slotKey: string,
 ): UnitInstance | null {
   const { b, ctx, f, deps } = args;
   const st = f.storeyId;
-  const template = deps.templates.get(slot.templateId);
-  if (!template) {
-    b.warn(`unknown unit template ${slot.templateId} — slot skipped`);
+  const templateId = templateOf(slot.moduleId);
+  const template = templateId ? deps.templates.get(templateId) : undefined;
+  if (!templateId || !template) {
+    b.warn(`unknown unit module ${slot.moduleId} — slot skipped`);
     return null;
   }
   const id = existing?.id ?? makeUnitId(st, b.nextUnitIndex(st));
@@ -1361,8 +1279,13 @@ function buildUnit(
     halves[side] = (slot.sides[side]?.thickness ?? EXT) / 2;
   }
   const net = insetSides(slot.boundary, halves);
+  // A slot can no longer be too small: it was created from a module's own admissible frontage at its strip's net
+  // depth. The guard stays as an assertion — reaching it is a placer bug, recorded as a violation, never a warning.
   if (net.w < 2.2 || net.h < 2.2) {
-    b.warn(`unit slot ${slot.templateId} on ${st} is too small (${round(net.w, 2)}x${round(net.h, 2)} m) — skipped`);
+    args.ctx.issues?.add({
+      severity: 'violation', ruleId: 'ARC-D01', discipline: 'architecture', storey: st,
+      message: `slot ${slot.id} (${slot.moduleId}) instantiated at ${round(net.w, 2)} × ${round(net.h, 2)} m`,
+    });
     return null;
   }
 
@@ -1377,6 +1300,20 @@ function buildUnit(
     && slot.exteriorSides.includes(balconySide)
     && level === levelsTotal - 1
     && balconyIsClear(args, slot, balRectPlanned);
+
+  const horizontal = slot.accessSide === 'front' || slot.accessSide === 'rear';
+  const frontage = horizontal ? net.w : net.h;
+  const netDepth = horizontal ? net.h : net.w;
+  // the stack is an OUTPUT port of the module, resolved to world XY by the packer. Passing its offset instead of an
+  // imposed coordinate is what makes identical modules stack vertically without anyone remembering a number.
+  const stackPort = slot.ports.find(p => p.kind === 'stack');
+  const stackAlong = stackPort
+    ? round(Math.max(0.3, Math.min(frontage - 0.3, stackPort.along - (horizontal ? net.x : net.y))), 3)
+    : undefined;
+  const fit = args.fitFor?.(slot.moduleId, frontage, netDepth, level) ?? undefined;
+  // the fork label carries the module, the slot and the edit hash, so an edited unit re-solves and its untouched
+  // twins stay bit-identical
+  const editHash = slot.edits && slot.edits.length > 0 ? hashUnitEdits(slot.edits) : '0';
 
   const req: UnitLayoutRequest = {
     unitId: id,
@@ -1395,17 +1332,24 @@ function buildUnit(
     balcony: wantBalcony ? { side: balconySide, depth: balconyDepth } : null,
     region: ctx.spec.region,
     options: ctx.spec.options,
-    rng: ctx.rng.fork(`unit:${slot.templateId}:${slot.index}:${level}`),
+    rng: ctx.rng.fork(`unit:${slot.moduleId}:${slot.id}:${level}:${editHash}`),
     wetWallSide: slot.accessSide,
-    stackAlong: slot.stackAlong,
+    stackAlong,
     stairRect: slot.stairRect,
+    // ---- v2: module identity, program, witness and edits -----------------
+    moduleId: slot.moduleId,
+    program: args.programFor?.(slot.moduleId),
+    fit,
+    mirrored: slot.mirrored,
+    gridLinesLocal: slot.partyLines.filter(pl => pl.column).map(pl => round(pl.at - (horizontal ? slot.boundary.x : slot.boundary.y), 3)),
+    edits: slot.edits,
   };
 
   let layout;
   try {
     layout = deps.layoutUnit(req);
   } catch (err) {
-    b.warn(`layoutUnit failed for ${id} (${slot.templateId}): ${(err as Error).message}`);
+    b.warn(`layoutUnit failed for ${id} (${slot.moduleId}): ${(err as Error).message}`);
     return null;
   }
 
@@ -1478,10 +1422,19 @@ function buildUnit(
     const host = wallBySide[ed.side];
     if (!host) continue;
     const len = dist(host.start, host.end);
-    const along = clamp(ed.offset ?? len / 2, ed.width / 2 + 0.3, len - ed.width / 2 - 0.3);
+    const motion: DoorDef['motion'] = ed.type === 'garage' ? 'rolling' : 'swing';
+    const served = roomOnWall(layout.rooms, host, ed.type === 'garage' ? ['garage'] : ['entry', 'hall'], ed.width);
+    const wanted = ed.offset ?? alongInWall(host, served?.rect ?? net, ed.width);
+    const along = clamp(wanted, ed.width / 2 + 0.3, len - ed.width / 2 - 0.3);
+    const sol = solveSwing({
+      wall: host, along, width: ed.width, motion,
+      into: reachRect(served?.rect ?? net, host),
+    });
     const d = b.addDoor({
       storey: st, wallId: host.id, along, width: ed.width, height: ed.height, type: ed.type,
-      operation: ed.type === 'garage' ? 'ROLLINGUP' : 'SINGLE_SWING_RIGHT', unitId: id,
+      motion, hinge: sol.hinge, swing: sol.swing,
+      ...(motion === 'swing' && served ? { swingIntoRoomId: served.id, toRoomId: served.id } : {}),
+      unitId: id,
     });
     extraDoorIds.push(d.id);
     if (ed.type === 'garage') {
@@ -1502,9 +1455,16 @@ function buildUnit(
       roomIds.push(room.id);
       const host = wallBySide[balconySide];
       if (host) {
+        // hang the slider where the room behind the wall actually is, not at the wall midpoint
+        const served = roomOnWall(layout.rooms, host, ['living', 'living-kitchen', 'dining', 'bedroom', 'master-bedroom'], 1.6);
+        const along = round(alongInWall(host, served?.rect ?? net, 1.6));
+        const sol = solveSwing({
+          wall: host, along, width: 1.6, motion: 'sliding', into: reachRect(served?.rect ?? net, host),
+        });
         b.addDoor({
-          storey: st, wallId: host.id, along: dist(host.start, host.end) / 2, width: 1.6,
-          height: 2.2, type: 'balcony', operation: 'DOUBLE_DOOR_SLIDING', unitId: id, toRoomId: room.id,
+          storey: st, wallId: host.id, along, width: 1.6,
+          height: 2.2, type: 'balcony', motion: 'sliding', hinge: sol.hinge, swing: sol.swing,
+          unitId: id, toRoomId: room.id, fromRoomId: served?.id, ref: 'balcony',
         });
       }
     }
@@ -1512,7 +1472,16 @@ function buildUnit(
       id: b.ids.next(st, 'BALC'), storey: st, unitId: id, rect: balRect, roomId: balconyRoomId ?? '',
     };
     b.balconies.push(balDef);
-    slabElement(b, st, balRect, 0.15, -0.15, 'FLOOR', 'Balcony slab', ['ARC-05'], id);
+    /*
+     * STR-C5: a cantilever is sized from its PROJECTION, never from a constant — thickness ≥ max(0.18, L/10)
+     * (ACI 318-19 Table 9.3.1.1, Eurocode 2 §7.4.2). The two numbers are not rule records yet (`STR-C5` carries the
+     * backspan ratio), so they live here as the constants the structure agent specified.
+     */
+    const BALCONY_MIN_T = 0.18;
+    const BALCONY_DEPTH_RATIO = 10;
+    const balProj = balRect.w >= balRect.h ? balRect.h : balRect.w;
+    const balT = round(Math.max(BALCONY_MIN_T, balProj / BALCONY_DEPTH_RATIO), 3);
+    slabElement(b, st, balRect, balT, -balT, 'FLOOR', 'Balcony slab', ['ARC-05', 'STR-C5'], id);
     const e = rectEdges(balRect);
     for (const side of ['front', 'rear', 'left', 'right'] as Side[]) {
       if (side === oppositeSide(balconySide)) continue;
@@ -1532,11 +1501,22 @@ function buildUnit(
     existing.bathroomRoomIds.push(...layout.bathroomRoomIds);
     if (!existing.kitchenRoomId) existing.kitchenRoomId = layout.kitchenRoomId;
     if (!existing.balconyRoomId) existing.balconyRoomId = balconyRoomId;
+    // Upper levels of a maisonette contribute their own ports (a second stack, its own extract). The layout numbers
+    // them from 1 per level, so they are renumbered here to stay unique within the dwelling.
+    if (layout.stackPorts?.length) {
+      const base = existing.stackPorts ?? [];
+      existing.stackPorts = [...base, ...layout.stackPorts.map((s, i) => ({ ...s, id: `stack.${base.length + i + 1}` }))];
+    }
+    if (layout.exhaustPorts?.length) {
+      const base = existing.exhaustPorts ?? [];
+      existing.exhaustPorts = [...base, ...layout.exhaustPorts.map((e, i) => ({ ...e, id: `exhaust.${base.length + i + 1}` }))];
+    }
+    if (!existing.panelPort && layout.panelPort) existing.panelPort = layout.panelPort;
     return existing;
   }
   const inst: UnitInstance = {
     id,
-    templateId: slot.templateId,
+    templateId,
     storeys: slot.storeySpan ?? [st],
     rect: slot.boundary,
     polygon: rectToPolygon(slot.boundary),
@@ -1554,14 +1534,32 @@ function buildUnit(
     balconyRoomId,
     barId: slot.barId,
     coreId: slot.coreId,
+    // v2 ports: outputs of the unit layout, consumed by plumbing (chase/stacks), mechanical (extract) and electrical
+    stackPorts: layout.stackPorts ? [...layout.stackPorts] : undefined,
+    exhaustPorts: layout.exhaustPorts ? [...layout.exhaustPorts] : undefined,
+    panelPort: layout.panelPort ?? undefined,
+    // v2 module/placer identity: what the editor selects by and what the mix report is computed from
+    moduleId: slot.moduleId,
+    slotId: slot.id,
+    mirrored: slot.mirrored,
+    layoutKey: `${slot.moduleId}|${Math.round(frontage * 100)}|${Math.round(netDepth * 100)}|${level}|${editHash}`,
+    partyLines: [{ ...slot.partyLines[0] }, { ...slot.partyLines[1] }],
+    roomGraph: layout.graph,
   };
   if (!inst.entryDoorId) {
     const host = wallBySide[slot.accessSide];
     if (host) {
+      const served = roomOnWall(layout.rooms, host, ['entry', 'hall', 'corridor', 'living-kitchen', 'living'], SIZES.doorUnitEntry);
+      const along = round(alongInWall(host, served?.rect ?? net, SIZES.doorUnitEntry));
+      const sol = solveSwing({
+        wall: host, along, width: SIZES.doorUnitEntry, motion: 'swing',
+        into: reachRect(served?.rect ?? net, host),
+      });
       const d = b.addDoor({
-        storey: st, wallId: host.id, along: dist(host.start, host.end) / 2, width: SIZES.doorUnitEntry,
-        height: SIZES.doorHeight, type: 'unit-entry', operation: 'SINGLE_SWING_LEFT', unitId: id,
-        fireRated: true, toRoomId: roomIds[0],
+        storey: st, wallId: host.id, along, width: SIZES.doorUnitEntry,
+        height: SIZES.doorHeight, type: 'unit-entry', motion: 'swing', hinge: sol.hinge, swing: sol.swing,
+        swingIntoRoomId: served?.id, unitId: id,
+        fireRated: true, toRoomId: served?.id ?? roomIds[0], ref: 'entry',
       });
       inst.entryDoorId = d.id;
       b.warn(`unit ${id}: layout returned no entry door — organiser inserted ${d.id}`);
@@ -1575,27 +1573,89 @@ function buildUnit(
 }
 
 /**
+ * The room an organiser-owned door opens into: an interior room that RUNS ALONG the host wall (within 0.35 m of it
+ * and overlapping it by at least a leaf), preferring the types in `prefer`, then the longest overlap. The door is
+ * then hung inside that room's span with `alongInWall` and its swing solved against that room's rect, so the leaf
+ * lands on its floor instead of in the corridor or over a balcony.
+ */
+function roomOnWall(rooms: readonly RoomDef[], wall: WallDef, prefer: readonly RoomType[], width: number): RoomDef | null {
+  const dx = wall.end[0] - wall.start[0];
+  const dy = wall.end[1] - wall.start[1];
+  const len = Math.hypot(dx, dy) || 1;
+  const dir: Vec2 = [dx / len, dy / len];
+  const nrm: Vec2 = [-dir[1], dir[0]];
+  let best: { room: RoomDef; rank: number; overlap: number } | null = null;
+  for (const r of rooms) {
+    if (r.type === 'balcony' || r.type === 'terrace') continue;
+    const corners: Vec2[] = [
+      [r.rect.x, r.rect.y], [r.rect.x + r.rect.w, r.rect.y],
+      [r.rect.x + r.rect.w, r.rect.y + r.rect.h], [r.rect.x, r.rect.y + r.rect.h],
+    ];
+    let lo = Infinity;
+    let hi = -Infinity;
+    let perp = Infinity;
+    for (const c of corners) {
+      const t = (c[0] - wall.start[0]) * dir[0] + (c[1] - wall.start[1]) * dir[1];
+      lo = Math.min(lo, t);
+      hi = Math.max(hi, t);
+      perp = Math.min(perp, Math.abs((c[0] - wall.start[0]) * nrm[0] + (c[1] - wall.start[1]) * nrm[1]));
+    }
+    const overlap = Math.min(hi, len) - Math.max(lo, 0);
+    if (perp > 0.35 || overlap < width + 0.2) continue;
+    const rank = prefer.indexOf(r.type) >= 0 ? prefer.indexOf(r.type) : prefer.length;
+    if (!best || rank < best.rank || (rank === best.rank && overlap > best.overlap + 1e-9)) {
+      best = { room: r, rank, overlap };
+    }
+  }
+  return best?.room ?? null;
+}
+
+/**
  * A balcony may only project into open air: in a courtyard or L/U plan the face opposite the access
  * can look straight at the next bar, and a balcony there would land inside someone's living room.
  */
-function balconyIsClear(args: InstantiateArgs, slot: UnitSlot, bal: Rect): boolean {
-  const probe = { x: bal.x + 0.05, y: bal.y + 0.05, w: Math.max(0.1, bal.w - 0.1), h: Math.max(0.1, bal.h - 0.1) };
-  for (const other of args.layout.units) {
+function balconyIsClear(args: InstantiateArgs, slot: Slot, bal: Rect): boolean {
+  /*
+   * The probe is the balcony GROWN to the full width of its unit, not the 0.3 m inset rect the organiser plans:
+   * the unit solver places its own balcony room from `req.balcony.side/depth` and need not adopt that inset, so a
+   * clearance test on the inset rect lets a balcony clip the resident-storage pocket beside a core by 50 mm.
+   */
+  const pad = 0.35;
+  const wide = bal.w >= bal.h;
+  const probe = {
+    x: wide ? bal.x - pad : bal.x + 0.01,
+    y: wide ? bal.y + 0.01 : bal.y - pad,
+    w: Math.max(0.05, wide ? bal.w + 2 * pad : bal.w - 0.02),
+    h: Math.max(0.05, wide ? bal.h - 0.02 : bal.h + 2 * pad),
+  };
+  for (const other of args.layout.slots) {
     if (other === slot) continue;
-    if (rectsOverlap(probe, other.boundary, 0.02)) return false;
+    if (rectsOverlap(probe, other.boundary, 0)) return false;
   }
-  for (const c of args.layout.corridors) if (!c.external && rectsOverlap(probe, c.rect, 0.02)) return false;
-  for (const c of args.layout.commons) if (rectsOverlap(probe, c.rect, 0.02)) return false;
+  for (const c of args.layout.corridorSlots ?? []) if (!c.external && rectsOverlap(probe, c.rect, 0)) return false;
+  for (const c of args.layout.commons) if (rectsOverlap(probe, c.rect, 0)) return false;
   for (const c of args.cores) {
-    if (rectsOverlap(probe, c.rect, 0.02)) return false;
-    if (c.shaftBlock && rectsOverlap(probe, c.shaftBlock, 0.02)) return false;
+    if (rectsOverlap(probe, c.rect, 0)) return false;
+    if (c.shaftBlock && rectsOverlap(probe, c.shaftBlock, 0)) return false;
+  }
+  /*
+   * A courtyard or L/U plan puts two bars face to face: both sets of dwellings have the courtyard as their
+   * access-opposite face, so both would project a balcony into it and the two would MEET in the middle of a narrow
+   * court. Another bar's own balcony zone — its rect grown by this projection — is therefore not open air either.
+   */
+  const proj = Math.min(bal.w, bal.h);
+  for (const fr of args.f.bars) {
+    if (fr.barId === slot.barId) continue;
+    const r = rectFromAC(fr, fr.a0, fr.a1, fr.c0, fr.c1);
+    const grown = { x: r.x - proj, y: r.y - proj, w: r.w + 2 * proj, h: r.h + 2 * proj };
+    if (rectsOverlap(probe, grown, 0)) return false;
   }
   const site = polygonBounds(args.ctx.site.boundary);
   if (!rectContainsRect(site, probe, 0.5)) return false;
   return true;
 }
 
-function extensionsFor(slot: UnitSlot, side: Side): { s: number; e: number } {
+function extensionsFor(slot: Slot, side: Side): { s: number; e: number } {
   const horizontal = side === 'front' || side === 'rear';
   const atA0: Side = horizontal ? 'left' : 'front';
   const atA1: Side = horizontal ? 'right' : 'rear';
@@ -1625,5 +1685,5 @@ export function aspectOf(sides: Side[]): 'single' | 'dual' | 'corner' {
   return 'single';
 }
 
-export type { FloorCtx, FloorLayout, UnitSlot, CommonRoomSlot, CorridorSlot };
+export type { FloorCtx, FloorLayout, Slot, CommonRoomSlot, CorridorSlot };
 export { rectToPolygon };

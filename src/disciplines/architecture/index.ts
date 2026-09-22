@@ -16,8 +16,20 @@ import type {
   UnitTemplateId, Vec2,
 } from '../../core/types.ts';
 import type { UnitLayoutFn } from './unit-layout-types.ts';
-import { layoutUnit } from './unit-layout.ts';
+import type { FeasibilityOpts } from './program/types.ts';
+import type { Deviation, Rule, RuleSet, ScopeContext, SubjectKind } from '../../core/rules/types.ts';
+import { layoutUnitV2 } from './program/solver.ts';
 import { UNIT_TEMPLATES } from './templates.ts';
+import { buildCatalogue } from '../../modules/catalogue.ts';
+import { programFor } from '../../modules/program-source.ts';
+import { templateOf } from '../../modules/ids.ts';
+import { bayGridFrom, defaultBayGrid, type BayGrid } from '../structure/presize.ts';
+import { structuralSystemFor } from '../../core/typologies.ts';
+import { newQuota, mergeMix } from './placer/quota.ts';
+import { applyOverrides } from './placer/apply-overrides.ts';
+import { corridorGraphFor, longestLeg, travelFrom, travelGraph } from './placer/corridors.ts';
+import { portAlignment } from './placer/ports.ts';
+import { fitsStrip } from './placer/packer.ts';
 import { UNIT_PATTERNS } from './unit-patterns.ts';
 import { SIZES } from '../../core/coordination.ts';
 import {
@@ -32,6 +44,8 @@ import {
   instantiateFloor, planFloorLayout, planHouses, planKey, type FloorResult, type OrganizerDeps,
 } from './floor-organizer.ts';
 import type { FloorCtx, FloorLayout } from './types-internal.ts';
+import type { ModuleCatalogue } from '../../modules/types.ts';
+import type { CorridorGraph } from '../site/corridor-graph.ts';
 
 // ============================================================================
 // Pattern book
@@ -51,7 +65,8 @@ export { FLOOR_PATTERNS, UNIT_PATTERNS };
 
 const DEFAULT_DEPS: OrganizerDeps = {
   templates: normalizeTemplates(UNIT_TEMPLATES),
-  layoutUnit,
+  // the v2 program solver: a layout exists only for a (frontage, depth) its program admits
+  layoutUnit: layoutUnitV2,
 };
 
 let injected: Partial<OrganizerDeps> = {};
@@ -103,12 +118,25 @@ function currentDeps(): OrganizerDeps {
 // ============================================================================
 
 export function generateArchitecture(ctx: GenContext): ArchModel {
-  const deps = currentDeps();
   const b = new ArchBuilder(ctx.warnings);
   const spec = ctx.spec;
   const site = ctx.site;
   const massing = site.massing;
   const floorSpecs = new Map(spec.floors.map(f => [f.index, f] as const));
+
+  // ---- the three things the placer needs, resolved once ---------------------------------------
+  // the module catalogue (memoised by the rule set's hash), the structural handshake, and the corridor topology
+  const catalogue = buildCatalogue(ctx.rules);
+  const grid: BayGrid = ctx.presize
+    ? bayGridFrom(ctx.presize)
+    : defaultBayGrid(structuralSystemFor(ctx.typology, Math.max(1, spec.massing.storeys)));
+  const graph = corridorGraphFor(ctx);
+  const opts: FeasibilityOpts = {
+    region: spec.region,
+    detail: spec.options.detail,
+    rulesHash: catalogue.rulesHash,
+  };
+  const deps = { ...currentDeps(), catalogue };
 
   const built = ctx.storeys
     .filter(s => s.id !== 'SITE' && s.id !== 'FND' && s.id !== 'ROOF')
@@ -119,20 +147,38 @@ export function generateArchitecture(ctx: GenContext): ArchModel {
   const floorCtxs = built.map(s => makeFloorCtx(ctx, s, floorSpecs.get(s.index) ?? null, podiumStoreys));
 
   // ---- cores + shafts (once for the whole building) ----------------------
-  const cores = planCores(b, massing.cores, massing.bars, ctx.storeys, spec, ctx.typology.access);
+  const cores = planCores(b, massing.cores, massing.bars, ctx.storeys, spec, ctx.typology.access, {
+    catalogue, presize: ctx.presize ?? null,
+  });
 
   // ---- floors -------------------------------------------------------------
   const planCache = new Map<string, FloorLayout>();
   const unitRegistry = new Map<string, UnitInstance>();
   const results = new Map<string, FloorResult>();
+  const layouts: Record<string, FloorLayout> = {};
   const emitSlabs = spec.options.structure === false;
   const residentialStoreys = floorCtxs.filter(f => f.isResidential).map(f => f.storeyId);
   const unitsEstimate = estimateUnits(ctx, floorCtxs.length);
   const hasAmenityFloor = floorCtxs.some(f => f.use === 'amenity');
   let houseLayout: FloorLayout | null = null;
 
+  // ONE building-wide mix ledger, carried across strips and storeys in storey-index order: a template the geometry
+  // pushed off one floor is the first pick on the next, which is what holds the mix deviation under 0.08.
+  const requestedMix = { ...(ctx.typology.defaultUnitMix ?? {}), ...(spec.unitMix ?? {}) };
+  const targetTotal = floorCtxs.reduce((a, f) => a + (f.targetUnits ?? 0), 0) || unitsEstimate;
+  const quota = newQuota(requestedMix, targetTotal);
+  const fitFor = (moduleId: string, frontage: number, depth: number, level: number): ReturnType<typeof catalogue.fitFor> =>
+    catalogue.fitFor(moduleId, frontage, depth, { ...opts, levels: level });
+  const programOf = (moduleId: string): ReturnType<typeof programFor> | undefined => {
+    const t = templateOf(moduleId);
+    return t ? programFor(t) : undefined;
+  };
+
   for (const f of floorCtxs) {
-    const planArgs = { b, ctx, f, cores: coresOn(cores, f), deps, unitsInBuilding: unitsEstimate, hasAmenityFloor };
+    const planArgs = {
+      b, ctx, f, cores: coresOn(cores, f), deps, unitsInBuilding: unitsEstimate, hasAmenityFloor,
+      catalogue, grid, quota, graph, opts,
+    };
     let layout: FloorLayout;
     if (ctx.typology.access === 'direct' && f.isResidential) {
       houseLayout ??= planHouses(planArgs, residentialStoreys);
@@ -146,10 +192,23 @@ export function generateArchitecture(ctx: GenContext): ArchModel {
         planCache.set(key, layout);
       }
     }
-    const res = instantiateFloor({ b, ctx, f, layout, cores: coresOn(cores, f), deps, unitRegistry, emitSlabs });
+    // the editable document: base plan → overrides → geometry. An empty override doc returns the base by reference,
+    // so every existing output stays byte-identical.
+    const edited = applyOverrides(layout, spec.overrides, {
+      catalogue, grid, rules: ctx.rules ?? FALLBACK_RULES, region: spec.region, level: 0, storeyId: f.storeyId,
+    });
+    layouts[f.storeyId] = edited;
+    const res = instantiateFloor({
+      b, ctx, f, layout: edited, cores: coresOn(cores, f), deps, unitRegistry, emitSlabs,
+      fitFor, programFor: programOf,
+    });
     results.set(f.storeyId, res);
     if (emitSlabs) buildFloorSlab(b, f.storeyId, f.outline, f.slabThickness);
   }
+
+  // ---- the placer's own report: deviations, fit conformance, port alignment, party lines -------
+  reportPlacer(ctx, layouts, catalogue, opts);
+  const partyLines = partyLinesOf(layouts, massing);
 
   // ---- roof ---------------------------------------------------------------
   const top = floorCtxs[floorCtxs.length - 1];
@@ -212,7 +271,7 @@ export function generateArchitecture(ctx: GenContext): ArchModel {
   }
 
   // ---- derived + patterns -------------------------------------------------
-  const derived = computeDerived(ctx, b, floors, cores, results);
+  const derived = computeDerived(ctx, b, floors, cores, results, graph, spec.massing.corridorWidth ?? ctx.typology.corridorWidth ?? 1.6);
   recordPatterns(ctx, b, floors, cores, derived);
 
   b.flushWarnings();
@@ -222,10 +281,16 @@ export function generateArchitecture(ctx: GenContext): ArchModel {
   const unitTemplateOf = new Map(b.units.map(u => [u.id, u.templateId] as const));
   const elements: ModelElement[] = emitElements(b, { ceilingHeight, unitTemplateOf, detail: spec.options.detail });
 
+  const mix = Object.values(layouts).reduce<ReturnType<typeof mergeMix> | null>(
+    (acc, l) => (acc ? mergeMix(acc, l.mix) : l.mix), null);
+  if (mix) derived.mixDeviation = mix.deviation;
+
   return {
     storeys: ctx.storeys,
     floors,
     units: b.units,
+    partyLines,
+    layouts,
     rooms: b.rooms,
     walls: b.walls,
     doors: b.doors,
@@ -244,6 +309,87 @@ export function generateArchitecture(ctx: GenContext): ArchModel {
 }
 
 // ============================================================================
+// The placer's report
+// ============================================================================
+
+/**
+ * Minimal `RuleSet` for the paths that run before the rule set is wired (test fixtures, the mock app). Every reader
+ * takes the fallback argument, which is today's constant, so behaviour is identical either way.
+ */
+const FALLBACK_RULES: RuleSet = {
+  all: () => [],
+  get: () => null,
+  num: (_id: string, fallback: number) => fallback,
+  str: (_id: string, fallback: string) => fallback,
+  bool: (_id: string, fallback: boolean) => fallback,
+  table: () => [],
+  forSubject: (_kind: SubjectKind, _ctx: ScopeContext) => [] as readonly Rule[],
+  disabled: () => false,
+  profileApplied: () => false,
+  hash: () => 'v1',
+};
+
+/**
+ * Everything the placer has to say goes into the issues ledger: its own deviations (declared remnants, strips that
+ * admit no dwelling, clamped overrides), the FIT CONFORMANCE assertion (every slot inside its module's admissible
+ * frontage at its strip's net depth) and the PORT ALIGNMENT assertion (identical modules resolve identical stack
+ * fractions). A failure of either assertion is a `violation` — a placer bug — not a warning about the design.
+ */
+function reportPlacer(
+  ctx: GenContext, layouts: Record<string, FloorLayout>, catalogue: ModuleCatalogue, opts: FeasibilityOpts,
+): void {
+  const seen = new Set<string>();
+  for (const [storey, layout] of Object.entries(layouts).sort()) {
+    for (const d of layout.deviations) {
+      const key = `${d.ruleId}|${d.message}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      ctx.issues?.add({ ...d, storey: d.storey ?? storey });
+    }
+    for (const slot of layout.slots) {
+      if (slot.kind !== 'unit') continue;
+      const strip = layout.strips.find(st => st.id === slot.stripId);
+      if (!strip) continue;
+      const fit = fitsStrip(slot, strip, catalogue, opts);
+      if (fit.ok) continue;
+      ctx.issues?.add({
+        severity: 'violation', ruleId: 'ARC-D01', discipline: 'architecture', storey,
+        message: `slot ${slot.id} (${slot.moduleId}) has ${round(fit.frontage, 2)} m frontage, outside the ${fit.range ? `${round(fit.range.min, 2)}–${round(fit.range.max, 2)} m` : 'inadmissible'} range at ${round(strip.netDepth, 2)} m depth`,
+        observed: round(fit.frontage, 2),
+      });
+    }
+    for (const bad of portAlignment(layout.slots)) {
+      ctx.issues?.add({
+        severity: 'violation', ruleId: 'ARC-D05', discipline: 'architecture', storey,
+        message: `stack ports of ${bad.key} resolved to different fractions (${bad.fracs.join(', ')}) — identical modules must stack`,
+      });
+    }
+  }
+}
+
+/** Actual party/column lines per bar, returned to the structural detailing pass (the other half of the handshake) */
+function partyLinesOf(
+  layouts: Record<string, FloorLayout>, massing: { bars: MassingBar[] },
+): { barId: string; axis: 'x' | 'y'; offsets: number[] }[] {
+  const byBar = new Map<string, Set<number>>();
+  for (const layout of Object.values(layouts)) {
+    for (const [barId, lines] of Object.entries(layout.grid.lines)) {
+      const set = byBar.get(barId) ?? new Set<number>();
+      for (const v of lines) set.add(round(v, 3));
+      byBar.set(barId, set);
+    }
+  }
+  const axisOf = new Map(massing.bars.map(bar => [bar.id, bar.axis] as const));
+  return [...byBar.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([barId, set]) => ({
+      barId,
+      axis: axisOf.get(barId) ?? 'x',
+      offsets: [...set].sort((a, c) => a - c),
+    }));
+}
+
+// ============================================================================
 // Floor context
 // ============================================================================
 
@@ -257,10 +403,17 @@ function makeFloorCtx(ctx: GenContext, s: StoreyDef, spec: FloorSpec | null, pod
         ? (massing.towerFootprint ?? massing.footprint)
         : massing.footprint;
   const use = (spec?.use ?? (s.use === 'site' || s.use === 'foundation' ? 'residential' : s.use)) as FloorUse;
-  const f2f = spec?.floorToFloor ?? s.height ?? ctx.spec.massing.floorToFloor ?? 3.0;
-  // podium transfer: the slab ABOVE the top podium storey is thicker
-  const slabThickness = podiumStoreys > 0 && s.index + 1 === podiumStoreys ? 0.25 : SIZES.slabT;
-  const ceilingHeight = spec?.ceilingHeight ?? Math.min(f2f - 0.45, s.index === 0 ? 3.2 : 2.7);
+  /*
+   * The STRUCTURAL PRE-SIZING is the single owner of every number in this block (principle 1). `slabTAbove` is the
+   * slab whose soffit forms this storey's ceiling, so it — not a constant — sets the wall height; `floorToFloor` may
+   * have been RAISED so the ceiling profile fits, and `ceilingZ` already allows for the beam depth over the unit.
+   * Falling back to today's constants keeps the paths that run before the pre-sizing byte-identical.
+   */
+  const sizing = ctx.presize?.byStorey.get(s.id);
+  const f2f = sizing?.floorToFloor ?? spec?.floorToFloor ?? s.height ?? ctx.spec.massing.floorToFloor ?? 3.0;
+  const slabThickness = sizing?.slabTAbove
+    ?? (podiumStoreys > 0 && s.index + 1 === podiumStoreys ? 0.25 : SIZES.slabT);
+  const ceilingHeight = spec?.ceilingHeight ?? sizing?.ceilingZ ?? Math.min(f2f - 0.45, s.index === 0 ? 3.2 : 2.7);
   const bars = barsForOutline(outline, massing.bars);
   return {
     storey: s,
@@ -331,6 +484,7 @@ function groupBy<T>(items: T[], key: (t: T) => string): Map<string, T[]> {
 
 function computeDerived(
   ctx: GenContext, b: ArchBuilder, floors: FloorPlan[], cores: CoreLayout[], results: Map<string, FloorResult>,
+  graph: CorridorGraph | null, corridorWidth: number,
 ): Record<string, number> {
   const habitable = floors.filter(f => f.use !== 'roof');
   const gia = habitable.reduce((a, f) => a + f.area, 0);
@@ -348,24 +502,46 @@ function computeDerived(
   const CORE_ROOMS = new Set(['stair', 'elevator', 'lift-lobby', 'shaft']);
   const coreArea = b.rooms.filter(r => CORE_ROOMS.has(r.type)).reduce((a, r) => a + r.area, 0);
   const corridorLength = b.corridors.reduce((a, c) => a + Math.max(...c.centerline.map(s => dist(s.a, s.b))), 0);
-  const travel = maxTravel(ctx, b, cores);
+  const travel = maxTravel(ctx, b, cores, graph, corridorWidth);
 
   const dualAspect = b.units.filter(u => u.aspect === 'dual').length;
   const corner = b.units.filter(u => u.aspect === 'corner').length;
   const storeyHeightMax = Math.max(0, ...floors.map(f => f.floorToFloor));
 
-  // ---- warnings -----------------------------------------------------------
-  const limit = ctx.typology.sprinklered ? 76 : 61;
+  // ---- issues, not warnings ------------------------------------------------
+  // Every one of these was a v1 warning. They are now RECORDED against their rule with the metric that triggered
+  // them: break modules cut every leg to ARC-03, travel is measured on the corridor graph, and the remnant bound
+  // keeps net-to-gross up. A `violation` here means the placer failed at something it owns.
+  const limit = ctx.rules?.num('ARC-33.egressTravel', ctx.typology.sprinklered ? 76 : 61)
+    ?? (ctx.typology.sprinklered ? 76 : 61);
   if (travel > limit) {
-    b.warn(`egress travel distance ${round(travel, 1)} m exceeds the ${limit} m limit (IBC 2021 Table 1017.2) — add a core`);
+    ctx.issues?.add({
+      severity: 'deviation', ruleId: 'ARC-33.egressTravel', discipline: 'architecture',
+      message: `egress travel ${round(travel, 1)} m on the corridor graph exceeds the ${limit} m limit (IBC 2021 Table 1017.2)`,
+      observed: round(travel, 1), limit, resolution: { id: 'add-core' },
+    });
   }
-  for (const c of b.corridors) {
-    const len = Math.max(...c.centerline.map(s => dist(s.a, s.b)));
-    if (len > 60) b.warn(`corridor ${c.id} on ${c.storey} runs ${round(len, 1)} m without a break (ARC-03 limit 45 m, hard warn 60 m)`);
+  const maxLeg = ctx.rules?.num('ARC-03.maxLegLength', 45) ?? 45;
+  const longest = longestLeg(graph);
+  if (longest > maxLeg + 0.5) {
+    ctx.issues?.add({
+      severity: 'violation', ruleId: 'ARC-03.maxLegLength', discipline: 'architecture',
+      message: `corridor leg of ${round(longest, 1)} m survived the break slots (limit ${maxLeg} m)`,
+      observed: round(longest, 1), limit: maxLeg,
+    });
   }
-  if (b.units.length === 0) b.warn('no dwellings were placed — check the massing bars, cores and unit mix');
+  if (b.units.length === 0) {
+    ctx.issues?.add({
+      severity: 'violation', ruleId: 'ARC-01.dwellingPlaced', discipline: 'architecture',
+      message: 'no dwellings were placed — the massing bars, cores or unit mix admit no module',
+    });
+  }
   if (residentialGia > 0 && nia / residentialGia < 0.5 && b.units.length > 0) {
-    b.warn(`residential net-to-gross is only ${round(nia / residentialGia, 3)} — cores, landings and service bays are taking too much of the plate (check massing.coreCount)`);
+    ctx.issues?.add({
+      severity: 'deviation', ruleId: 'ARC-08.netToGross', discipline: 'architecture',
+      message: `residential net-to-gross is ${round(nia / residentialGia, 3)} — cores, landings and service bays take more than half the plate`,
+      observed: round(nia / residentialGia, 3), limit: 0.5,
+    });
   }
 
   return {
@@ -405,11 +581,18 @@ function computeDerived(
   };
 }
 
-/** Travel from the farthest unit entry door to the nearest exit stair, routed orthogonally */
-function maxTravel(ctx: GenContext, b: ArchBuilder, cores: CoreLayout[]): number {
+/**
+ * Travel from the farthest unit entry door to the nearest exit, walked along the CORRIDOR GRAPH (Dijkstra from every
+ * core, plus the step from the door onto the nearest leg). The v1 estimate was a Manhattan distance straight across
+ * the plate, which under-reported on an L or O plan and over-reported past a knuckle.
+ */
+function maxTravel(
+  ctx: GenContext, b: ArchBuilder, cores: CoreLayout[], graph: CorridorGraph | null, corridorWidth: number,
+): number {
   if (ctx.typology.access === 'direct' || cores.length === 0) return 0;
   const doorById = new Map(b.doors.map(d => [d.id, d] as const));
   const wallById = new Map(b.walls.map(w => [w.id, w] as const));
+  const tg = travelGraph(graph, cores.map(c => c.rect), corridorWidth);
   let worst = 0;
   for (const u of b.units) {
     const d = doorById.get(u.entryDoorId);
@@ -418,10 +601,14 @@ function maxTravel(ctx: GenContext, b: ArchBuilder, cores: CoreLayout[]): number
     const dir = segDir({ a: w.start, b: w.end });
     const p: Vec2 = [w.start[0] + dir[0] * d.along, w.start[1] + dir[1] * d.along];
     let best = Infinity;
-    for (const c of cores) {
-      const dx = Math.max(0, Math.max(c.rect.x - p[0], p[0] - (c.rect.x + c.rect.w)));
-      const dy = Math.max(0, Math.max(c.rect.y - p[1], p[1] - (c.rect.y + c.rect.h)));
-      best = Math.min(best, dx + dy);
+    if (tg) best = travelFrom(tg, p);
+    if (!Number.isFinite(best) || best <= 0) {
+      // no corridor graph (stair-core, point-core, houses): the door opens onto its own landing
+      for (const c of cores) {
+        const dx = Math.max(0, Math.max(c.rect.x - p[0], p[0] - (c.rect.x + c.rect.w)));
+        const dy = Math.max(0, Math.max(c.rect.y - p[1], p[1] - (c.rect.y + c.rect.h)));
+        best = Math.min(best, dx + dy);
+      }
     }
     if (Number.isFinite(best)) worst = Math.max(worst, best);
   }

@@ -107,6 +107,11 @@ export function normalizeSpec(input: PartialSpec): BuildingSpec {
     },
     floors: input.floors ?? [],
     unitMix: input.unitMix ?? t.defaultUnitMix,
+    // v2: the rule overrides and the floorplan-editor overrides ride through normalisation untouched — they are
+    // applied later (rules by the rule set, layouts by `applyOverrides` between planFloorLayout and
+    // instantiateFloor), and dropping them here would make the editor a no-op. (Added by agent L.)
+    rules: input.rules,
+    overrides: input.overrides,
     options: {
       furniture: true,
       site: true,

@@ -5,7 +5,7 @@
 import type {
   FloorSpec, FloorUse, Polygon, Rect, Side, StoreyDef, UnitTemplateId, WallType,
 } from '../../core/types.ts';
-import type { BarFrame, Interval } from './bar-frame.ts';
+import type { BarFrame } from './bar-frame.ts';
 
 /** Everything the organisers need to know about one storey */
 export interface FloorCtx {
@@ -36,28 +36,6 @@ export interface SideWallSpec {
   /** Extend the wall by this much beyond each end of the boundary edge (to close corners) */
   extendStart?: number;
   extendEnd?: number;
-}
-
-/** One dwelling slot in an abstract (storey-independent) floor layout */
-export interface UnitSlot {
-  index: number;
-  templateId: UnitTemplateId;
-  /** Boundary rect: edges lie on the CENTRELINES of the bounding walls */
-  boundary: Rect;
-  accessSide: Side;
-  exteriorSides: Side[];
-  sides: Record<Side, SideWallSpec>;
-  barId: string;
-  coreId?: string;
-  /** Distance along the wet-wall side at which the plumbing stack must sit (vertical alignment) */
-  stackAlong: number;
-  /** Multi-level house: identical internal stair footprint on every level */
-  stairRect?: Rect;
-  /** Storeys this slot spans (multi-level units); undefined = the storey it is instantiated on */
-  storeySpan?: string[];
-  /** Extra doors the organiser must cut into a boundary wall (garage doors, private stair doors) */
-  extraDoors?: { side: Side; width: number; height: number; type: 'garage' | 'building-entry' | 'exit'; offset?: number }[];
-  notes?: string;
 }
 
 export interface CommonRoomSlot {
@@ -95,13 +73,10 @@ export interface CorridorSlot {
   outerSide?: Side;
 }
 
-/** An abstract floor layout, computed once per (use, outline, mix) and replicated per storey (ARC-08) */
-export interface FloorLayout {
-  key: string;
-  units: UnitSlot[];
-  corridors: CorridorSlot[];
-  commons: CommonRoomSlot[];
-  /** along-intervals consumed by cores/shafts per bar, for reporting */
-  blocked: Record<string, Interval[]>;
-  remnantArea: number;
-}
+/**
+ * The abstract floor layout is now the v2 editable document in `placer/types.ts`: `FloorLayout` carries `strips`,
+ * `slots` (one placed module each, with stable ids and resolved ports), the corridor graph, the grid handshake and
+ * the mix report. `UnitSlot` is gone — a dwelling is a `Slot` with `kind: 'unit'`, and its plumbing stack is a
+ * resolved PORT rather than the `stackAlong` coordinate the organiser used to impose.
+ */
+export type { FloorLayout, Slot, SlotId, StripDef, StripId, ResolvedPort } from './placer/types.ts';

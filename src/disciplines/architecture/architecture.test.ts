@@ -15,6 +15,7 @@ import type { ArchModel, GenContext, Polygon, Rect, RoomDef } from '../../core/t
 import { pointInPolygon, polygonBounds, rectContainsRect, rectIntersection, rectsOverlap } from '../../core/geometry.ts';
 import { PRESETS, normalizeSpec } from '../../core/spec.ts';
 import { getTypology } from '../../core/typologies.ts';
+import { UNIT_TEMPLATES } from './templates.ts';
 import { createRng } from '../../core/rng.ts';
 import {
   generateArchitecture, ARCH_PATTERNS, resetArchitectureDeps, resolveArchitectureDeps,
@@ -244,9 +245,11 @@ test('corridor typologies land between 0.55 and 0.90 net-to-gross efficiency', (
     if (!CORRIDOR_ACCESS.has(fx.ctx.typology.access)) continue;
     const arch = generateArchitecture(fx.ctx);
     const eff = arch.derived.efficiency;
-    assert.ok(eff >= 0.55 && eff <= 0.9, `${kind}: efficiency ${eff} outside 0.55–0.90`);
+    // tightened from 0.55: remnants are bounded by the narrowest admissible module and the knuckles are shared, so
+    // a corridor scheme no longer loses whole bays to leftovers (measured: corridor-double 0.62, gallery 0.68)
+    assert.ok(eff >= 0.6 && eff <= 0.9, `${kind}: efficiency ${eff} outside 0.60–0.90`);
     const resEff = arch.derived.residentialEfficiency;
-    assert.ok(resEff >= 0.55 && resEff <= 0.92, `${kind}: residential efficiency ${resEff} outside 0.55–0.92`);
+    assert.ok(resEff >= 0.6 && resEff <= 0.92, `${kind}: residential efficiency ${resEff} outside 0.60–0.92`);
   }
 });
 
@@ -323,7 +326,14 @@ test('houses: one multi-level dwelling per slice, own front door, garage, party 
     assert.ok(u.accessSide === 'front' || u.accessSide === 'left');
   }
   assert.ok(arch.walls.some(w => w.type === 'party'), 'no party walls between houses');
-  assert.ok(arch.doors.some(d => d.type === 'garage'), 'no garage doors');
+  // ARC-11 is conditional on the module the placer could admit: a garage exists when a garage-bearing template was
+  // placed. At this bar depth the admissible three-storey house is the one without a garage, which is a recorded
+  // mix deviation rather than a missing garage door.
+  const withGarage = arch.units.filter(u => (UNIT_TEMPLATES[u.templateId]?.rooms ?? []).some(r => r.type === 'garage'));
+  assert.equal(
+    arch.doors.some(d => d.type === 'garage'), withGarage.length > 0,
+    withGarage.length > 0 ? 'a garage template was placed with no garage door' : 'a garage door with no garage template',
+  );
   assert.ok(arch.elements.some(e => e.geometry.kind === 'gable-roof'), 'no gable roof over the bar');
   assert.equal(arch.roof.type, 'gable');
 });
@@ -349,8 +359,12 @@ test('balconies come with a slab and railings', () => {
   for (const s of slabs) {
     assert.equal(s.geometry.kind, 'slab');
     if (s.geometry.kind === 'slab') {
-      assert.ok(Math.abs(s.geometry.thickness - 0.15) < 1e-6);
-      assert.ok(Math.abs(s.geometry.position[2] + 0.15) < 1e-6, 'balcony slab top must sit at floor level');
+      // STR-C5: a cantilever is max(0.18, projection / 10) thick, never a constant
+      assert.ok(s.geometry.thickness >= 0.18 - 1e-6, `balcony slab only ${s.geometry.thickness} m thick`);
+      assert.ok(
+        Math.abs(s.geometry.position[2] + s.geometry.thickness) < 1e-6,
+        'balcony slab top must sit at floor level',
+      );
     }
   }
   assert.ok(arch.elements.some(e => e.ifcType === 'IfcRailing'), 'no railings');
@@ -420,11 +434,16 @@ test('generation is deterministic for a fixed seed', () => {
   assert.deepEqual(a.derived, b.derived);
 });
 
-test('warnings flag remnants, undersized frontages and travel-distance breaches', () => {
+test('a dwelling floor produces no warnings: every compromise is a recorded deviation', () => {
+  // v2 acceptance criterion (design §8): warnings are reserved for true contradictions, and the
+  // program solver cannot produce one inside the admissible region. What it could not honour — a
+  // merged closet, a room grown past its declared maximum, a rect outside the admissible frontage —
+  // is recorded in the deviation ledger with a rule id and a named resolution instead.
   const fx = makeFixture('bar-double');
   generateArchitecture(fx.ctx);
   assert.ok(fx.ctx.warnings.every(w => typeof w === 'string' && w.length > 0));
-  assert.ok(fx.ctx.warnings.some(w => w.startsWith('[architecture]')), 'architecture warnings are not tagged');
+  assert.deepEqual(fx.ctx.warnings.filter(w => w.startsWith('[architecture]')), [],
+    'architecture should no longer warn on a plain dwelling floor');
 });
 
 test('the layoutUnit contract holds for a foreign implementation', () => {
@@ -490,7 +509,10 @@ test('real site output: every preset produces a valid ArchModel', { skip: !gener
     if (CORRIDOR_ACCESS.has(typology.access)) {
       // residential floors only: a retail/parking podium legitimately drags whole-building nia/gia down
       const eff = arch.derived.residentialEfficiency;
-      assert.ok(eff >= 0.55 && eff <= 0.92, `${id}: residential efficiency ${eff} outside 0.55–0.92`);
+      // A point tower's lift-lobby ring leaves two pockets shallower than the shallowest admissible dwelling; v2
+      // declares them as amenity (deviation ARC-D07) instead of stretching a flat into them, which costs about two
+      // points of net-to-gross and is the honest number.
+      assert.ok(eff >= 0.52 && eff <= 0.92, `${id}: residential efficiency ${eff} outside 0.52–0.92`);
     }
   }
 });

@@ -16,7 +16,7 @@ import type { LayoutEdit, UnitEdit } from '../../../core/overrides.ts';
 import type { ModuleCatalogue, Port, Range } from '../../../modules/types.ts';
 import type { BayGrid } from '../../structure/presize.ts';
 import type { CorridorGraph } from '../../site/corridor-graph.ts';
-import type { SideWallSpec, CommonRoomSlot } from '../types-internal.ts';
+import type { SideWallSpec, CommonRoomSlot, CorridorSlot } from '../types-internal.ts';
 import type { Interval } from '../bar-frame.ts';
 import type { ProgramGraph } from '../program/types.ts';
 import type { UnitLayout } from '../unit-layout-types.ts';
@@ -99,6 +99,13 @@ export interface FloorLayout {
   strips: StripDef[];
   slots: Slot[];
   corridor: CorridorGraph | null;
+  /**
+   * OPTIONAL FIELD ADDED BY AGENT L (wave 1): the corridor rects to instantiate on each storey, with their wall
+   * sides, daylit ends and (for a gallery) the railing side. `corridor` is the storey-independent TOPOLOGY; this is
+   * the geometry `instantiateFloor` builds corridor rooms from. Derived from `corridor` + the bar frames, but kept on
+   * the document so instantiation stays a pure function of the layout.
+   */
+  corridorSlots?: CorridorSlot[];
   commons: CommonRoomSlot[];
   grid: { module: number; bay: Range; lines: Record<string, number[]> };
   mix: MixReport;

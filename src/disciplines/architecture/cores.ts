@@ -13,7 +13,11 @@ import type {
 } from '../../core/types.ts';
 import { SIZES } from '../../core/coordination.ts';
 import { exposureOf, inset, rectEdges, rectsOverlap, round, sideNormal } from '../../core/geometry.ts';
+import { alongInWall, reachRect, solveSwing } from '../../core/openings.ts';
 import { barFrame, rectFromAC, alongRange, acrossRange, sideSpan, type BarFrame, type Interval } from './bar-frame.ts';
+import type { CoreModule, ModuleCatalogue } from '../../modules/types.ts';
+import type { StructuralPresize } from '../structure/presize.ts';
+import { pickCoreModule } from '../../modules/core-modules.ts';
 import { ArchBuilder, railingElement, liftCarElement } from './arch-elements.ts';
 import type { FloorCtx } from './types-internal.ts';
 
@@ -33,6 +37,10 @@ export interface StairGeom {
 export interface CoreLayout {
   id: string;
   placement: CorePlacement;
+  /** the `CoreModule` this core was built from (stair configuration, lifts, purpose-tagged shaft slots) */
+  module: CoreModule | null;
+  /** the three purpose-tagged shaft rects plus the refuse chute, in the bay beside the core */
+  shaftRects: { purpose: ShaftDef['purpose']; rect: Rect }[];
   /** Gross rect — wall centrelines lie on these edges */
   rect: Rect;
   /** Net rect inside the core walls */
@@ -65,6 +73,13 @@ export interface CoreLayout {
 const LANDING_MIN = 1.1;
 const LIFT_SLICE = 2.3;
 
+export interface PlanCoresOpts {
+  /** the module catalogue: the core's stair run, lift bank and shaft slots come from its `CoreModule` */
+  catalogue?: ModuleCatalogue;
+  /** the single owner of `coreWallT` and the slab thicknesses */
+  presize?: StructuralPresize | null;
+}
+
 export function planCores(
   b: ArchBuilder,
   placements: CorePlacement[],
@@ -72,7 +87,9 @@ export function planCores(
   storeys: StoreyDef[],
   spec: BuildingSpec,
   access: AccessType = 'corridor-double',
+  o: PlanCoresOpts = {},
 ): CoreLayout[] {
+  const coreWallT = o.presize?.coreWallT ?? SIZES.coreWallT;
   const barById = new Map(bars.map(bar => [bar.id, bar] as const));
   const buildingStoreys = storeys.filter(s => s.index >= 0 && s.index < 100).map(s => s.id);
   const allStoreys = storeys.filter(s => s.index > -100 && s.index < 100).map(s => s.id);
@@ -98,7 +115,7 @@ export function planCores(
       rect = rectFromAC(frame, coreS, coreE, across0.s, across0.e);
       innerBay = towardCentre0 > 0 ? { s: coreE, e: along0.e } : { s: along0.s, e: coreS };
     }
-    const net = inset(rect, SIZES.coreWallT / 2);
+    const net = inset(rect, coreWallT / 2);
     if (net.w < 2.0 || net.h < 2.0) {
       b.warn(`core ${p.id} rect ${fmtRect(rect)} is too small to hold a stair — skipped`);
       continue;
@@ -139,16 +156,25 @@ export function planCores(
       ? { x: round(net.x + s), y: round(net.y), w: round(len), h: round(net.h) }
       : { x: round(net.x), y: round(net.y + s), w: round(net.w), h: round(len) };
 
-    // the stair must fit a real dog-leg: risers/2 treads plus a landing
+    /*
+     * The stair run comes from the CORE MODULE (`catalogue.coreFootprintAt`), which sizes it from the floor-to-floor
+     * once: risers(f2f) × tread + landings across the bar, flights + lift bank + lobby along it. The placer asked the
+     * same function for the footprint BEFORE it packed, so "core spacing leaves only N m per landing side" and "core
+     * is only N m wide internally" have nothing left to report — the reservation and the build agree by construction.
+     */
     const f2fMax = Math.max(spec.massing.floorToFloor ?? 3, spec.massing.groundFloorToFloor ?? 3);
-    const risersPerFlight = Math.ceil(Math.ceil(f2fMax / 0.175) / 2);
-    const runNeed = round(risersPerFlight * SIZES.stairTreadMin + LANDING_MIN + 0.1, 3);
-    const runAcross = cf.short >= runNeed;
-    let stairSliceLen = runAcross ? 2.4 : Math.max(runNeed, 3.0);
-    if (!runAcross && cf.short < 2 * SIZES.stairWidth + 0.1) {
-      b.warn(`core ${p.id} is only ${round(cf.short, 2)} m wide internally — two ${SIZES.stairWidth} m flights need ${round(2 * SIZES.stairWidth + 0.1, 2)} m (IBC 2021 §1011.2)`);
-    }
     const wantLift = p.hasElevator && p.elevatorCount > 0;
+    const mod = o.catalogue
+      ? pickCoreModule(o.catalogue.cores, wantLift ? Math.max(1, p.elevatorCount) : 0, p.type === 'scissor-stair') ?? null
+      : null;
+    const foot = mod && o.catalogue ? o.catalogue.coreFootprintAt(mod.id, f2fMax) : null;
+    const runNeed = foot
+      ? foot.across
+      : round(Math.ceil(Math.ceil(f2fMax / 0.175) / 2) * SIZES.stairTreadMin + LANDING_MIN + 0.1, 3);
+    const runAcross = cf.short >= runNeed;
+    let stairSliceLen = runAcross
+      ? (mod ? Math.max(2.4, 2 * mod.stairWidth + 0.1) : 2.4)
+      : Math.max(runNeed, 3.0);
     let liftSliceLen = wantLift ? LIFT_SLICE : 0;
     if (stairSliceLen + liftSliceLen > cf.long - 0.2) {
       // shrink the lift bank first, then the stair
@@ -195,6 +221,7 @@ export function planCores(
     let combinedShaft: Rect | null = null;
     let trashShaft: Rect | null = null;
     let storage: Rect | null = null;
+    const shaftRects: { purpose: ShaftDef['purpose']; rect: Rect }[] = [];
     if (fits) {
       const bayC0 = cAcross.s, bayC1 = cAcross.e;
       shaftBlock = rectFromAC(frame, bayA0, bayA1, bayC0, bayC1);
@@ -202,16 +229,33 @@ export function planCores(
       const atHigh = corridorSide === frame.highSide;
       const cStart = atHigh ? bayC1 : bayC0;
       const sgn = atHigh ? -1 : 1;
-      combinedShaft = rectFromAC(frame, bayA0 + 0.1, bayA0 + 1.3, Math.min(cStart, cStart + sgn * 0.8), Math.max(cStart, cStart + sgn * 0.8));
-      if (nStoreys >= 4) {
-        trashShaft = rectFromAC(frame, bayA0 + 1.35, bayA0 + 2.35, Math.min(cStart, cStart + sgn * 1.0), Math.max(cStart, cStart + sgn * 1.0));
+      const bayLenAlong = bayA1 - bayA0;
+      const bayLenAcross = Math.abs(bayC1 - bayC0);
+      /*
+       * THREE PURPOSE-TAGGED SLOTS plus the refuse chute, at the fractions the `CoreModule` declares (design §2.3).
+       * v1 cut one 'combined' riser and left plumbing, mechanical and electrical to share it by three different
+       * conventions; each discipline now has a rect of its own, in a fixed order, in the same bay.
+       */
+      const slots = mod
+        ? mod.shaftSlots
+        : [{ purpose: 'combined' as ShaftDef['purpose'], atFrac: 0.27, wFrac: 0.5, dFrac: 0.34 },
+          { purpose: 'trash' as ShaftDef['purpose'], atFrac: 0.77, wFrac: 0.42, dFrac: 0.42 }];
+      let deepest = 0;
+      for (const sl of slots) {
+        if (sl.purpose === 'trash' && nStoreys < 4) continue;
+        const len = Math.max(0.45, bayLenAlong * sl.wFrac);
+        const a0 = Math.max(bayA0 + 0.05, Math.min(bayA1 - len - 0.05, bayA0 + bayLenAlong * sl.atFrac - len / 2));
+        const dep = Math.max(0.8, Math.min(bayLenAcross - 0.3, bayLenAcross * sl.dFrac));
+        const c1 = cStart + sgn * dep;
+        const rect = rectFromAC(frame, round(a0, 3), round(a0 + len, 3), Math.min(cStart, c1), Math.max(cStart, c1));
+        shaftRects.push({ purpose: sl.purpose, rect });
+        deepest = Math.max(deepest, dep);
+        if (sl.purpose === 'trash') trashShaft = rect;
+        else if (!combinedShaft) combinedShaft = rect;
       }
-      const usedDepth = nStoreys >= 4 ? 1.0 : 0.8;
-      const rest0 = atHigh ? bayC0 : cStart + usedDepth + 0.15;
-      const rest1 = atHigh ? cStart - usedDepth - 0.15 : bayC1;
+      const rest0 = atHigh ? bayC0 : cStart + deepest + 0.15;
+      const rest1 = atHigh ? cStart - deepest - 0.15 : bayC1;
       if (rest1 - rest0 >= 1.6) storage = rectFromAC(frame, bayA0 + 0.1, bayA1 - 0.1, rest0, rest1);
-    } else {
-      b.warn(`core ${p.id}: no room for a shaft bay beside the core (bar ${bar.id}); shafts omitted`);
     }
 
     const blocked: Interval = {
@@ -239,22 +283,15 @@ export function planCores(
     coreDef.elevatorIds = elevatorDefs.map(e => e.id);
 
     const shaftDefs: ShaftDef[] = [];
-    if (combinedShaft) {
+    const TAG: Record<string, string> = {
+      plumbing: 'PLB', mechanical: 'MEC', electrical: 'ELE', trash: 'TRASH', combined: 'ME', elevator: 'LIFT',
+    };
+    for (const sr of shaftRects) {
       shaftDefs.push({
-        id: b.ids.named('SHAFT', p.id.replace(/[^A-Za-z0-9]/g, ''), 'ME'),
-        rect: combinedShaft,
+        id: b.ids.named('SHAFT', p.id.replace(/[^A-Za-z0-9]/g, ''), TAG[sr.purpose] ?? sr.purpose.toUpperCase()),
+        rect: sr.rect,
         storeys: buildingStoreys,
-        purpose: 'combined',
-        servesUnitIds: [],
-        accessFrom: 'corridor',
-      });
-    }
-    if (trashShaft) {
-      shaftDefs.push({
-        id: b.ids.named('SHAFT', p.id.replace(/[^A-Za-z0-9]/g, ''), 'TRASH'),
-        rect: trashShaft,
-        storeys: buildingStoreys,
-        purpose: 'trash',
+        purpose: sr.purpose,
         servesUnitIds: [],
         accessFrom: 'corridor',
       });
@@ -275,7 +312,7 @@ export function planCores(
     b.shafts.push(...shaftDefs);
 
     out.push({
-      id: coreDef.id, placement: p, rect, net, barId: bar.id, stair, liftBank, liftRects, lobby,
+      id: coreDef.id, placement: p, module: mod, shaftRects, rect, net, barId: bar.id, stair, liftBank, liftRects, lobby,
       shaftBlock, combinedShaft, trashShaft, storage, corridorSide, exteriorSides, blocked,
       storeys: allStoreys, elevatorCount, coreDef, elevatorDefs, shaftDefs, frame,
     });
@@ -287,7 +324,7 @@ export function planCores(
       elementIds: out.map(c => c.id),
       params: {
         cores: out.length,
-        coreWallThickness: SIZES.coreWallT,
+        coreWallThickness: coreWallT,
         fireRating: '2HR',
         liftsTotal: out.reduce((a, c) => a + c.elevatorCount, 0),
       },
@@ -318,6 +355,7 @@ function stairGeomFor(rect: Rect, runAxis: 'x' | 'y'): StairGeom {
 
 export function buildCoreOnFloor(
   b: ArchBuilder, core: CoreLayout, f: FloorCtx, streetFacing: Compass, env?: EnvelopeLookup,
+  coreWallT: number = SIZES.coreWallT,
 ): void {
   const st = f.storeyId;
   const h = f.wallHeight;
@@ -339,7 +377,7 @@ export function buildCoreOnFloor(
       storey: st,
       start: e.a,
       end: e.b,
-      thickness: isExt ? SIZES.exteriorWallT : SIZES.coreWallT,
+      thickness: isExt ? SIZES.exteriorWallT : coreWallT,
       height: h,
       type: isExt ? 'exterior' : 'core',
       isExternal: isExt,
@@ -356,12 +394,13 @@ export function buildCoreOnFloor(
   });
   core.coreDef.roomIds.push(stairRoom.id);
 
-  const total = Math.max(2, Math.ceil(f.floorToFloor / 0.175));
+  const riserMax = core.module?.riserMax ?? 0.175;
+  const total = Math.max(2, Math.ceil(f.floorToFloor / riserMax));
   const riserHeight = round(f.floorToFloor / total, 4);
   const r1 = Math.ceil(total / 2);
   const r2 = total - r1;
   const runAvail = core.stair.runAxis === 'x' ? core.stair.rect.w : core.stair.rect.h;
-  let tread: number = SIZES.stairTreadMin;
+  let tread: number = core.module?.treadMin ?? SIZES.stairTreadMin;
   let run1 = r1 * tread;
   if (run1 + LANDING_MIN > runAvail) {
     tread = round(Math.max(0.22, (runAvail - LANDING_MIN) / r1), 4);
@@ -436,7 +475,7 @@ export function buildCoreOnFloor(
     : { start: [core.net.x, at], end: [core.net.x + core.net.w, at] };
   const stairEnd = sliceAxis === 'x' ? core.stair.rect.x + core.stair.rect.w : core.stair.rect.y + core.stair.rect.h;
   const stairWall = b.addWall({
-    storey: st, ...wallAcross(round(stairEnd)), thickness: SIZES.coreWallT, height: h,
+    storey: st, ...wallAcross(round(stairEnd)), thickness: coreWallT, height: h,
     type: 'core', loadBearingHint: true, fireRating: '2HR', leftRoomId: stairRoom.id,
   });
   if (core.liftBank) {
@@ -453,34 +492,44 @@ export function buildCoreOnFloor(
     lobbyRoomId = room.id;
   }
 
-  // stair door off the lobby (or straight off the corridor)
+  // stair door off the lobby (or straight off the corridor): the leaf sweeps the lift lobby, i.e. in the
+  // direction of egress travel out of the stair (IBC 1010.1.2.1). Without a lobby it sweeps the stair landing.
   const doorHost = lobbyRoomId ? stairWall : perimeter[core.corridorSide];
   if (doorHost) {
-    const along = wallAlongFraction(doorHost, 0.5);
+    const into = lobbyRoomId && core.lobby ? core.lobby : core.stair.rect;
+    const along = round(alongInWall(doorHost, into, 0.95));
+    const sol = solveSwing({ wall: doorHost, along, width: 0.95, motion: 'swing', into: reachRect(into, doorHost) });
     b.addDoor({
       storey: st, wallId: doorHost.id, along, width: 0.95, height: SIZES.doorHeight,
-      type: 'interior', operation: 'SINGLE_SWING_LEFT', fromRoomId: lobbyRoomId, toRoomId: stairRoom.id,
-      fireRated: true,
+      type: 'interior', motion: 'swing', hinge: sol.hinge, swing: sol.swing,
+      swingIntoRoomId: lobbyRoomId ?? stairRoom.id,
+      fromRoomId: lobbyRoomId, toRoomId: stairRoom.id, fireRated: true, ref: 'core.stair-door',
     });
   }
   // lobby opening onto the corridor
   const corridorWall = perimeter[core.corridorSide];
-  if (corridorWall && lobbyRoomId) {
+  if (corridorWall && lobbyRoomId && core.lobby) {
+    const along = round(alongInWall(corridorWall, core.lobby, 1.4));
+    const sol = solveSwing({ wall: corridorWall, along, width: 1.4, motion: 'swing', into: reachRect(core.lobby, corridorWall) });
     b.addDoor({
-      storey: st, wallId: corridorWall.id, along: wallAlongFraction(corridorWall, 0.5), width: 1.4,
-      height: SIZES.doorHeight, type: 'interior', operation: 'DOUBLE_DOOR_SINGLE_SWING',
-      fromRoomId: lobbyRoomId, fireRated: true,
+      storey: st, wallId: corridorWall.id, along, width: 1.4,
+      height: SIZES.doorHeight, type: 'interior', motion: 'swing', hinge: sol.hinge, swing: sol.swing,
+      swingIntoRoomId: lobbyRoomId, fromRoomId: lobbyRoomId, fireRated: true, ref: 'core.lobby-door',
     });
   }
-  // exit door to outside at ground level
+  // exit door to outside at ground level — swings out, away from the stair (egress direction)
   if (f.storey.index === 0) {
     const extSide = core.exteriorSides[0];
     const host = extSide ? perimeter[extSide] : corridorWall;
     if (host) {
+      const along = round(alongInWall(host, core.stair.rect, 1.0));
+      // `into` is the stair mirrored across the wall: the leaf sweeps to the OUTSIDE face
+      const sol = solveSwing({ wall: host, along, width: 1.0, motion: 'swing', into: reachRect(core.stair.rect, host) });
       b.addDoor({
-        storey: st, wallId: host.id, along: wallAlongFraction(host, 0.5), width: 1.0,
-        height: SIZES.doorHeight, type: 'exit', operation: 'SINGLE_SWING_RIGHT',
-        fromRoomId: stairRoom.id, fireRated: true,
+        storey: st, wallId: host.id, along, width: 1.0,
+        height: SIZES.doorHeight, type: 'exit', motion: 'swing',
+        hinge: sol.hinge, swing: sol.swing === 'left' ? 'right' : 'left',
+        fromRoomId: stairRoom.id, fireRated: true, ref: 'core.exit-door',
       });
     }
   }
@@ -510,11 +559,6 @@ export function enclose(
     storey, start: e[side].a, end: e[side].b, thickness, height, type,
     loadBearingHint: type === 'core' || type === 'shaft', fireRating, leftRoomId: roomId,
   }));
-}
-
-export function wallAlongFraction(w: WallDef, t: number): number {
-  const len = Math.hypot(w.end[0] - w.start[0], w.end[1] - w.start[1]);
-  return round(len * t);
 }
 
 /** Cores that sit on the given floor frame (matched by bar id, or geometrically for a plate) */
