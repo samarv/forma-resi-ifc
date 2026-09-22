@@ -25,7 +25,7 @@ import {
   LEAF_MIN, LEAF_MIN_BATH, PROBE_DEPTH,
 } from '../../core/openings.ts';
 import { recommendedRect, UNIT_TEMPLATES } from './templates.ts';
-import { layoutUnit } from './unit-layout.ts';
+import { layoutUnitV2 as layoutUnit } from './program/solver.ts';
 import { generateArchitecture, resolveArchitectureDeps } from './index.ts';
 import { makeFixture, type FixtureKind } from './test-fixtures.ts';
 

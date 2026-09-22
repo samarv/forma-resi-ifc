@@ -20,7 +20,7 @@ import {
 } from './kits.ts';
 import { FURNITURE_CATALOG } from '../furniture.ts';
 import { UNIT_TEMPLATES } from '../templates.ts';
-import { layoutUnit } from '../unit-layout.ts';
+import { layoutUnitV2 as layoutUnit } from './solver.ts';
 import { createRng } from '../../../core/rng.ts';
 import { recommendedRect } from '../templates.ts';
 

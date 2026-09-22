@@ -12,7 +12,7 @@ import { writeIfc } from '../ifc/writer.ts';
 import { METRICS } from '../core/metrics.ts';
 import { UNIT_TEMPLATES } from '../disciplines/architecture/templates.ts';
 import { setArchitectureDeps } from '../disciplines/architecture/index.ts';
-import { layoutUnit } from '../disciplines/architecture/unit-layout.ts';
+import { layoutUnitV2 as layoutUnit } from '../disciplines/architecture/program/solver.ts';
 
 // The architecture module resolves its unit templates / layout function lazily via
 // `await resolveArchitectureDeps()`. A single-file bundle cannot await a dynamic

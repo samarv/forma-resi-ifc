@@ -49,72 +49,41 @@ import type {
   RoomType, Side, UnitTemplateDef, Vec2, WallDef, WindowDef, Zone,
 } from '../../core/types.ts';
 import type { UnitLayout, UnitLayoutFn, UnitLayoutRequest } from './unit-layout-types.ts';
+import type { ExhaustPort, PanelPort, StackPort } from './program/types.ts';
 import {
-  projectOnSegment, rectContainsRect, rectToPolygon, rectsOverlap, round, solarScore,
+  projectOnSegment, rectContainsRect, rectToPolygon, rectsOverlap, round, segPointAt, solarScore,
   stripsXByWidths, stripsYByHeights,
 } from '../../core/geometry.ts';
 import { IdFactory, roomId } from '../../core/ids.ts';
 import { SIZES } from '../../core/coordination.ts';
 import { CLEARANCE, FURNITURE_CATALOG, storageVolume } from './furniture.ts';
 import { UNIT_LEVEL_SPLIT } from './templates.ts';
+import { LEAF_MIN, reachRect, solveSwing, swingRect } from '../../core/openings.ts';
+import { unitPorts } from './program/ports.ts';
+import type { DoorMotion } from '../../core/types.ts';
+import type { KitId } from './program/types.ts';
+import type { KitRules, Placement } from './program/kits.ts';
+import {
+  againstSide, fitKit, insetLocal, KIT, offsetFrom, offsets, oppSide, sideCentre, sideLength, TRIANGLE_MAX,
+  TRIANGLE_MIN, triangleOf,
+} from './program/kits.ts';
 
 // ============================================================================
 // Constants and small tables
 // ============================================================================
 
 const STAIR_TREAD = 0.26;
-const STAIR_CLEAR_WIDTH = 1.0;
 /** Minimum overlap of two room edges before a wall/door is worth generating (m) */
 const MIN_EDGE = 0.6;
 /** Minimum clear overlap needed to hang a door (m) — below this a room is landlocked */
-const MIN_DOOR_EDGE = 0.7;
+export const MIN_DOOR_EDGE = 0.7;
 const E = 1e-6;
 
-interface RoomLimit { maxWidth: number; maxDepth: number }
-const ROOM_LIMITS: Partial<Record<RoomType, RoomLimit>> = {
-  living: { maxWidth: 7.0, maxDepth: 7.0 },
-  'living-kitchen': { maxWidth: 8.5, maxDepth: 8.5 },
-  dining: { maxWidth: 5.0, maxDepth: 5.5 },
-  kitchen: { maxWidth: 6.0, maxDepth: 4.6 },
-  bedroom: { maxWidth: 4.8, maxDepth: 5.6 },
-  'master-bedroom': { maxWidth: 5.6, maxDepth: 6.2 },
-  study: { maxWidth: 4.6, maxDepth: 5.0 },
-  den: { maxWidth: 3.6, maxDepth: 4.4 },
-  flex: { maxWidth: 4.8, maxDepth: 5.6 },
-  bathroom: { maxWidth: 3.2, maxDepth: 4.4 },
-  ensuite: { maxWidth: 3.0, maxDepth: 4.4 },
-  powder: { maxWidth: 2.2, maxDepth: 3.2 },
-  wc: { maxWidth: 2.2, maxDepth: 3.2 },
-  entry: { maxWidth: 3.2, maxDepth: 4.4 },
-  hall: { maxWidth: 40, maxDepth: 2.8 },
-  corridor: { maxWidth: 40, maxDepth: 40 },
-  closet: { maxWidth: 2.4, maxDepth: 4.4 },
-  'walk-in-closet': { maxWidth: 3.0, maxDepth: 4.4 },
-  laundry: { maxWidth: 2.8, maxDepth: 4.4 },
-  utility: { maxWidth: 2.8, maxDepth: 4.4 },
-  storage: { maxWidth: 3.0, maxDepth: 4.4 },
-  garage: { maxWidth: 4.4, maxDepth: 6.6 },
-  stair: { maxWidth: 2.4, maxDepth: 6.5 },
-  'shared-living': { maxWidth: 13, maxDepth: 8 },
-  'shared-kitchen': { maxWidth: 13, maxDepth: 6 },
-};
-const DEFAULT_LIMIT: RoomLimit = { maxWidth: 6, maxDepth: 6 };
-const limitOf = (t: RoomType): RoomLimit => ROOM_LIMITS[t] ?? DEFAULT_LIMIT;
-
-/** Rooms that must touch the façade band; everything else is service/circulation. */
+/** Rooms that want the façade band — the fallback when a cell carries no program node. */
 const BACK_TYPES = new Set<RoomType>(['living', 'living-kitchen', 'dining', 'bedroom', 'master-bedroom', 'shared-living', 'shared-kitchen', 'flex', 'study']);
 const PRIVATE_TYPES = new Set<RoomType>(['bedroom', 'master-bedroom']);
 const WET_TYPES = new Set<RoomType>(['kitchen', 'living-kitchen', 'bathroom', 'ensuite', 'powder', 'wc', 'laundry', 'utility', 'shared-kitchen']);
 const BATH_TYPES = new Set<RoomType>(['bathroom', 'ensuite', 'powder', 'wc']);
-const DROPPABLE = new Set<RoomType>(['closet', 'storage', 'walk-in-closet', 'laundry', 'utility', 'powder', 'wc']);
-/**
- * Rooms whose loss is absorbed by furniture rather than reported: a dropped closet becomes a
- * wardrobe run in the bedroom it served (ARC-27/ARC-30), a dropped store becomes shelving.
- * Everything else that gets dropped is still worth a warning.
- */
-const SILENT_DROP = new Set<RoomType>(['closet', 'walk-in-closet', 'storage']);
-/** Rooms whose minimum clear width is a code/usability failure rather than a tight fit */
-const CRITICAL_WIDTH = new Set<RoomType>(['kitchen', 'living-kitchen', 'bathroom', 'ensuite', 'shared-kitchen']);
 
 /**
  * Share of a wall's glazing budget a room claims per metre of façade (ARC-16). Living spaces take
@@ -133,6 +102,16 @@ const glazeWeight = (t: RoomType): number => GLAZE_WEIGHT[t] ?? 0.8;
 const GLAZE_LOW_SILL = new Set<RoomType>(['living', 'living-kitchen', 'shared-living', 'dining', 'kitchen']);
 /** Glazed leaf fraction of a sliding balcony door: frames and rails are not glass (ARC-16/ARC-17) */
 const DOOR_GLAZED = 0.8;
+
+/**
+ * Total reveal (both sides) a door gives up to the wall that hosts it: 0.30 m on a comfortable
+ * partition, 0.20 m where the shared edge is tight and 0.15 m at the limit. The leaf's CLEAR width is
+ * the dimension a person passes through and the one the leaf minima are written against, while a door
+ * lining is only ~25 mm of the reveal — so the reveal yields before the leaf does.
+ */
+function doorReveal(span: number): number {
+  return span >= 1.15 ? 0.3 : span >= 1.0 ? 0.2 : 0.15;
+}
 /** Rooms joined by a cased opening instead of a door leaf */
 const OPEN_PLAN = new Set<RoomType>(['living', 'living-kitchen', 'dining', 'kitchen', 'hall', 'entry', 'corridor', 'stair', 'shared-living', 'shared-kitchen', 'flex']);
 
@@ -144,7 +123,7 @@ const TRANSIT_COST: Partial<Record<RoomType, number>> = {
   bedroom: 40, 'master-bedroom': 40, bathroom: 120, ensuite: 120, powder: 120, wc: 120,
   closet: 200, 'walk-in-closet': 200, laundry: 90, utility: 90, storage: 90, balcony: 400,
 };
-const transitCost = (t: RoomType): number => TRANSIT_COST[t] ?? 20;
+export const transitCost = (t: RoomType): number => TRANSIT_COST[t] ?? 20;
 
 const ROOM_LABELS: Record<string, string> = {
   living: 'Living Room', dining: 'Dining Room', kitchen: 'Kitchen', 'living-kitchen': 'Living / Kitchen',
@@ -171,9 +150,9 @@ const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);
 // Local frame (access side → u/v)
 // ============================================================================
 
-type LDir = 'u+' | 'u-' | 'v+' | 'v-';
+export type LDir = 'u+' | 'u-' | 'v+' | 'v-';
 
-interface Frame {
+export interface Frame {
   F: number;
   D: number;
   toWorld(u: number, v: number): Vec2;
@@ -196,7 +175,7 @@ const LOCAL_TO_WORLD_SIDE: Record<Side, Record<Side, Side>> = {
   right: { front: 'right', rear: 'left', left: 'front', right: 'rear' },
 };
 
-function makeFrame(r: Rect, access: Side): Frame {
+export function makeFrame(r: Rect, access: Side): Frame {
   const toWorld = (u: number, v: number): Vec2 => {
     switch (access) {
       case 'front': return [r.x + u, r.y + v];
@@ -253,140 +232,25 @@ function sub2(a: Vec2, b: Vec2): Vec2 { return [round(a[0] - b[0], 6), round(a[1
 // Program resolution
 // ============================================================================
 
-interface Inst { type: RoomType; prog: RoomProgram; n: number }
 
-function allInstances(t: UnitTemplateDef): Inst[] {
-  const out: Inst[] = [];
-  const seen = new Map<RoomType, number>();
-  for (const r of t.rooms) {
-    for (let i = 0; i < r.count; i++) {
-      const n = (seen.get(r.type) ?? 0) + 1;
-      seen.set(r.type, n);
-      out.push({ type: r.type, prog: r, n });
-    }
-  }
-  return out;
-}
 
-/** Rooms belonging to `level` of a multi-level template (deterministic across independent calls). */
-function programForLevel(t: UnitTemplateDef, level: number, levelsTotal: number, warnings: string[]): Inst[] {
-  const all = allInstances(t);
-  if (levelsTotal <= 1 || t.storeysInUnit <= 1) return level === 0 ? all : [];
-  const split = UNIT_LEVEL_SPLIT[t.id];
-  if (!split) {
-    if (level === 0) warnings.push(`template ${t.id} has ${t.storeysInUnit} storeys but no level split; everything placed on the entry level`);
-    return level === 0 ? all : [];
-  }
-  const pools = new Map<RoomType, Inst[]>();
-  for (const i of all) {
-    const p = pools.get(i.type) ?? [];
-    p.push(i);
-    pools.set(i.type, p);
-  }
-  const taken = new Map<RoomType, number>();
-  let mine: Inst[] = [];
-  for (let L = 0; L < Math.max(split.length, levelsTotal); L++) {
-    const want = split[L] ?? {};
-    const picked: Inst[] = [];
-    for (const key of Object.keys(want) as RoomType[]) {
-      const count = want[key] ?? 0;
-      const pool = pools.get(key) ?? [];
-      const start = taken.get(key) ?? 0;
-      for (let k = 0; k < count; k++) {
-        const idx = start + k;
-        const found = pool[idx];
-        if (found) picked.push(found);
-        else if (pool.length > 0) picked.push({ type: key, prog: pool[pool.length - 1].prog, n: idx + 1 });
-      }
-      taken.set(key, start + count);
-    }
-    if (L === level) mine = picked;
-  }
-  return mine;
-}
 
 // ============================================================================
 // Width fitting
 // ============================================================================
 
-interface FitItem { key: string; min: number; target: number; max: number; drop: boolean; type?: RoomType }
 
-function toFitItem(i: Inst, depth: number): FitItem {
-  const lim = limitOf(i.type);
-  const target = depth > 0 ? i.prog.targetArea / depth : i.prog.minWidth;
-  const min = Math.max(0.6, Math.min(i.prog.minWidth, lim.maxWidth));
-  const max = Math.max(min, Math.min(lim.maxWidth, Math.max(target, (i.prog.targetArea * 1.8) / Math.max(depth, 0.5))));
-  return { key: `${i.type}${i.n}`, min, target: clamp(target, min, max), max, drop: DROPPABLE.has(i.type), type: i.type };
-}
 
-const minWidthOf = (i: Inst): number => Math.max(0.6, Math.min(i.prog.minWidth, limitOf(i.type).maxWidth));
 
-/**
- * Distribute `total` across items. Returns widths summing to `total` (or less, with `leftover`),
- * dropping droppable items and squeezing below minimums only as a last resort.
- */
-function fitWidths(items: FitItem[], total: number, label: string, warnings: string[]): { widths: number[]; kept: number[]; dropped: number[]; leftover: number } {
-  const idx = items.map((_, i) => i);
-  const keep = [...idx];
-  const dropped: number[] = [];
-  const minSum = (): number => sum(keep.map(i => items[i].min));
-  let guard = 0;
-  while (minSum() > total + E && guard++ < items.length) {
-    let d = -1;
-    for (let k = keep.length - 1; k >= 0; k--) if (items[keep[k]].drop) { d = k; break; }
-    if (d < 0) break;
-    dropped.push(keep[d]);
-    keep.splice(d, 1);
-  }
-  if (keep.length === 0) return { widths: [], kept: [], dropped, leftover: total };
-  let w = keep.map(i => clamp(items[i].target, items[i].min, items[i].max));
-  let s = sum(w);
-  let leftover = 0;
-  if (s > total + E) {
-    const slack = w.map((x, k) => x - items[keep[k]].min);
-    const slackSum = sum(slack);
-    const excess = s - total;
-    if (slackSum >= excess - E && slackSum > E) {
-      w = w.map((x, k) => x - (excess * slack[k]) / slackSum);
-    } else {
-      const mins = keep.map(i => items[i].min);
-      // the entry keeps its 1.2 m: squeeze it and the front door no longer fits its own wall
-      const hold = keep.map(i => items[i].type === 'entry');
-      const holdSum = sum(mins.filter((_, k) => hold[k]));
-      const restSum = sum(mins.filter((_, k) => !hold[k]));
-      if (holdSum > E && restSum > E && total - holdSum > 0.55 * restSum) {
-        const f = (total - holdSum) / restSum;
-        w = mins.map((x, k) => (hold[k] ? x : x * f));
-      } else {
-        const f = total / Math.max(sum(mins), E);
-        w = mins.map(x => x * f);
-      }
-      // Squeezing a closet or a hall below its nominal width is a tight plan, not a defect; a
-      // kitchen or a bathroom below its minimum genuinely stops working (ARC-15).
-      const hurt = keep
-        .map((i, k) => ({ it: items[i], w: w[k] }))
-        .filter(x => x.it.type && CRITICAL_WIDTH.has(x.it.type) && x.w < x.it.min - 0.15);
-      if (hurt.length > 0) {
-        warnings.push(`${label}: ${hurt.map(x => `${x.it.type} ${x.w.toFixed(2)} m (min ${x.it.min.toFixed(2)} m)`).join(', ')} — only ${total.toFixed(2)} m available for ${sum(mins).toFixed(2)} m of rooms`);
-      }
-    }
-  } else if (s < total - E) {
-    const head = w.map((x, k) => Math.max(0, items[keep[k]].max - x));
-    const headSum = sum(head);
-    const deficit = total - s;
-    const give = Math.min(deficit, headSum);
-    if (headSum > E) w = w.map((x, k) => x + (give * head[k]) / headSum);
-    leftover = deficit - give;
-  }
-  return { widths: w, kept: keep, dropped, leftover };
-}
 
 // ============================================================================
 // Plan cells
 // ============================================================================
 
-interface Cell {
+export interface Cell {
   type: RoomType;
+  /** v2: stable program-node ref ('bedroom2'); the v1 planner leaves it undefined */
+  ref?: string;
   rect: Rect;
   prog?: RoomProgram;
   n: number;
@@ -398,9 +262,9 @@ interface Cell {
   daylightWaived?: boolean;
 }
 
-interface StairPlan { rect: Rect; risers: number; riserHeight: number; tread: number; width: number }
+export interface StairPlan { rect: Rect; risers: number; riserHeight: number; tread: number; width: number }
 
-interface PlanOpts {
+export interface PlanOpts {
   accessible: boolean;
   level: number;
   levelsTotal: number;
@@ -424,13 +288,9 @@ interface PlanOpts {
   warnings: string[];
   /** rooms the plan could not fit; merged into furniture instead (ARC-27/ARC-30) */
   dropped: RoomType[];
-  /** set by the planner: true when a bathroom span ended up covering `stackU` */
-  stackHit?: boolean;
-  /** what sits on `stackU` when the wet cluster could not reach it (undefined = off the band) */
-  stackBlockedBy?: RoomType;
 }
 
-interface PlanResult {
+export interface PlanResult {
   cells: Cell[];
   frontDepth: number;
   hallDepth: number;
@@ -440,854 +300,25 @@ interface PlanResult {
   wetSpan?: { lo: number; hi: number };
 }
 
-/** Standard plan: optional full-depth stair and garage columns, then the zoned two-band region. */
-function planStandard(F: number, D: number, insts: Inst[], o: PlanOpts): PlanResult {
-  const cells: Cell[] = [];
-  let u0 = 0;
-  let stair: StairPlan | undefined;
-  let rest = insts;
 
-  const stairInst = rest.find(i => i.type === 'stair');
-  if (stairInst) {
-    rest = rest.filter(i => i !== stairInst);
-    // round UP: rounding down puts the riser over the code maximum (ARC-22)
-    const risers = Math.max(12, Math.ceil(round(o.floorToFloor / SIZES.stairRiserMax, 4)));
-    const run = (risers - 1) * STAIR_TREAD;
-    // honour the organizer's footprint when it hugs the party wall (so its slab opening lines up)
-    const hint = o.stairLocal;
-    const useHint = Boolean(hint && hint.w >= 0.9 && hint.h >= 2.0 && hint.x < 0.45 && hint.y + hint.h <= D + 0.05);
-    let sw = useHint
-      ? clamp((hint as Rect).x + (hint as Rect).w, 1.1, Math.min(2.4, F * 0.34))
-      : clamp(STAIR_CLEAR_WIDTH + 0.15, 1.1, Math.max(1.15, Math.min(2.2, F * 0.3)));
-    // A terrace house with a garage has no frontage left for an entry beside the stair, so the
-    // front door opens into a hall IN FRONT of the stair instead (ARC-18): the standard plan of
-    // every narrow-fronted house. The hall keeps the 1.2 m the entry door needs on its own wall.
-    const entryInst0 = rest.find(i => i.type === 'entry');
-    const garageMin = rest.find(i => i.type === 'garage')?.prog.minWidth ?? 0;
-    const tightFrontage = F - sw - garageMin < Math.max(1.35, (entryInst0?.prog.minWidth ?? 1.2) + 0.15);
-    let sv = useHint ? clamp((hint as Rect).y, 0, Math.max(0, D - 2.4))
-      : entryInst0 && tightFrontage && D >= 5.2
-        ? clamp(entryInst0.prog.targetArea / sw, 1.6, Math.min(2.8, D - 2.6))
-        : 0;
-    const entryInFront = Boolean(entryInst0) && tightFrontage && sv >= 1.35;
-    if (entryInFront) sw = clamp(Math.max(sw, 1.25), 1.25, Math.max(1.25, F * 0.4));
-    let sh = useHint ? clamp((hint as Rect).h, 2.4, D - sv) : clamp(run + 0.35, 2.4, D - sv);
-    if (sv > 0 && sv < 0.95) { sh = Math.min(D - 0, sh + sv); sv = 0; }
-    if (D - sv - sh < 0.95) sh = D - sv;
-    if (entryInFront && sv > E) {
-      rest = rest.filter(i => i !== entryInst0);
-      cells.push({ type: 'entry', rect: { x: 0, y: 0, w: sw, h: sv }, n: (entryInst0 as Inst).n, prog: (entryInst0 as Inst).prog });
-    } else if (sv > E) cells.push({ type: 'hall', rect: { x: 0, y: 0, w: sw, h: sv }, n: 2, tag: 'hall' });
-    cells.push({ type: 'stair', rect: { x: 0, y: sv, w: sw, h: sh }, n: 1, tag: 'stair', prog: stairInst.prog });
-    if (sv + sh < D - E) cells.push({ type: 'storage', rect: { x: 0, y: sv + sh, w: sw, h: D - sv - sh }, n: 9, tag: 'filler' });
-    stair = { rect: { x: 0, y: sv, w: sw, h: sh }, risers, riserHeight: o.floorToFloor / risers, tread: STAIR_TREAD, width: Math.min(STAIR_CLEAR_WIDTH, sw - 0.12) };
-    u0 = sw;
-  }
 
-  const garageInst = rest.find(i => i.type === 'garage');
-  if (garageInst) {
-    rest = rest.filter(i => i !== garageInst);
-    const gw = clamp(garageInst.prog.targetArea / Math.min(6.0, D), garageInst.prog.minWidth, Math.max(garageInst.prog.minWidth, Math.min(4.4, (F - u0) * 0.62)));
-    const gd = clamp(Math.max(5.0, garageInst.prog.targetArea / gw), 4.8, D);
-    cells.push({ type: 'garage', rect: { x: u0, y: 0, w: gw, h: gd }, n: 1, tag: 'garage', prog: garageInst.prog });
-    if (D - gd > 1.8) {
-      const flexInst = rest.find(i => i.type === 'flex') ?? rest.find(i => i.type === 'storage');
-      if (flexInst) rest = rest.filter(i => i !== flexInst);
-      cells.push({ type: flexInst?.type ?? 'storage', rect: { x: u0, y: gd, w: gw, h: D - gd }, n: flexInst?.n ?? 8, prog: flexInst?.prog, tag: flexInst ? undefined : 'filler' });
-    } else if (D - gd > E) {
-      cells[cells.length - 1].rect.h = D;
-    }
-    u0 += gw;
-  }
 
-  let entryAtLowEdge = u0 > 0;
-  // single-aspect toward the access side: the daylit band has to sit on the access side, so the
-  // entry becomes a full-depth spine from the front door back to the service band.
-  if (o.flipV) {
-    const entryInst = rest.find(i => i.type === 'entry');
-    if (entryInst) {
-      rest = rest.filter(i => i !== entryInst);
-      const ew = clamp(entryInst.prog.targetArea / D, Math.max(1.1, entryInst.prog.minWidth), Math.min(2.0, (F - u0) * 0.3));
-      cells.push({ type: 'entry', rect: { x: u0, y: 0, w: ew, h: D }, n: entryInst.n, prog: entryInst.prog });
-      u0 += ew;
-      entryAtLowEdge = true;
-    }
-  }
-  const region: Rect = { x: u0, y: 0, w: Math.max(1.2, F - u0), h: D };
-  const r = planRegion(region, rest, o, entryAtLowEdge);
-  if (o.flipV) {
-    for (const c of r.cells) {
-      c.rect.y = D - (c.rect.y + c.rect.h);
-      if (c.wetEdge === 'v+') c.wetEdge = 'v-';
-      else if (c.wetEdge === 'v-') c.wetEdge = 'v+';
-    }
-  }
-  cells.push(...r.cells);
-  return { cells, frontDepth: o.flipV ? D - r.frontDepth : r.frontDepth, hallDepth: r.hallDepth, stair };
-}
 
-interface ZonePlan {
-  kind: 'L' | 'P' | 'M';
-  back: Inst[];
-  front: Inst[];
-  depth: number;
-  width: number;
-  minWidth: number;
-  raw: number;
-}
 
-function planRegion(region: Rect, insts: Inst[], o: PlanOpts, entryAtLowEdge: boolean): { cells: Cell[]; frontDepth: number; hallDepth: number } {
-  const W = region.w;
-  const D = region.h;
-  const warnings = o.warnings;
-  const minW = (i: Inst): number => Math.max(0.6, Math.min(i.prog.minWidth, limitOf(i.type).maxWidth));
 
-  // a room belongs to the daylit band iff its program asks for an exterior wall
-  let back = insts.filter(i => i.prog.needsExterior === true && !BATH_TYPES.has(i.type));
-  let front = insts.filter(i => !back.includes(i) && i.type !== 'hall');
-  const hallInst = insts.find(i => i.type === 'hall');
-
-  // --- feasibility: daylit rooms must sit side by side along the frontage -----
-  let guard = 0;
-  while (guard++ < 12 && back.length > 1) {
-    const need = sum(back.map(minW));
-    if (need <= W + 0.45) break;
-    const cand = [...back].sort((a, b) => minW(a) - minW(b) || a.prog.targetArea - b.prog.targetArea)[0];
-    back = back.filter(i => i !== cand);
-    front = [...front, cand];
-    // it keeps a window if a perpendicular wall is glazed — it takes the end of the service band
-    if (!o.accessExterior && !o.extLow && !o.extHigh) {
-      warnings.push(`${cand.type} moved into the service band with no exterior wall — frontage ${W.toFixed(1)} m is too narrow for ${cand.type} beside the other ${back.length + 1} daylit rooms`);
-    }
-  }
-  const backNeed = sum(back.map(minW));
-  if (backNeed > W + E) warnings.push(`daylit rooms squeezed below minimum width (need ${backNeed.toFixed(2)} m, have ${W.toFixed(2)} m)`);
-
-  const privates = back.filter(i => PRIVATE_TYPES.has(i.type));
-  const publics = back.filter(i => !PRIVATE_TYPES.has(i.type));
-  const masterInst = privates.find(i => i.type === 'master-bedroom');
-  const ensuiteInst = front.find(i => i.type === 'ensuite');
-  const walkinInst = front.find(i => i.type === 'walk-in-closet');
-  const suite = Boolean(masterInst && ensuiteInst && privates.length > 1 && W > 6.5);
-  const bedrooms = suite ? privates.filter(i => i !== masterInst) : privates;
-
-  // --- band depths -----------------------------------------------------------
-  const frontRooms = front;
-  const frontArea = sum(frontRooms.map(i => i.prog.targetArea));
-  const hasFrontDaylit = frontRooms.some(i => BACK_TYPES.has(i.type));
-  const minFd = hasFrontDaylit ? 3.3 : o.accessible ? 2.8 : 2.4;
-  const maxFd = Math.max(minFd, Math.min(4.4, D * 0.48));
-  let Fd = frontRooms.length === 0 ? 0 : clamp(frontArea / W, minFd, maxFd);
-  let Hd = bedrooms.length > 0 ? (o.accessible ? 1.4 : 1.25) : 0;
-  // keep the daylit band from becoming a corridor of very deep rooms
-  if (Fd > 0 && D - Fd - Hd > 5.4) Fd = clamp(D - Hd - 5.4, minFd, maxFd);
-  if (Fd > 0 && D - Fd < 3.2) Fd = Math.max(0, D - 3.2);
-
-  const backDepth = Math.max(1.0, D - Fd);
-  let bedDepth = Math.max(2.4, backDepth - Hd);
-
-  // --- front room assignment (which zone each service room sits over) -------
-  const frontM: Inst[] = suite ? [ensuiteInst as Inst, ...(walkinInst ? [walkinInst] : [])] : [];
-  const others = frontRooms.filter(i => !frontM.includes(i));
-  const hasL = publics.length > 0;
-  const hasP = bedrooms.length > 0 || !hasL;
-  const frontL: Inst[] = [];
-  const frontP: Inst[] = [];
-  for (const i of others) {
-    if (!hasP) { frontL.push(i); continue; }
-    if (!hasL) { frontP.push(i); continue; }
-    if (i.type === 'kitchen' || i.type === 'dining' || i.type === 'den' || i.type === 'study') frontL.push(i);
-    else frontP.push(i);
-  }
-
-  // --- zone widths: driven by the daylit band only --------------------------
-  // The service band is one continuous strip across the region, so service rooms are never
-  // squeezed by the zone they happen to sit over; only daylit rooms set the zone widths.
-  const zones: ZonePlan[] = [];
-  const mkZone = (kind: 'L' | 'P' | 'M', backList: Inst[], frontList: Inst[], depth: number): ZonePlan => {
-    const bMin = sum(backList.map(minW));
-    const bRaw = depth > 0 ? sum(backList.map(i => i.prog.targetArea)) / depth : 0;
-    return { kind, back: backList, front: frontList, depth, width: 0, minWidth: Math.max(bMin, 0.9), raw: Math.max(bRaw, bMin, 0.9) };
-  };
-  if (hasL) zones.push(mkZone('L', publics, frontL, backDepth));
-  if (hasP) zones.push(mkZone('P', bedrooms, frontP, bedDepth));
-  if (suite && masterInst) zones.push(mkZone('M', [masterInst], frontM, backDepth));
-
-  // order along u: entry near the low edge for own-door / multi-level / dual-key plans
-  const order: ('L' | 'P' | 'M')[] = entryAtLowEdge ? ['P', 'M', 'L'] : ['L', 'P', 'M'];
-  zones.sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
-
-  const rawTotal = sum(zones.map(z => z.raw));
-  if (rawTotal > W) {
-    const minTotal = sum(zones.map(z => z.minWidth));
-    if (minTotal >= W - E) {
-      const f = W / Math.max(minTotal, E);
-      for (const z of zones) z.width = z.minWidth * f;
-    } else {
-      const excess = rawTotal - W;
-      const slack = zones.map(z => z.raw - z.minWidth);
-      const slackSum = sum(slack);
-      zones.forEach((z, k) => { z.width = z.raw - (excess * slack[k]) / Math.max(slackSum, E); });
-    }
-  } else {
-    const surplus = W - rawTotal;
-    const wBack = zones.map(z => sum(z.back.map(i => i.prog.targetArea)) + 0.5);
-    const wSum = sum(wBack);
-    zones.forEach((z, k) => { z.width = z.raw + (surplus * wBack[k]) / Math.max(wSum, E); });
-  }
-  const wErr = W - sum(zones.map(z => z.width));
-  if (zones.length > 0) zones[zones.length - 1].width += wErr;
-
-  // hall depth from the hall program once zone P's width is known
-  const zoneP = zones.find(z => z.kind === 'P');
-  if (zoneP && Hd > 0) {
-    const target = hallInst ? hallInst.prog.targetArea / Math.max(zoneP.width, 1) : Hd;
-    Hd = clamp(target, o.accessible ? 1.4 : 1.15, 2.8);
-    if (backDepth - Hd < 2.6) Hd = Math.max(1.0, backDepth - 2.6);
-    bedDepth = Math.max(2.4, backDepth - Hd);
-  }
-
-  const cells: Cell[] = [];
-  const anyBack = zones.some(z => z.back.length > 0);
-
-  // --- service band: one continuous strip in zone order ---------------------
-  const frontCells: Cell[] = [];
-  if (Fd > 0) {
-    let ordered: Inst[] = [];
-    for (const z of zones) ordered.push(...orderFront(z, entryAtLowEdge));
-    // a daylit room that could not stand in the façade band still gets a window if it takes the
-    // end of the service band against a perpendicular exterior wall (ARC-26)
-    const exiled = ordered.filter(i => i.prog.needsExterior === true && BACK_TYPES.has(i.type));
-    if (exiled.length > 0 && (o.extLow || o.extHigh)) {
-      const others = ordered.filter(i => !exiled.includes(i));
-      ordered = o.extLow ? [...exiled, ...others] : [...others, ...exiled];
-    }
-    const items = ordered.map(i => toFitItem(i, Fd));
-    const fit = fitWidths(items, W, 'service band', warnings);
-    const widths = [...fit.widths];
-    const kept = fit.kept.map(k => ordered[k]);
-    if (fit.leftover > 0.7) { widths.push(fit.leftover); kept.push(fillerInst('storage', 7)); }
-    else if (fit.leftover > E && widths.length > 0) { const add = fit.leftover / widths.length; for (let k = 0; k < widths.length; k++) widths[k] += add; }
-    const strips = stripsXByWidths({ x: region.x, y: 0, w: W, h: anyBack ? Fd : D }, widths);
-    strips.forEach((st, k) => {
-      const inst = kept[k];
-      const c: Cell = {
-        type: inst.type, rect: st, prog: inst.prog, n: inst.n,
-        wetEdge: WET_TYPES.has(inst.type) ? 'v+' : undefined,
-      };
-      frontCells.push(c);
-      cells.push(c);
-    });
-    // XD-01: slide the wet cluster along the band so a bathroom column covers the requested
-    // stack coordinate. Only the column ORDER changes, so the band still tiles exactly.
-    if (o.stackU !== undefined) {
-      o.stackHit = slideWetCluster(frontCells, region.x, o.stackU);
-      if (!o.stackHit) {
-        const at = frontCells.find(c => o.stackU! >= c.rect.x - E && o.stackU! <= c.rect.x + c.rect.w + E);
-        o.stackBlockedBy = at?.type;
-      }
-    }
-    // rooms that could not stand side by side go in a second row at the hall side of a
-    // deep-enough service column (linen closet behind the bathroom, store behind the kitchen)
-    // Only wet/service columns may carry a second row: the entry and the kitchen must keep their
-    // own edge onto the hall or the living room, or the plan loses its circulation.
-    const bandDepth = anyBack ? Fd : D;
-    const rowDepth = clamp(bandDepth - 2.3, 0.9, anyBack ? 1.7 : 2.4);
-    const hostRank = (c: Cell): number => (BATH_TYPES.has(c.type) ? 0 : c.type === 'laundry' || c.type === 'utility' || c.type === 'storage' ? 1 : 9);
-    const queue = fit.dropped.map(di => ordered[di]);
-    if (queue.length > 0 && rowDepth >= 0.9 && bandDepth - rowDepth >= 2.2) {
-      const hosts = frontCells
-        .filter(c => hostRank(c) < 9 && c.rect.h >= bandDepth - E)
-        .sort((a, b) => hostRank(a) - hostRank(b) || b.rect.w - a.rect.w);
-      for (const host of hosts) {
-        if (queue.length === 0) break;
-        const picks: Inst[] = [];
-        let used = 0;
-        while (queue.length > 0 && used + minW(queue[0]) <= host.rect.w + E) {
-          const it = queue.shift() as Inst;
-          picks.push(it);
-          used += minW(it);
-        }
-        if (picks.length === 0) continue;
-        host.rect.h = bandDepth - rowDepth;
-        const rowFit = fitWidths(picks.map(i => toFitItem(i, rowDepth)), host.rect.w, 'second service row', warnings);
-        const rw = [...rowFit.widths];
-        if (rowFit.leftover > E && rw.length > 0) { const add = rowFit.leftover / rw.length; for (let k = 0; k < rw.length; k++) rw[k] += add; }
-        const rowStrips = stripsXByWidths({ x: host.rect.x, y: bandDepth - rowDepth, w: host.rect.w, h: rowDepth }, rw);
-        rowStrips.forEach((st, k) => {
-          const inst = picks[rowFit.kept[k]];
-          cells.push({
-            type: inst.type, rect: st, prog: inst.prog, n: inst.n,
-            wetEdge: WET_TYPES.has(inst.type) ? 'v-' : undefined,
-          });
-        });
-      }
-    }
-    for (const inst of queue) o.dropped.push(inst.type);
-  }
-  if (!anyBack) {
-    if (frontCells.length === 0) cells.push({ type: 'storage', rect: { x: region.x, y: 0, w: W, h: D }, n: 6, tag: 'filler' });
-    return { cells, frontDepth: 0, hallDepth: 0 };
-  }
-
-  // --- daylit band, zone by zone --------------------------------------------
-  let u = region.x;
-  for (const z of zones) {
-    const backTop = z.kind === 'P' && Hd > 0 ? Fd + Hd : Fd;
-    if (z.kind === 'P' && Hd > 0) {
-      cells.push({ type: 'hall', rect: { x: u, y: Fd, w: z.width, h: Hd }, n: 1, tag: 'hall', prog: hallInst?.prog });
-    }
-    const depth = Math.max(0.8, D - backTop);
-    const ordered = orderBack(z, o);
-    const items = ordered.map(i => toFitItem(i, depth));
-    const fit = fitWidths(items, z.width, `${z.kind}-daylit`, warnings);
-    const widths = [...fit.widths];
-    const kept = fit.kept.map(k => ordered[k]);
-    if (fit.leftover > E && widths.length > 0) { const add = fit.leftover / widths.length; for (let k = 0; k < widths.length; k++) widths[k] += add; }
-    const strips = stripsXByWidths({ x: u, y: backTop, w: z.width, h: depth }, widths);
-    strips.forEach((st, k) => {
-      const inst = kept[k];
-      cells.push({
-        type: inst.type, rect: st, prog: inst.prog, n: inst.n,
-        wetEdge: WET_TYPES.has(inst.type) ? 'v-' : undefined,
-      });
-    });
-    u += z.width;
-  }
-  return { cells, frontDepth: Fd, hallDepth: Hd };
-}
-
-/**
- * XD-01: reorder a row of fixed-width columns so that a bathroom column covers `stackU`.
- * Widths are preserved (the row still tiles exactly) and the kitchen is kept immediately beside
- * the bathroom so their fixtures stay back to back on one wet wall (ARC-21).
- * Returns true when the requested coordinate ends up inside a bathroom span.
- */
-function slideWetCluster(cells: Cell[], u0: number, stackU: number): boolean {
-  // a daylit room parked at the end of the band is there for its window: leave it alone
-  const pin = (c: Cell): boolean => BACK_TYPES.has(c.type);
-  let p0 = 0;
-  while (p0 < cells.length && pin(cells[p0])) p0++;
-  let p1 = cells.length;
-  while (p1 > p0 && pin(cells[p1 - 1])) p1--;
-  const head = cells.slice(0, p0);
-  const mid = cells.slice(p0, p1);
-  const tail = cells.slice(p1);
-  const base = u0 + sum(head.map(c => c.rect.w));
-  const bath = mid.find(c => BATH_TYPES.has(c.type));
-  if (!bath) return false;
-  // The stack stands in the wet wall behind the whole cluster, so it may land anywhere along the
-  // kitchen or the bathrooms; the bathroom is preferred because its branch is the longest.
-  const wetScore = (list: Cell[]): number => {
-    let acc = base;
-    let best = Infinity;
-    for (const c of list) {
-      if (WET_TYPES.has(c.type)) {
-        const margin = Math.min(0.2, c.rect.w / 4);
-        const lo = acc + margin;
-        const hi = acc + c.rect.w - margin;
-        const d = (stackU < lo ? lo - stackU : stackU > hi ? stackU - hi : 0) + (BATH_TYPES.has(c.type) ? 0 : 0.05);
-        best = Math.min(best, d);
-      }
-      acc += c.rect.w;
-    }
-    return best === Infinity ? 99 : best;
-  };
-  let best = mid;
-  let bestScore = wetScore(mid);
-  if (bestScore > E) {
-    const kit = mid.find(c => c.type === 'kitchen' || c.type === 'living-kitchen');
-    const others = mid.filter(c => c !== bath && c !== kit);
-    for (const pair of kit ? [[bath, kit], [kit, bath]] : [[bath]]) {
-      for (let k = 0; k <= others.length; k++) {
-        const trial = [...others.slice(0, k), ...pair, ...others.slice(k)];
-        const s = wetScore(trial);
-        if (s < bestScore - 1e-9) { bestScore = s; best = trial; }
-        if (bestScore <= E) break;
-      }
-      if (bestScore <= E) break;
-    }
-  }
-  const out = [...head, ...best, ...tail];
-  let acc = u0;
-  for (const c of out) { c.rect.x = acc; acc += c.rect.w; }
-  cells.length = 0;
-  cells.push(...out);
-  // the margin only ranks the candidates: a stack anywhere inside a wet room's span is a hit
-  return out.some(c => WET_TYPES.has(c.type) && stackU >= c.rect.x - 0.02 && stackU <= c.rect.x + c.rect.w + 0.02);
-}
-
-function fillerInst(type: RoomType, n: number): Inst {
-  return { type, n, prog: { type, count: 1, targetArea: 1.5, minArea: 0.8, minWidth: 0.7, needsExterior: false, wet: false, zone: 'service' as Zone, prefer: 'front' } };
-}
-
-/** Front-band column order: wet rooms adjacent to the neighbouring zone's kitchen (ARC-14/21). */
-function orderFront(z: ZonePlan, entryAtLowEdge: boolean): Inst[] {
-  const rank = (i: Inst): number => {
-    if (i.type === 'entry') return entryAtLowEdge ? 0 : 3;
-    if (BATH_TYPES.has(i.type)) return z.kind === 'P' ? 1 : 2;
-    if (i.type === 'kitchen') return z.kind === 'L' ? 8 : 2;
-    if (i.type === 'dining' || i.type === 'den' || i.type === 'study') return 6;
-    if (BACK_TYPES.has(i.type)) return 5;
-    return 4;
-  };
-  return [...z.front].sort((a, b) => rank(a) - rank(b) || b.prog.targetArea - a.prog.targetArea);
-}
-
-/** Daylit band order: living toward an exterior corner (ARC-26), bedrooms largest farthest. */
-function orderBack(z: ZonePlan, o: PlanOpts): Inst[] {
-  if (z.kind === 'P') return [...z.back].sort((a, b) => a.prog.targetArea - b.prog.targetArea);
-  const rank = (i: Inst): number => (i.type === 'living' || i.type === 'living-kitchen' || i.type === 'shared-living' ? 0 : i.type === 'dining' ? 1 : 2);
-  const sorted = [...z.back].sort((a, b) => rank(a) - rank(b));
-  // if the outer exterior side is at the high-u end, flip so the living room takes that corner
-  if (o.extHigh && !o.extLow) sorted.reverse();
-  return sorted;
-}
 
 // --- through unit: dual-aspect side entry (ARC-36) --------------------------
 
-/** One column of the through plan, spanning `vDepth` from `vTop`, filled with a v-stack of rooms. */
-interface ThroughCol {
-  kind: 'band' | 'service' | 'spur';
-  rooms: Inst[];
-  vTop: number;
-  vDepth: number;
-  min: number;
-  raw: number;
-  max: number;
-  /** may be dropped when the frontage runs short */
-  optional: boolean;
-  width: number;
-  end?: 'low' | 'high';
-}
 
-/**
- * Is the through plan (daylight on the two ends of u, hall along the access wall) the right plan
- * for this rect? True when the side opposite the entry is NOT glazed but a perpendicular side is —
- * the mansion-block / walk-up landing unit — or when the end façades are simply longer than the
- * far wall, which is the case for any unit deeper than it is wide.
- */
-function useThroughPlan(F: number, D: number, insts: Inst[], o: PlanOpts): boolean {
-  if (o.accessExterior || o.flipV) return false;
-  if (!o.extLow && !o.extHigh) return false;
-  const hallD = o.accessible ? 1.5 : 1.2;
-  if (D < hallD + 2.4 || F < 5.4) return false;
-  // nothing else can light this unit: the only glazed walls are the ends of u
-  if (!o.extFar) return true;
-  // too shallow for the zoned plan's service band plus a daylit band on the far wall
-  if (D < 5.4) return true;
-  // both plans are possible. The through plan stands every daylit room and every service room
-  // side by side along the frontage, so it only wins on a unit deeper than it is wide AND with
-  // enough frontage to take all of those columns at once.
-  const daylit = insts.filter(i => i.prog.needsExterior === true && !BATH_TYPES.has(i.type));
-  const svc = insts.filter(i => !daylit.includes(i) && (WET_TYPES.has(i.type) || PRIVATE_TYPES.has(i.type)));
-  const need = sum(daylit.map(minWidthOf)) + sum(svc.map(i => Math.min(minWidthOf(i), D - hallD)));
-  return D > F + 1.0 && need <= F;
-}
 
-function planThrough(F: number, D: number, insts: Inst[], o: PlanOpts): PlanResult {
-  const warnings = o.warnings;
-  // no glazed end to hang a band on: there is nothing for this plan type to do
-  if (!o.extLow && !o.extHigh) return planStandard(F, D, insts, o);
-  const hallD = clamp(o.accessible ? 1.5 : 1.2, 1.1, Math.max(1.1, D - 2.4));
-  const sd = D - hallD;
 
-  const hallInst = insts.find(i => i.type === 'hall');
-  const entryInst = insts.find(i => i.type === 'entry');
-  const rest = insts.filter(i => i !== hallInst && i !== entryInst && i.type !== 'corridor');
-  const daylit = rest.filter(i => i.prog.needsExterior === true && !BATH_TYPES.has(i.type));
-  const service = rest.filter(i => !daylit.includes(i));
 
-  // --- which end takes the public rooms: the better solar exposure (APL #128) ---
-  const ends: ('low' | 'high')[] = [];
-  if (o.extLow) ends.push('low');
-  if (o.extHigh) ends.push('high');
-  const pubEnd: 'low' | 'high' = ends.length > 1 ? (o.solarLow >= o.solarHigh ? 'low' : 'high') : ends[0];
-  const privEnd: 'low' | 'high' | null = ends.length > 1 ? (pubEnd === 'low' ? 'high' : 'low') : null;
-
-  const band: Record<'low' | 'high', Inst[]> = { low: [], high: [] };
-  if (privEnd) {
-    band[pubEnd] = daylit.filter(i => !PRIVATE_TYPES.has(i.type));
-    band[privEnd] = daylit.filter(i => PRIVATE_TYPES.has(i.type));
-    // a bedroom-only unit (or a template with no private rooms) still deserves both façades
-    if (band[pubEnd].length === 0) { band[pubEnd] = band[privEnd].slice(0, 1); band[privEnd] = band[privEnd].slice(1); }
-  } else {
-    band[pubEnd] = [...daylit.filter(i => !PRIVATE_TYPES.has(i.type)), ...daylit.filter(i => PRIVATE_TYPES.has(i.type))];
-  }
-
-  // --- feasibility: each façade is only D long -----------------------------
-  const internal: Inst[] = [];
-  for (const e of ends) {
-    let guard = 0;
-    while (band[e].length > 1 && sum(band[e].map(minWidthOf)) > D + 0.05 && guard++ < 8) {
-      const cand = [...band[e]].sort((a, b) => minWidthOf(a) - minWidthOf(b) || a.prog.targetArea - b.prog.targetArea)[0];
-      band[e] = band[e].filter(i => i !== cand);
-      const other: 'low' | 'high' | null = e === 'low' ? (o.extHigh ? 'high' : null) : (o.extLow ? 'low' : null);
-      if (other && sum([...band[other], cand].map(minWidthOf)) <= D + 0.05) band[other].push(cand);
-      else internal.push(cand);
-    }
-  }
-
-  // --- service rooms packed into columns on the party wall -----------------
-  // Each column carries ONE room that needs its own door off the hall (kitchen, bathroom, a
-  // bedroom that lost its façade) in the slot against the hall strip, with cupboards, the laundry
-  // and stores stacked behind it on the party wall. Nothing is ever reached through a bathroom.
-  const rank = (t: RoomType): number => (t === 'kitchen' || t === 'living-kitchen' || t === 'shared-kitchen' ? 0
-    : t === 'bathroom' ? 1 : t === 'ensuite' || t === 'powder' || t === 'wc' ? 2
-    : t === 'laundry' || t === 'utility' ? 3 : t === 'bedroom' || t === 'master-bedroom' ? 6 : 4);
-  const secondary = (t: RoomType): boolean => t === 'closet' || t === 'walk-in-closet' || t === 'storage' || t === 'laundry' || t === 'utility';
-  const packs: Inst[][] = service.filter(i => !secondary(i.type))
-    .sort((a, b) => rank(a.type) - rank(b.type) || b.prog.targetArea - a.prog.targetArea)
-    .map(i => [i]);
-  // a room that lost its façade keeps a full-depth column: it then touches the hall AND, where the
-  // far side is glazed, the party-side exterior wall, so it can still be given a window
-  for (const i of internal) packs.push([i]);
-  const packRaw = (p: Inst[]): number => Math.max(
-    sum(p.map(r => r.prog.targetArea)) / sd,
-    ...p.map(r => Math.min(minWidthOf(r), sd)),
-  );
-  const packMin = (p: Inst[]): number => Math.max(
-    0.9,
-    sum(p.map(r => r.prog.minArea)) / sd,
-    ...p.map(r => Math.min(minWidthOf(r), sd)),
-  );
-  const packV = (p: Inst[]): number => sum(p.map(r => minWidthOf(r)));
-  const hostScore = (p: Inst[], s: Inst): number => {
-    const h = p[0].type;
-    if (PRIVATE_TYPES.has(h) || BACK_TYPES.has(h)) return 99;
-    if (s.type === 'laundry' || s.type === 'utility') return h === 'kitchen' ? 0 : BATH_TYPES.has(h) ? 1 : 3;
-    return h === 'kitchen' ? 1 : BATH_TYPES.has(h) ? 0 : 2;
-  };
-  for (const s of service.filter(i => secondary(i.type)).sort((a, b) => b.prog.targetArea - a.prog.targetArea)) {
-    const host = packs
-      .filter(p => hostScore(p, s) < 99 && packV([...p, s]) <= sd - 0.1)
-      .sort((a, b) => hostScore(a, s) - hostScore(b, s) || packV(a) - packV(b))[0];
-    if (host) host.push(s);
-    else packs.push([s]);
-  }
-  packs.sort((a, b) => rank(a[0].type) - rank(b[0].type));
-  if (pubEnd === 'high') packs.reverse();
-
-  // --- columns in u order --------------------------------------------------
-  const cols: ThroughCol[] = [];
-  const mkBand = (e: 'low' | 'high'): void => {
-    const rooms = orderBandV(band[e], o);
-    if (rooms.length === 0) return;
-    const min = Math.max(1.6, sum(rooms.map(r => r.prog.minArea)) / D, ...rooms.map(minWidthOf));
-    const raw = Math.max(min, sum(rooms.map(r => r.prog.targetArea)) / D);
-    const max = Math.max(raw, Math.min(...rooms.map(r => Math.max(limitOf(r.type).maxWidth, limitOf(r.type).maxDepth))));
-    cols.push({ kind: 'band', rooms, vTop: 0, vDepth: D, min, raw, max, optional: false, width: 0, end: e });
-  };
-  const mkSpur = (e: 'low' | 'high'): void => {
-    const rooms = band[e];
-    if (rooms.length < 2) return;
-    // rooms behind the first one need their own way out: a bedroom may not be a passage (APL #127)
-    const needs = rooms.slice(1).some(r => !OPEN_PLAN.has(r.type));
-    if (!needs) return;
-    const w = clamp(hallD, 1.0, 1.4);
-    cols.push({ kind: 'spur', rooms: [], vTop: hallD, vDepth: sd, min: w, raw: w, max: w, optional: true, width: 0, end: e });
-  };
-  mkBand('low');
-  mkSpur('low');
-  for (const p of packs) {
-    // keep service columns close to the width their rooms actually need: the surplus of a
-    // generous rect belongs to the living room and the bedrooms, not to the cupboards
-    cols.push({
-      kind: 'service', rooms: p, vTop: hallD, vDepth: sd,
-      min: packMin(p), raw: Math.max(packMin(p), packRaw(p)),
-      max: Math.max(packMin(p), sum(p.map(r => r.prog.targetArea)) / sd + 0.5),
-      optional: p.every(r => DROPPABLE.has(r.type)), width: 0,
-    });
-  }
-  mkSpur('high');
-  mkBand('high');
-
-  // --- degrade until the columns fit the frontage --------------------------
-  const minTotal = (): number => sum(cols.map(c => c.min));
-  let guard = 0;
-  while (minTotal() > F - 1.4 && guard++ < 16) {
-    const dry = cols.map((c, k) => ({ c, k })).filter(x => x.c.kind === 'service' && x.c.optional);
-    if (dry.length > 0) {
-      const victim = dry.sort((a, b) => a.c.min - b.c.min)[0];
-      for (const r of victim.c.rooms) o.dropped.push(r.type);
-      cols.splice(victim.k, 1);
-      continue;
-    }
-    const spur = cols.map((c, k) => ({ c, k })).filter(x => x.c.kind === 'spur')
-      .sort((a, b) => (a.c.end === pubEnd ? 0 : 1) - (b.c.end === pubEnd ? 0 : 1))[0];
-    if (spur) { cols.splice(spur.k, 1); continue; }
-    break;
-  }
-  const items: FitItem[] = cols.map((c, k) => ({
-    key: `col${k}`, min: c.min, target: clamp(c.raw, c.min, c.max), max: Math.max(c.max, c.min), drop: false,
-    type: c.rooms[0]?.type,
-  }));
-  const fit = fitWidths(items, F, 'through plan', warnings);
-  fit.kept.forEach((ci, k) => { cols[ci].width = fit.widths[k]; });
-  if (fit.leftover > E && cols.length > 0) {
-    const bands = cols.filter(c => c.kind === 'band');
-    const share = bands.length > 0 ? bands : cols;
-    for (const c of share) c.width += fit.leftover / share.length;
-  }
-  const err = F - sum(cols.map(c => c.width));
-  if (cols.length > 0) cols[cols.length - 1].width += err;
-  // keep the tiling exact while nothing ends up narrower than a doorway: a column that got
-  // squeezed to a sliver borrows from the widest one instead of being dropped
-  for (let pass = 0; pass < 3; pass++) {
-    const thin = cols.filter(c => c.width < 0.4);
-    if (thin.length === 0) break;
-    let moved = 0;
-    for (const c of thin) {
-      const widest = cols.reduce((m, x) => (x.width > m.width ? x : m), cols[0]);
-      const need = 0.4 - c.width;
-      if (widest === c || widest.width - need < 0.9) continue;
-      c.width += need;
-      widest.width -= need;
-      moved++;
-    }
-    if (moved === 0) break;
-  }
-
-  // --- emit cells ----------------------------------------------------------
-  const cells: Cell[] = [];
-  let u = 0;
-  let stripLo = 0;
-  let stripHi = F;
-  const wetSpan = { lo: F, hi: 0 };
-  /** u boundaries of the columns under the hall strip, so the strip can be split in line with them */
-  const inner: number[] = [];
-  for (const c of cols) {
-    if (c.kind === 'band' && c.end === 'low') stripLo = u + c.width;
-    if (c.kind === 'band' && c.end === 'high') stripHi = u;
-    if (c.kind !== 'band') inner.push(u);
-    if (c.kind === 'spur') {
-      cells.push({ type: 'hall', rect: { x: u, y: c.vTop, w: c.width, h: c.vDepth }, n: 5, tag: 'hall', prog: hallInst?.prog });
-    } else {
-      const depth = c.vDepth;
-      const fitV = fitWidths(c.rooms.map(r => toFitItem(r, c.width)), depth, c.kind === 'band' ? `${c.end}-façade` : 'service column', warnings);
-      const hs = [...fitV.widths];
-      const kept = fitV.kept.map(k => c.rooms[k]);
-      for (const di of fitV.dropped) o.dropped.push(c.rooms[di].type);
-      if (hs.length === 0) { hs.push(depth); kept.push(fillerInst('storage', 30 + cells.length)); }
-      else if (Math.abs(sum(hs) - depth) > E) { const add = (depth - sum(hs)) / hs.length; for (let k = 0; k < hs.length; k++) hs[k] += add; }
-      const strips = stripsYByHeights({ x: u, y: c.vTop, w: c.width, h: depth }, hs);
-      strips.forEach((st, k) => {
-        const inst = kept[k];
-        const wet = WET_TYPES.has(inst.type);
-        if (wet && c.kind === 'service') { wetSpan.lo = Math.min(wetSpan.lo, u); wetSpan.hi = Math.max(wetSpan.hi, u + c.width); }
-        cells.push({
-          type: inst.type, rect: st, prog: inst.prog, n: inst.n,
-          daylightWaived: internal.includes(inst) && !o.extFar,
-        });
-      });
-    }
-    u += c.width;
-  }
-  // --- hall strip along the access wall, with the entry carved out of it ---
-  // The strip is cut only ON column boundaries, so every room under it keeps its FULL width onto
-  // one circulation room and its door never has to squeeze into a 0.7 m offcut (ARC-28).
-  const stripW = Math.max(0, stripHi - stripLo);
-  if (stripW > 0.5) {
-    const cuts = [stripLo, ...inner.filter(x => x > stripLo + E && x < stripHi - E), stripHi];
-    const ew = clamp(entryInst ? entryInst.prog.targetArea / hallD : 2.0, 1.3, Math.min(3.0, stripW));
-    // the run of whole columns closest to `ew` and to the middle of the strip becomes the entry
-    let best: { lo: number; hi: number; score: number } | null = null;
-    for (let i = 0; i < cuts.length - 1; i++) {
-      for (let j = i + 1; j < cuts.length; j++) {
-        const w = cuts[j] - cuts[i];
-        if (w < 1.3 - E && j < cuts.length - 1) continue;
-        const centre = (cuts[i] + cuts[j]) / 2;
-        const score = Math.abs(w - ew) + 0.35 * Math.abs(centre - (stripLo + stripHi) / 2);
-        if (w > 3.4 + E) continue;
-        if (!best || score < best.score) best = { lo: cuts[i], hi: cuts[j], score };
-      }
-    }
-    const eLo = best ? best.lo : stripLo;
-    const eHi = best ? best.hi : stripHi;
-    const parts: { t: RoomType; lo: number; hi: number }[] = [];
-    if (eLo > stripLo + E) parts.push({ t: 'hall', lo: stripLo, hi: eLo });
-    parts.push({ t: 'entry', lo: eLo, hi: eHi });
-    if (eHi < stripHi - E) parts.push({ t: 'hall', lo: eHi, hi: stripHi });
-    parts.forEach((p, k) => {
-      cells.push({
-        type: p.t, rect: { x: p.lo, y: 0, w: p.hi - p.lo, h: hallD }, n: k + 1, tag: 'hall',
-        prog: p.t === 'entry' ? entryInst?.prog : hallInst?.prog,
-      });
-    });
-  }
-  // --- wet edges: the wall shared by the kitchen and the bathroom ----------
-  markThroughWetEdges(cells, hallD);
-  if (internal.length > 0 && !o.extFar) {
-    warnings.push(`${internal.map(i => i.type).join(', ')} placed away from the façade: a through unit ${round(D, 2)} m wide offers ${round(ends.length * D, 2)} m of end façade for ${round(sum(daylit.map(minWidthOf)), 2)} m of habitable rooms`);
-  }
-  return {
-    cells, frontDepth: D, hallDepth: hallD, kind: 'through',
-    wetSpan: wetSpan.hi > wetSpan.lo ? wetSpan : undefined,
-  };
-}
-
-/** Order the rooms of one façade band along v: public near the entry, the master farthest (APL #127). */
-function orderBandV(rooms: Inst[], o: PlanOpts): Inst[] {
-  const rank = (i: Inst): number => {
-    if (i.type === 'living' || i.type === 'living-kitchen' || i.type === 'shared-living') return 0;
-    if (i.type === 'dining' || i.type === 'kitchen') return 1;
-    if (i.type === 'study' || i.type === 'den' || i.type === 'flex') return 2;
-    if (i.type === 'master-bedroom') return 9;
-    return 5;
-  };
-  const sorted = [...rooms].sort((a, b) => rank(a) - rank(b) || a.prog.targetArea - b.prog.targetArea);
-  // where the far wall is glazed as well, the living room takes the corner (ARC-26 / APL #159)
-  if (o.extFar && sorted.length > 1 && rank(sorted[0]) === 0 && sorted.every(i => !PRIVATE_TYPES.has(i.type))) {
-    sorted.push(sorted.shift() as Inst);
-  }
-  return sorted;
-}
-
-/**
- * Point every wet room's fixture wall at the neighbour it shares plumbing with: the kitchen and the
- * bathroom stand back to back on one wall (ARC-21), and a lone wet room backs onto the hall strip
- * so its stack still lands in a partition the organizer can chase (ARC-14).
- */
-function markThroughWetEdges(cells: Cell[], hallD: number): void {
-  const wet = cells.filter(c => WET_TYPES.has(c.type));
-  for (const c of wet) {
-    const touching = (other: Cell, dir: LDir): boolean => {
-      if (dir === 'u+' || dir === 'u-') {
-        const edge = dir === 'u+' ? c.rect.x + c.rect.w : c.rect.x;
-        const onIt = dir === 'u+' ? Math.abs(other.rect.x - edge) < 1e-3 : Math.abs(other.rect.x + other.rect.w - edge) < 1e-3;
-        return onIt && Math.min(c.rect.y + c.rect.h, other.rect.y + other.rect.h) - Math.max(c.rect.y, other.rect.y) > MIN_EDGE;
-      }
-      const edge = dir === 'v+' ? c.rect.y + c.rect.h : c.rect.y;
-      const onIt = dir === 'v+' ? Math.abs(other.rect.y - edge) < 1e-3 : Math.abs(other.rect.y + other.rect.h - edge) < 1e-3;
-      return onIt && Math.min(c.rect.x + c.rect.w, other.rect.x + other.rect.w) - Math.max(c.rect.x, other.rect.x) > MIN_EDGE;
-    };
-    const dirs: LDir[] = ['u+', 'u-', 'v+', 'v-'];
-    let picked: LDir | undefined;
-    for (const d of dirs) {
-      if (wet.some(o2 => o2 !== c && touching(o2, d))) { picked = d; break; }
-    }
-    if (!picked) {
-      // back onto the hall strip when there is no wet neighbour
-      picked = Math.abs(c.rect.y - hallD) < 1e-3 ? 'v-' : 'v+';
-    }
-    c.wetEdge = picked;
-  }
-}
 
 // --- cluster (co-living) ----------------------------------------------------
 
-function planCluster(F: number, D: number, insts: Inst[], o: PlanOpts): PlanResult {
-  const cells: Cell[] = [];
-  const warnings = o.warnings;
-  const beds = insts.filter(i => i.type === 'bedroom');
-  const ensuites = insts.filter(i => i.type === 'ensuite');
-  const sharedLiving = insts.find(i => i.type === 'shared-living');
-  const sharedKitchen = insts.find(i => i.type === 'shared-kitchen');
-  const entryInst = insts.find(i => i.type === 'entry');
-  const laundryInst = insts.find(i => i.type === 'laundry');
-  const storeInst = insts.find(i => i.type === 'storage');
-  const corridorInst = insts.find(i => i.type === 'corridor');
-
-  const cw = clamp(corridorInst ? 1.4 : 1.3, 1.2, Math.max(1.2, F * 0.16));
-  const sharedArea = (sharedLiving?.prog.targetArea ?? 26) + (sharedKitchen?.prog.targetArea ?? 16);
-  const sd = clamp(sharedArea / F, 3.6, Math.max(3.6, D * 0.35));
-  const entryD = clamp(entryInst ? entryInst.prog.targetArea / cw : 2.2, 1.6, 3.0);
-  const uc = (F - cw) / 2;
-  const rowTop = 0;
-  const rowBottom = D - sd;
-  const rowSpan = rowBottom - rowTop;
-  if (rowSpan < 3.0 || uc < 2.6) {
-    warnings.push(`cluster rect ${F.toFixed(1)} × ${D.toFixed(1)} m is too small for ${beds.length} en-suite rooms; falling back to the standard plan`);
-    return planStandard(F, D, insts, o);
-  }
-
-  // corridor + entry down the middle
-  cells.push({ type: 'entry', rect: { x: uc, y: 0, w: cw, h: entryD }, n: 1, prog: entryInst?.prog });
-  cells.push({ type: 'corridor', rect: { x: uc, y: entryD, w: cw, h: rowBottom - entryD }, n: 1, tag: 'hall', prog: corridorInst?.prog });
-
-  // bedroom rows either side, each row = bedroom + (en-suite over closet)
-  const perSide = [Math.ceil(beds.length / 2), Math.floor(beds.length / 2)];
-  const sides: { u0: number; w: number; wetDir: LDir; ensuiteAtHigh: boolean }[] = [
-    { u0: 0, w: uc, wetDir: 'u+', ensuiteAtHigh: true },
-    { u0: uc + cw, w: F - uc - cw, wetDir: 'u-', ensuiteAtHigh: false },
-  ];
-  let bi = 0;
-  let extraIdx = 0;
-  const extras: (Inst | undefined)[] = [laundryInst, storeInst];
-  for (let s = 0; s < 2; s++) {
-    const side = sides[s];
-    const rows = Math.max(1, perSide[s]);
-    const rowH = rowSpan / rows;
-    for (let r = 0; r < rows; r++) {
-      const bed = beds[bi];
-      const ens = ensuites[bi];
-      bi++;
-      const y = rowTop + r * rowH;
-      const ew = clamp((ens?.prog.targetArea ?? 3.9) / Math.min(rowH, 2.6), 1.5, Math.max(1.5, side.w * 0.42));
-      const bedW = side.w - ew;
-      const bedX = side.ensuiteAtHigh ? side.u0 : side.u0 + ew;
-      const ensX = side.ensuiteAtHigh ? side.u0 + bedW : side.u0;
-      if (bed) {
-        cells.push({ type: 'bedroom', rect: { x: bedX, y, w: bedW, h: rowH }, n: bed.n, prog: bed.prog });
-      } else {
-        cells.push({ type: 'storage', rect: { x: bedX, y, w: bedW, h: rowH }, n: 20 + r, tag: 'filler' });
-      }
-      const ensH = clamp((ens?.prog.targetArea ?? 3.9) / ew, 2.0, rowH);
-      cells.push({
-        type: 'ensuite', rect: { x: ensX, y, w: ew, h: ensH }, n: ens?.n ?? bi, prog: ens?.prog,
-        wetEdge: side.wetDir, prefParent: 'bedroom',
-      });
-      if (rowH - ensH > 0.8) {
-        const extra = extras[extraIdx];
-        if (extra) extraIdx++;
-        cells.push({
-          type: extra?.type ?? 'closet', rect: { x: ensX, y: y + ensH, w: ew, h: rowH - ensH },
-          n: extra?.n ?? bi, prog: extra?.prog, tag: extra ? undefined : 'filler',
-          wetEdge: extra && WET_TYPES.has(extra.type) ? side.wetDir : undefined,
-        });
-      } else if (rowH - ensH > E) {
-        cells[cells.length - 1].rect.h = rowH;
-      }
-    }
-  }
-
-  // shared kitchen + living across the daylit end
-  const kw = sharedKitchen ? clamp(sharedKitchen.prog.targetArea / sd, sharedKitchen.prog.minWidth, F * 0.5) : 0;
-  if (sharedKitchen) {
-    cells.push({ type: 'shared-kitchen', rect: { x: 0, y: rowBottom, w: kw, h: sd }, n: 1, prog: sharedKitchen.prog, wetEdge: 'v-' });
-  }
-  cells.push({
-    type: 'shared-living', rect: { x: kw, y: rowBottom, w: F - kw, h: sd }, n: 1,
-    prog: sharedLiving?.prog,
-  });
-  return { cells, frontDepth: 0, hallDepth: cw };
-}
 
 // --- dual-key ---------------------------------------------------------------
 
-function planDualKey(F: number, D: number, insts: Inst[], o: PlanOpts): PlanResult {
-  const warnings = o.warnings;
-  const studioLiving = insts.find(i => i.type === 'living-kitchen');
-  const studioBath = insts.filter(i => i.type === 'ensuite').pop();
-  if (!studioLiving || !studioBath) {
-    warnings.push('dual-key template needs a living-kitchen and an en-suite for the lock-off studio');
-    return planStandard(F, D, insts, o);
-  }
-  const rest = insts.filter(i => i !== studioLiving && i !== studioBath);
-  const studioArea = studioLiving.prog.targetArea + studioBath.prog.targetArea + 3.4;
-  const Sw = clamp(studioArea / D, 3.0, Math.max(3.0, Math.min(4.8, F * 0.4)));
-  const Fd = clamp(studioBath.prog.targetArea / clamp(Sw * 0.5, 1.5, 2.1), 2.2, 2.8);
-  const bw = clamp(studioBath.prog.targetArea / Fd, 1.5, Math.max(1.5, Sw - 1.1));
-  const cells: Cell[] = [
-    { type: 'ensuite', rect: { x: 0, y: 0, w: bw, h: Fd }, n: studioBath.n, prog: studioBath.prog, wetEdge: 'v+', sub: 'studio' },
-    { type: 'hall', rect: { x: bw, y: 0, w: Sw - bw, h: Fd }, n: 2, tag: 'hall', sub: 'studio' },
-    { type: 'living-kitchen', rect: { x: 0, y: Fd, w: Sw, h: D - Fd }, n: studioLiving.n, prog: studioLiving.prog, wetEdge: 'v-', sub: 'studio' },
-  ];
-  const region: Rect = { x: Sw, y: 0, w: F - Sw, h: D };
-  const main = planRegion(region, rest, o, true);
-  for (const c of main.cells) c.sub = 'main';
-  return { cells: [...cells, ...main.cells], frontDepth: main.frontDepth, hallDepth: main.hallDepth };
-}
 
 // ============================================================================
 // Opening allocation (no two openings overlap on one wall)
@@ -1342,7 +373,7 @@ function makeOpeningTracker(): {
 // Room / wall / door records
 // ============================================================================
 
-interface RoomRec {
+export interface RoomRec {
   id: string;
   cell: Cell;
   local: Rect;
@@ -1352,7 +383,7 @@ interface RoomRec {
   outside: boolean;
 }
 
-interface Adj {
+export interface Adj {
   a: number;
   b: number;
   /** 'u' = the shared edge runs along u (constant v); 'v' = runs along v (constant u) */
@@ -1372,7 +403,27 @@ function facingOf(v: Vec2): number {
 // layoutUnit
 // ============================================================================
 
-export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => {
+/**
+ * v2 seam: the planning half of the engine. `program/solver.ts` supplies one of these so the
+ * realisation below (walls, doors, windows, furniture, patterns) is shared by the v1 template engine
+ * and the v2 program solver, and the two can be A/B-tested through `setArchitectureDeps`.
+ */
+export interface PlanProvider {
+  /** the plan cells in the local (u, v) frame — must tile the rect */
+  plan(a: { req: UnitLayoutRequest; F: number; D: number; opts: PlanOpts }): PlanResult;
+  /**
+   * Which room pairs get a door, as a spanning tree over the realised rooms. `null` falls back to the
+   * v1 shortest-circulation tree. The v2 provider seeds it from the program graph's required edges.
+   */
+  doors?(a: { rooms: RoomRec[]; adjs: Adj[]; accessible: boolean; F: number; D: number }):
+  { root: number; parent: (TreeLink | undefined)[] } | null;
+  /** how many drainage stacks the program allows (XD-01); the port pass collapses toward it */
+  maxStacks?: number;
+}
+
+
+
+export function layoutUnitWithPlan(req: UnitLayoutRequest, provider: PlanProvider): UnitLayout {
   const warnings: string[] = [];
   const t = req.template;
   const ids = new IdFactory('architecture');
@@ -1392,11 +443,9 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
     warnings.push(`wetWallSide '${req.wetWallSide}' differs from accessSide '${req.accessSide}'; the wet band is kept on the access side so stacks stay by the corridor (ARC-14)`);
   }
 
-  // --- program + plan --------------------------------------------------------
-  const insts = programForLevel(t, req.level, req.levelsTotal, warnings);
-  if (insts.length === 0) {
-    warnings.push(`no rooms assigned to level ${req.level} of template ${t.id}`);
-  }
+  // --- plan ------------------------------------------------------------------
+  // Which rooms belong to this level is the PROGRAM's answer now (`program/programs.ts` gives every
+  // node a level), so the realisation no longer resolves a room list of its own.
   const southern = req.region === 'AU' || req.region === 'NZ';
   const solarOf = (ls: Side): number => {
     const c = req.exposures[frame.side(ls)];
@@ -1420,42 +469,23 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
     warnings,
     dropped: [],
   };
-  if (opts.flipV) {
-    warnings.push('unit is single-aspect toward the access side: daylit rooms placed on the access side with the service band at the back');
-  }
-  const wantsThrough = t.id !== 'coliving-cluster' && t.id !== 'dual-key'
-    && !insts.some(i => i.type === 'stair' || i.type === 'garage')
-    && useThroughPlan(F, D, insts, opts);
-  let plan: PlanResult;
-  if (t.id === 'coliving-cluster') plan = planCluster(F, D, insts, opts);
-  else if (t.id === 'dual-key') plan = planDualKey(F, D, insts, opts);
-  else if (wantsThrough) plan = planThrough(F, D, insts, opts);
-  else plan = planStandard(F, D, insts, opts);
+  const plan: PlanResult = provider.plan({ req, F, D, opts });
 
   // --- plumbing stack position (XD-01) --------------------------------------
-  // The slot rect is identical on every storey, so the wet cluster lands on the same local
-  // coordinate on every floor and the stacks line up whatever `stackAlong` asks for. Only warn
-  // when the wet cluster could have covered the requested coordinate and did not.
-  const stackAtU = wetStackU(plan, opts.stackU);
-  // A room parked at the end of the band for its window, or a coordinate that lands outside the
-  // wet band altogether, is a deliberate choice rather than a failure — the stacks still line up.
-  const stackBlocker = opts.stackBlockedBy;
-  if (opts.stackU !== undefined && plan.kind !== 'through' && opts.stackHit === false && plan.frontDepth > 0
-    && stackBlocker !== undefined && !BACK_TYPES.has(stackBlocker)) {
-    const baths = plan.cells.filter(c => BATH_TYPES.has(c.type));
-    if (baths.length > 0) {
-      warnings.push(`requested stack position u=${opts.stackU.toFixed(2)} m sits in the ${stackBlocker} and no order of the wet band covers it; the stack is placed at u=${stackAtU.toFixed(2)} m instead`);
-    }
-  }
+  // An OUTPUT, not an input: identical modules produce identical local plans, so the wet cluster lands
+  // on the same local coordinate on every floor and the stacks line up without anyone imposing one.
+  // (`unitPorts` derives the real stations from the fixtures; this is the pattern trace's headline.)
+  const bathCells = plan.cells.filter(c => BATH_TYPES.has(c.type));
+  const stackAtU = round(bathCells.length > 0
+    ? bathCells[0].rect.x + bathCells[0].rect.w / 2
+    : plan.wetSpan
+      ? (plan.wetSpan.lo + plan.wetSpan.hi) / 2
+      : 0, 3);
 
-  // --- rooms merged into furniture instead of being planned (ARC-27/ARC-30) --
-  const mergedRooms = opts.dropped.filter(x => SILENT_DROP.has(x));
-  const lostRooms = opts.dropped.filter(x => !SILENT_DROP.has(x));
-  if (lostRooms.length > 0) {
-    const tally = new Map<RoomType, number>();
-    for (const x of lostRooms) tally.set(x, (tally.get(x) ?? 0) + 1);
-    warnings.push(`no room for ${[...tally].map(([k, n]) => (n > 1 ? `${n} × ${k}` : k)).join(', ')} in a ${round(F, 2)} × ${round(D, 2)} m rect (${round(F * D, 1)} m² against a ${t.area.min} m² minimum for ${t.id})`);
-  }
+  // --- rooms provided as furniture instead of as rooms (ARC-27/ARC-30) ------
+  // The program declares the alternative (`mergeInto`), the solver records which ones it applied, and
+  // the pattern trace reports them; nothing is silently dropped, so nothing is warned about.
+  const mergedRooms = opts.dropped;
 
   // --- rooms -----------------------------------------------------------------
   const rooms: RoomRec[] = [];
@@ -1495,6 +525,9 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
       furnitureIds: [],
       occupancy: occupancyOf(cell, t.occupants),
       zone: cell.prog?.zone ?? zoneOf(cell.type),
+      // v2 program-node ref ('bedroom2'), scoped to this unit and level; door refs and stack-port
+      // `serves` are built from it, so it must be derived from the plan alone (never from an id counter)
+      ref: cell.ref ?? `${cell.type}${n}`,
     };
     return { id, cell, local: cell.rect, world, def, wet, outside };
   }
@@ -1607,6 +640,30 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
   const doors: DoorDef[] = [];
   const tracker = makeOpeningTracker();
   const swings = new Map<string, Rect[]>(); // roomId → local door-swing rects
+  /** stable program ref of a room ('kitchen1'), for door refs and stack-port `serves` */
+  const refOf = (r: RoomRec): string => r.def.ref ?? r.cell.type;
+  /**
+   * Reserve the leaf's motion volume inside the room it sweeps into, straight from the stored fields — the
+   * v1 code derived the same square from a local `dirIn` it then threw away (the door-arc bug).
+   */
+  const reserveSwing = (d: DoorDef, wall: { start: Vec2; end: Vec2 }, room: RoomRec): void => {
+    const sw = swingRect(d, wall);
+    if (!sw) return;
+    const list = swings.get(room.id) ?? [];
+    list.push(frame.toLocalRect(sw));
+    swings.set(room.id, list);
+  };
+  /** Centre of the room's wet-wall fixture run in world XY — the hinge goes on the end of the opening farther from it */
+  const fixtureRunCentre = (r: RoomRec): Vec2 | null => {
+    const e = r.cell.wetEdge;
+    if (!e || !r.wet) return null;
+    const l = r.local;
+    const p: Vec2 = e === 'v+' ? [l.x + l.w / 2, l.y + l.h]
+      : e === 'v-' ? [l.x + l.w / 2, l.y]
+      : e === 'u+' ? [l.x + l.w, l.y + l.h / 2]
+      : [l.x, l.y + l.h / 2];
+    return frame.toWorld(p[0], p[1]);
+  };
 
   // unit entry door in the access boundary wall
   let entryDoorId = '';
@@ -1625,13 +682,18 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
       warnings.push(`unit entry door does not fit in the ${req.accessSide} boundary wall span (${(hi - lo).toFixed(2)} m)`);
     } else {
       entryDoorId = nid('DOOR');
-      doors.push({
-        id: entryDoorId, storey: req.storey, wallId: accessWall.id, along, width: w, height: SIZES.doorHeight,
-        type: 'unit-entry', operation: 'SINGLE_SWING_LEFT', toRoomId: entryRoom.id, fireRated: true, unitId: req.unitId,
+      const sol = solveSwing({
+        wall: accessWall, along, width: w, motion: 'swing', into: reachRect(entryRoom.world, accessWall),
       });
+      const entryDoor: DoorDef = {
+        id: entryDoorId, storey: req.storey, wallId: accessWall.id, along, width: w, height: SIZES.doorHeight,
+        type: 'unit-entry', motion: 'swing', hinge: sol.hinge, swing: sol.swing, swingIntoRoomId: entryRoom.id,
+        toRoomId: entryRoom.id, fireRated: true, unitId: req.unitId, ref: 'entry',
+      };
+      doors.push(entryDoor);
       entryRoom.def.doorIds.push(entryDoorId);
       tracker.add(accessWall.id, along, w, 0);
-      addSwing(swings, entryRoom, along, w, 'v+', seg, frame);
+      reserveSwing(entryDoor, accessWall, entryRoom);
     }
   } else if (req.level === 0 && !accessWall) {
     warnings.push(`no boundary wall on the access side '${req.accessSide}'; entry door omitted`);
@@ -1649,9 +711,14 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
     const along = tracker.reserve(accessWall.id, lo, hi, w, (lo + hi) / 2, 0.1);
     if (along !== null) {
       const id = nid('DOOR');
+      // a rolling shutter has no leaf on the floor: motion 'rolling' ⇒ swing 'none', no arc, no keep-out
+      const sol = solveSwing({
+        wall: accessWall, along, width: w, motion: 'rolling', into: reachRect(garageRoom.world, accessWall),
+      });
       doors.push({
         id, storey: req.storey, wallId: accessWall.id, along, width: w, height: 2.1,
-        type: 'garage', operation: 'ROLLINGUP', toRoomId: garageRoom.id, unitId: req.unitId,
+        type: 'garage', motion: 'rolling', hinge: sol.hinge, swing: sol.swing,
+        toRoomId: garageRoom.id, unitId: req.unitId, ref: 'garage',
       });
       garageRoom.def.doorIds.push(id);
       tracker.add(accessWall.id, along, w, 0);
@@ -1678,9 +745,14 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
       const along = tracker.reserve(bw2.id, lo, hi, w, bc, 0.12);
       if (along !== null) {
         const id = nid('DOOR');
+        // sliding: `swing` is the side the leaf parks on — inside the room, never over the balcony
+        const sol = solveSwing({
+          wall: bw2, along, width: w, motion: 'sliding', into: reachRect(host.world, bw2),
+        });
         doors.push({
           id, storey: req.storey, wallId: bw2.id, along, width: w, height: SIZES.doorHeight,
-          type: 'balcony', operation: 'DOUBLE_DOOR_SLIDING', fromRoomId: host.id, toRoomId: balconyRec.id, unitId: req.unitId,
+          type: 'balcony', motion: 'sliding', hinge: sol.hinge, swing: sol.swing,
+          fromRoomId: host.id, toRoomId: balconyRec.id, unitId: req.unitId, ref: 'balcony',
         });
         host.def.doorIds.push(id);
         balconyRec.def.doorIds.push(id);
@@ -1692,8 +764,9 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
   }
 
   // interior doors: shortest-circulation spanning tree from the entry
-  const rootIdx = pickRoot(rooms);
-  const parent = spanningTree(rooms, adjs, rootIdx);
+  const tree = provider.doors?.({ rooms, adjs, accessible, F, D }) ?? null;
+  const rootIdx = tree ? tree.root : pickRoot(rooms);
+  const parent = tree ? tree.parent : spanningTree(rooms, adjs, rootIdx);
   for (let i = 0; i < rooms.length; i++) {
     if (i === rootIdx) continue;
     const p = parent[i];
@@ -1715,8 +788,9 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
     const wallLen = Math.hypot(wall.end[0] - wall.start[0], wall.end[1] - wall.start[1]);
     const centre = (adj.s1 + adj.s0) / 2;
     const prefer = projectOnSegment(seg, adj.axis === 'v' ? frame.toWorld(adj.coord, centre) : frame.toWorld(centre, adj.coord)).along;
-    const width = Math.min(spec.width, Math.max(0.6, wallLen - 0.15));
-    const margin = Math.min(0.15, Math.max(0, (wallLen - width) / 2));
+    const reveal = doorReveal(wallLen) / 2;
+    const width = Math.min(spec.width, Math.max(0.6, wallLen - doorReveal(wallLen)));
+    const margin = Math.min(reveal, Math.max(0, (wallLen - width) / 2));
     // a cupboard front may be any width; a door to a room may not drop below a usable leaf
     if (width < 0.7 && spec.type === 'interior' && spec.leaf) {
       warnings.push(`${to.def.name}: door narrowed to ${width.toFixed(2)} m — below the 0.75 m minimum leaf`);
@@ -1724,19 +798,25 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
     const along = tracker.reserve(wallId, 0, wallLen, width, prefer, margin);
     if (along === null) { warnings.push(`no clear position for the ${to.def.name} door on wall ${wallId} (${wallLen.toFixed(2)} m)`); continue; }
     const id = nid('DOOR');
-    doors.push({
-      id, storey: req.storey, wallId, along, width: round(width, 3), height: SIZES.doorHeight,
-      type: spec.type, operation: spec.operation, fromRoomId: from.id, toRoomId: to.id, unitId: req.unitId,
+    // The leaf sweeps into the room it serves, except out of a room too tight to keep it clear of the
+    // fixtures (< 4.6 m² or min dim < 1.55 m) and out of every room in an accessible unit (ADA 2010 §603.2.3).
+    const swingOut = spec.leaf && (accessible || isTight(to)) && !isTight(from);
+    const into = spec.leaf ? (swingOut ? from : to) : to;
+    const sol = solveSwing({
+      wall, along, width, motion: spec.motion,
+      into: reachRect(into.world, wall),
+      avoid: fixtureRunCentre(into),
     });
+    const d: DoorDef = {
+      id, storey: req.storey, wallId, along, width: round(width, 3), height: SIZES.doorHeight,
+      type: spec.type, motion: spec.motion, hinge: sol.hinge, swing: sol.swing,
+      ...(spec.leaf ? { swingIntoRoomId: into.id } : {}),
+      fromRoomId: from.id, toRoomId: to.id, unitId: req.unitId, ref: `${refOf(from)}~${refOf(to)}`,
+    };
+    doors.push(d);
     from.def.doorIds.push(id);
     to.def.doorIds.push(id);
-    if (spec.leaf) {
-      // swing into the room being entered
-      const dirIn: LDir = adj.axis === 'v'
-        ? (to.local.x > from.local.x ? 'u+' : 'u-')
-        : (to.local.y > from.local.y ? 'v+' : 'v-');
-      addSwing(swings, to, along, width, dirIn, seg, frame);
-    }
+    if (spec.leaf) reserveSwing(d, wall, into);
   }
 
   // --- windows (ARC-16: one glazing budget per exterior wall) ----------------
@@ -1940,6 +1020,21 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
     mergedRooms, stackAtU, stackWantU: opts.stackU,
   });
 
+  // the leaf keep-outs the furniture pass respected, in world XY, so the editor and the per-unit
+  // validator can check "no fixture inside a swing" without re-deriving anything
+  const swingOut: { doorId: string; roomId: string; rect: Rect }[] = [];
+  for (const d of doors) {
+    if (!d.swingIntoRoomId) continue;
+    const host = walls.find(w => w.id === d.wallId)
+      ?? (['front', 'rear', 'left', 'right'] as Side[]).map(s => req.boundaryWalls[s]).find(w => w && w.id === d.wallId);
+    if (!host) continue;
+    const sw = swingRect(d, host);
+    if (sw) swingOut.push({ doorId: d.id, roomId: d.swingIntoRoomId, rect: sw });
+  }
+
+  // ports: the outputs plumbing, mechanical and electrical consume instead of rediscovering the unit's geometry
+  const ports = unitPorts({ req, frame, rooms, furniture, walls, wetWallIds, maxStacks: provider.maxStacks ?? 2 });
+
   return {
     rooms: rooms.map(r => r.def),
     walls,
@@ -1952,10 +1047,14 @@ export const layoutUnit: UnitLayoutFn = (req: UnitLayoutRequest): UnitLayout => 
     bathroomRoomIds,
     balconyRoomId,
     stair: stairOut,
+    swings: swingOut,
+    stackPorts: ports.stackPorts,
+    exhaustPorts: ports.exhaustPorts,
+    panelPort: ports.panelPort,
     patterns,
     warnings,
   };
-};
+}
 
 // ============================================================================
 // Helpers used by layoutUnit
@@ -1965,17 +1064,6 @@ function typeTotal(cells: Cell[], type: RoomType): number {
   return cells.filter(c => c.type === type).length;
 }
 
-/** Local u the plumbing stack ends up on: the requested coordinate when a bathroom covers it (XD-01). */
-function wetStackU(plan: PlanResult, requested?: number): number {
-  const baths = plan.cells.filter(c => BATH_TYPES.has(c.type));
-  if (baths.length === 0) return requested ?? 0;
-  const mid = (c: Cell): number => c.rect.x + c.rect.w / 2;
-  if (requested === undefined) return round(mid(baths[0]), 3);
-  const hit = baths.find(c => requested >= c.rect.x - E && requested <= c.rect.x + c.rect.w + E);
-  if (hit) return round(requested, 3);
-  const near = [...baths].sort((a, b) => Math.abs(mid(a) - requested) - Math.abs(mid(b) - requested))[0];
-  return round(mid(near), 3);
-}
 
 function roomName(type: RoomType, n: number, region: Region, total: number): string {
   const label = ROOM_LABELS_REGION[region]?.[type] ?? ROOM_LABELS[type] ?? type;
@@ -2051,7 +1139,7 @@ function rankBalcony(r: RoomRec): number {
   return t === 'living' || t === 'living-kitchen' || t === 'shared-living' ? 0 : t === 'dining' ? 1 : 2;
 }
 
-interface TreeLink { idx: number; adj: Adj }
+export interface TreeLink { idx: number; adj: Adj }
 
 function pickRoot(rooms: RoomRec[]): number {
   const order: RoomType[] = ['entry', 'hall', 'stair', 'corridor', 'living-kitchen', 'living', 'shared-living'];
@@ -2117,68 +1205,41 @@ function spanningTree(rooms: RoomRec[], adjs: Adj[], root: number): (TreeLink | 
   return parent;
 }
 
-function doorSpec(from: RoomRec, to: RoomRec, accessible: boolean, interiorW: number, bathW: number, span: number): { width: number; type: DoorDef['type']; operation: string; leaf: boolean } {
+/** A room too small to keep a swing leaf clear of its fixtures: ARC-28 / ADA 2010 §603.2.3 */
+function isTight(r: RoomRec): boolean {
+  return r.local.w * r.local.h < 4.6 || Math.min(r.local.w, r.local.h) < 1.55;
+}
+
+function doorSpec(from: RoomRec, to: RoomRec, accessible: boolean, interiorW: number, bathW: number, span: number): { width: number; type: DoorDef['type']; motion: DoorMotion; leaf: boolean } {
   const ta = from.cell.type;
   const tb = to.cell.type;
-  const cap = Math.max(0.6, span - 0.3);
+  const cap = Math.max(0.6, span - doorReveal(span));
   if (tb === 'closet' || tb === 'walk-in-closet' || ta === 'closet' || ta === 'walk-in-closet') {
-    return { width: Math.min(accessible ? 0.85 : 0.7, cap), type: 'closet', operation: 'SLIDING_TO_LEFT', leaf: false };
+    return { width: Math.min(accessible ? 0.85 : 0.7, cap), type: 'closet', motion: 'sliding', leaf: false };
   }
-  const cupboard = (r: RoomRec): boolean => (r.cell.type === 'laundry' || r.cell.type === 'utility' || r.cell.type === 'storage') && r.local.w * r.local.h < 3.2;
+  // a store, laundry or utility that is either tiny or reached through an edge too short for a walk-through leaf
+  // is a CUPBOARD: it gets a bifold front (no arc, no keep-out) rather than an undersized swing door
+  const store = (r: RoomRec): boolean => r.cell.type === 'laundry' || r.cell.type === 'utility' || r.cell.type === 'storage';
+  const cupboard = (r: RoomRec): boolean => store(r) && (r.local.w * r.local.h < 3.2 || cap < LEAF_MIN.interior);
   if (cupboard(to) || cupboard(from)) {
-    return { width: Math.min(accessible ? 0.85 : 0.75, cap), type: 'service', operation: 'DOUBLE_DOOR_FOLDING', leaf: false };
+    return { width: Math.min(accessible ? 0.85 : 0.75, cap), type: 'service', motion: 'folding', leaf: false };
   }
   if (BATH_TYPES.has(tb) || BATH_TYPES.has(ta)) {
     const wet = BATH_TYPES.has(tb) ? to : from;
     // a swing leaf cannot be kept clear of the fixtures in a shower room under 4.6 m² (ARC-28),
     // and ADA 2010 §603.2.3 forbids a door swinging into the clear floor space at any fixture,
     // so an accessible bathroom always gets a sliding leaf
-    const tight = accessible || wet.local.w * wet.local.h < 4.6 || Math.min(wet.local.w, wet.local.h) < 1.55;
-    return tight
-      ? { width: Math.min(bathW, cap), type: 'interior', operation: 'SLIDING_TO_LEFT', leaf: false }
-      : { width: Math.min(bathW, cap), type: 'interior', operation: 'SINGLE_SWING_LEFT', leaf: true };
+    const tight = accessible || isTight(wet);
+    return { width: Math.min(bathW, cap), type: 'interior', motion: tight ? 'sliding' : 'swing', leaf: !tight };
   }
   if (tb === 'garage' || ta === 'garage') {
-    return { width: Math.min(0.85, cap), type: 'service', operation: 'SINGLE_SWING_RIGHT', leaf: true };
+    return { width: Math.min(0.85, cap), type: 'service', motion: 'swing', leaf: true };
   }
   if (OPEN_PLAN.has(ta) && OPEN_PLAN.has(tb)) {
-    return { width: clamp(cap, 0.9, accessible ? 1.5 : 1.4), type: 'interior', operation: 'NOTDEFINED', leaf: false };
+    // cased opening: no leaf at all, so no arc and no keep-out
+    return { width: clamp(cap, 0.9, accessible ? 1.5 : 1.4), type: 'interior', motion: 'opening', leaf: false };
   }
-  return { width: Math.min(interiorW, cap), type: 'interior', operation: 'SINGLE_SWING_LEFT', leaf: true };
-}
-
-function addSwing(map: Map<string, Rect[]>, room: RoomRec, along: number, width: number, into: LDir, seg: { a: Vec2; b: Vec2 }, frame: Frame): void {
-  // the swing square sits inside `room`, centred on the door, `width` deep (ARC-28)
-  const list = map.get(room.id) ?? [];
-  const c = pointAlong(seg, along);
-  // convert the world door centre back to local by projecting onto the room's local box
-  const lc = worldToLocalApprox(c, frame, room);
-  let r: Rect;
-  switch (into) {
-    case 'v+': r = { x: lc[0] - width / 2, y: room.local.y, w: width, h: width }; break;
-    case 'v-': r = { x: lc[0] - width / 2, y: room.local.y + room.local.h - width, w: width, h: width }; break;
-    case 'u+': r = { x: room.local.x, y: lc[1] - width / 2, w: width, h: width }; break;
-    default: r = { x: room.local.x + room.local.w - width, y: lc[1] - width / 2, w: width, h: width };
-  }
-  list.push(r);
-  map.set(room.id, list);
-}
-
-function pointAlong(seg: { a: Vec2; b: Vec2 }, along: number): Vec2 {
-  const dx = seg.b[0] - seg.a[0];
-  const dy = seg.b[1] - seg.a[1];
-  const l = Math.hypot(dx, dy) || 1;
-  return [seg.a[0] + (dx / l) * along, seg.a[1] + (dy / l) * along];
-}
-
-/** world point → local (u, v) using the frame's inverse (rotation only) */
-function worldToLocalApprox(p: Vec2, frame: Frame, room: RoomRec): Vec2 {
-  const o = frame.toWorld(0, 0);
-  const du = frame.dir('u+');
-  const dv = frame.dir('v+');
-  const u = (p[0] - o[0]) * du[0] + (p[1] - o[1]) * du[1];
-  const v = (p[0] - o[0]) * dv[0] + (p[1] - o[1]) * dv[1];
-  return [clamp(u, room.local.x, room.local.x + room.local.w), clamp(v, room.local.y, room.local.y + room.local.h)];
+  return { width: Math.min(interiorW, cap), type: 'interior', motion: 'swing', leaf: true };
 }
 
 // ============================================================================
@@ -2194,6 +1255,8 @@ interface FurnishCtx {
   warnings: string[];
   detail: 'low' | 'medium' | 'high';
   occupants: number;
+  /** rule set for the kit clearances, when one is resolved (principle 5) */
+  rules?: KitRules;
 }
 
 interface FurnishResult { items: FurnitureDef[]; triangle: number; storage: number }
@@ -2243,15 +1306,6 @@ function furnishRoom(room: RoomRec, ctx: FurnishCtx): FurnishResult {
     return f;
   };
 
-  const probe = (aabb: Rect): boolean => {
-    const box: Rect = { x: round(aabb.x, 4), y: round(aabb.y, 4), w: round(aabb.w, 4), h: round(aabb.h, 4) };
-    if (box.w < 0.03 || box.h < 0.03) return false;
-    if (!rectContainsRect(inner, box, 1e-3)) return false;
-    if (taken.some(x => rectsOverlap(x, box, 1e-3))) return false;
-    if (ctx.swings.some(x => rectsOverlap(x, box, 1e-3))) return false;
-    return true;
-  };
-
   const t = room.cell.type;
   const wetEdge = room.cell.wetEdge;
   switch (t) {
@@ -2279,7 +1333,7 @@ function furnishRoom(room: RoomRec, ctx: FurnishCtx): FurnishResult {
     case 'ensuite':
     case 'powder':
     case 'wc':
-      furnishBathroom(room, ctx, place, probe, inner, wetEdge ?? 'v+');
+      furnishBathroom(room, ctx, place, inner, wetEdge ?? 'v+');
       break;
     case 'laundry':
     case 'utility':
@@ -2313,10 +1367,6 @@ function furnishRoom(room: RoomRec, ctx: FurnishCtx): FurnishResult {
 
 type PlaceFn = (type: FurnitureType, aabb: Rect, face: LDir, override?: { w?: number; d?: number }) => FurnitureDef | null;
 
-function insetLocal(r: Rect, d: number): Rect {
-  return { x: r.x + d, y: r.y + d, w: Math.max(0, r.w - 2 * d), h: Math.max(0, r.h - 2 * d) };
-}
-
 /** local sides ranked by how good a back/headboard wall they are (free of doors and windows) */
 function rankedWalls(room: RoomRec, ctx: FurnishCtx, exclude: Side[] = []): Side[] {
   const score: Record<Side, number> = { front: 0, rear: 0, left: 0, right: 0 };
@@ -2344,28 +1394,6 @@ function swingOnSide(room: Rect, sw: Rect, s: Side): boolean {
     case 'left': return Math.abs(sw.x - room.x) < 0.05;
     default: return Math.abs(sw.x + sw.w - (room.x + room.w)) < 0.05;
   }
-}
-
-/** place a footprint against a local side of `inner`, centred at `centre` along that side */
-function againstSide(inner: Rect, s: Side, w: number, d: number, centre: number): { aabb: Rect; face: LDir } {
-  switch (s) {
-    case 'front': return { aabb: { x: centre - w / 2, y: inner.y, w, h: d }, face: 'v+' };
-    case 'rear': return { aabb: { x: centre - w / 2, y: inner.y + inner.h - d, w, h: d }, face: 'v-' };
-    case 'left': return { aabb: { x: inner.x, y: centre - w / 2, w: d, h: w }, face: 'u+' };
-    default: return { aabb: { x: inner.x + inner.w - d, y: centre - w / 2, w: d, h: w }, face: 'u-' };
-  }
-}
-
-function sideCentre(inner: Rect, s: Side): number {
-  return s === 'front' || s === 'rear' ? inner.x + inner.w / 2 : inner.y + inner.h / 2;
-}
-
-function sideLength(inner: Rect, s: Side): number {
-  return s === 'front' || s === 'rear' ? inner.w : inner.h;
-}
-
-function oppSide(s: Side): Side {
-  return s === 'front' ? 'rear' : s === 'rear' ? 'front' : s === 'left' ? 'right' : 'left';
 }
 
 function furnishBedroom(room: RoomRec, ctx: FurnishCtx, place: PlaceFn, inner: Rect): void {
@@ -2491,15 +1519,6 @@ function furnishLiving(room: RoomRec, ctx: FurnishCtx, place: PlaceFn, inner: Re
   }
 }
 
-function offsetFrom(inner: Rect, s: Side, off: number, w: number, d: number, centre: number): { aabb: Rect; face: LDir } {
-  switch (s) {
-    case 'front': return { aabb: { x: centre - w / 2, y: inner.y + off, w, h: d }, face: 'v+' };
-    case 'rear': return { aabb: { x: centre - w / 2, y: inner.y + inner.h - off - d, w, h: d }, face: 'v-' };
-    case 'left': return { aabb: { x: inner.x + off, y: centre - w / 2, w: d, h: w }, face: 'u+' };
-    default: return { aabb: { x: inner.x + inner.w - off - d, y: centre - w / 2, w: d, h: w }, face: 'u-' };
-  }
-}
-
 function furnishDining(room: RoomRec, ctx: FurnishCtx, place: PlaceFn, inner: Rect, secondary = false): void {
   const occ = ctx.occupants;
   const type: FurnitureType = occ >= 5 ? 'dining-table-6' : 'dining-table-4';
@@ -2524,229 +1543,96 @@ function furnishDining(room: RoomRec, ctx: FurnishCtx, place: PlaceFn, inner: Re
   }
 }
 
-/** Counter run along the wet wall: fridge, counter, range, counter, sink, dishwasher (ARC-20). */
+/**
+ * Counter run along the wet wall (ARC-20 / NKBA): the kit library lays fridge · counter · range · counter · sink ·
+ * dishwasher, sweeping the run along the wall in 100 mm steps and turning the fridge onto the return leg when a
+ * straight run will not do — the same routine the bathroom uses, which is what stops a kitchen from keeping its
+ * fridge and silently losing the sink and the range to a door swing.
+ */
 function furnishKitchenRun(room: RoomRec, ctx: FurnishCtx, place: PlaceFn, inner: Rect, wetEdge: LDir, big: boolean): number {
-  const side: Side = wetEdge === 'v+' ? 'rear' : wetEdge === 'v-' ? 'front' : wetEdge === 'u+' ? 'right' : 'left';
-  const setback = SIZES.wetWallT / 2;
-  const base = insetLocal(inner, 0);
-  // pull the run off the wet wall centreline by half the wall thickness
-  const runInner: Rect = side === 'rear' ? { ...base, h: base.h - setback }
-    : side === 'front' ? { ...base, y: base.y + setback, h: base.h - setback }
-    : side === 'right' ? { ...base, w: base.w - setback }
-    : { ...base, x: base.x + setback, w: base.w - setback };
-  const along = sideLength(runInner, side);
-  const d = 0.6;
-  const seq: { type: FurnitureType; w: number }[] = [];
-  const fridge = FURNITURE_CATALOG.fridge;
-  const range = FURNITURE_CATALOG.range;
-  const sink = FURNITURE_CATALOG['kitchen-sink'];
-  const dw = FURNITURE_CATALOG.dishwasher;
-  const need = fridge.w + range.w + sink.w + dw.w;
-  let fridgeOnReturn = false;
-  if (along < need + 0.2) {
-    // galley too short for one run: keep sink + range on the wet wall, fridge round the corner (L-run)
-    if (along >= sink.w + range.w + fridge.w) {
-      seq.push({ type: 'fridge', w: fridge.w }, { type: 'range', w: range.w }, { type: 'kitchen-sink', w: sink.w });
-    } else if (along >= sink.w + range.w) {
-      seq.push({ type: 'range', w: range.w }, { type: 'kitchen-sink', w: sink.w });
-      fridgeOnReturn = true;
-    } else if (along >= sink.w) {
-      seq.push({ type: 'kitchen-sink', w: sink.w });
-      fridgeOnReturn = true;
-      ctx.warnings.push(`${room.def.name}: counter run only ${along.toFixed(2)} m — no space for a range on the wet wall`);
-    } else {
-      ctx.warnings.push(`${room.def.name}: counter run only ${along.toFixed(2)} m — kitchen fixtures reduced`);
-    }
-  } else {
-    const spare = along - need;
-    const gap = clamp(spare / 3, 0.15, 0.9);
-    seq.push({ type: 'fridge', w: fridge.w });
-    if (gap > 0.35) seq.push({ type: 'kitchen-counter', w: gap });
-    seq.push({ type: 'range', w: range.w });
-    if (gap > 0.35) seq.push({ type: 'kitchen-counter', w: gap });
-    seq.push({ type: 'kitchen-sink', w: sink.w });
-    seq.push({ type: 'dishwasher', w: dw.w });
-    const tail = along - sum(seq.map(s => s.w));
-    if (tail > 0.35) seq.push({ type: 'kitchen-counter', w: tail });
+  const fit = fitKit({
+    room: room.local,
+    kit: kitchenKitFor(room, ctx, big),
+    swings: ctx.swings,
+    wetEdge,
+    setback: SIZES.wetWallT / 2,
+    opts: {
+      accessible: ctx.accessible, occupants: ctx.occupants, detail: ctx.detail, big,
+      area: room.local.w * room.local.h, rules: ctx.rules,
+    },
+  });
+  const placed = placeKit(fit.items, place);
+  if (fit.missing.length > 0) {
+    ctx.warnings.push(`${room.def.name}: counter run only ${sideLength(insetLocal(room.local, CLEARANCE.wall), sideOfLocalDir(wetEdge)).toFixed(2)} m — no space for the ${fit.missing.join(', ')} on the wet wall`);
   }
-  // lay the sequence out from the low end of the run
-  const start = side === 'front' || side === 'rear' ? runInner.x : runInner.y;
-  let cur = start + Math.max(0, (along - sum(seq.map(s => s.w))) / 2);
-  const spots: Partial<Record<FurnitureType, Vec2>> = {};
-  for (const s of seq) {
-    const p = againstSide(runInner, side, s.w, d, cur + s.w / 2);
-    const f = place(s.type, p.aabb, p.face, { w: s.w, d });
-    if (f) spots[s.type] = [p.aabb.x + p.aabb.w / 2, p.aabb.y + p.aabb.h / 2];
-    cur += s.w;
-  }
-  // fridge on the return leg of an L-shaped run
-  if (fridgeOnReturn) {
-    const lateral: Side[] = side === 'front' || side === 'rear' ? ['left', 'right'] : ['front', 'rear'];
-    for (const ls of lateral) {
-      const len = sideLength(runInner, ls);
-      if (len < fridge.d + 0.1) continue;
-      const c0 = (ls === 'front' || ls === 'rear' ? runInner.x : runInner.y) + fridge.w / 2 + 0.02;
-      const far = (ls === 'front' || ls === 'rear' ? runInner.x + runInner.w : runInner.y + runInner.h) - fridge.w / 2 - 0.02;
-      const cAt = side === 'rear' || side === 'right' ? c0 : far;
-      const p = againstSide(runInner, ls, fridge.w, fridge.d, cAt);
-      if (place('fridge', p.aabb, p.face)) { spots.fridge = [p.aabb.x + p.aabb.w / 2, p.aabb.y + p.aabb.h / 2]; break; }
-    }
-  }
-  // island where the room is deep enough (1.2 m aisle both sides)
-  const across = side === 'front' || side === 'rear' ? runInner.h : runInner.w;
-  const aisle = ctx.accessible ? CLEARANCE.turningCircle : CLEARANCE.kitchenAisle;
-  const island = FURNITURE_CATALOG['kitchen-island'];
-  if (big && across > d + aisle + island.d + 0.8 && along > island.w + 0.6 && ctx.detail !== 'low') {
-    const p = offsetFrom(runInner, side, d + aisle, Math.min(island.w, along - 0.6), island.d, sideCentre(runInner, side));
-    place('kitchen-island', p.aabb, p.face, { w: Math.min(island.w, along - 0.6), d: island.d });
-  }
-  // work triangle: sink → range → fridge (straight-line legs, ARC-20)
-  const legs: number[] = [];
-  const sk = spots['kitchen-sink'];
-  const rg = spots.range;
-  const fr = spots.fridge;
-  const leg = (a?: Vec2, b?: Vec2): void => { if (a && b) legs.push(Math.hypot(a[0] - b[0], a[1] - b[1])); };
-  leg(sk, rg);
-  leg(rg, fr);
-  leg(fr, sk);
-  const triangle = legs.length === 3 ? sum(legs) : 0;
-  if (triangle > 0 && (triangle < 2.6 || triangle > 8.2)) {
+  const triangle = triangleOf(placed);
+  if (triangle > 0 && (triangle < TRIANGLE_MIN - 1.0 || triangle > TRIANGLE_MAX + 0.2)) {
     ctx.warnings.push(`${room.def.name}: work triangle ${triangle.toFixed(2)} m is outside the 4–8 m guideline (ARC-20)`);
   }
   return triangle;
 }
 
-/** Candidate start offsets for a fixture run along a wall: centred first, then a 100 mm sweep. */
-function offsets(spare: number): number[] {
-  if (spare <= 0.02) return [Math.max(0, spare / 2)];
-  const out = [spare / 2, 0.02];
-  for (let x = 0.1; x < spare; x += 0.1) out.push(x);
-  out.push(Math.max(0.02, spare - 0.02));
+/** Which kitchen kit a room gets: accessible first, then the shared and open-plan variants (design §3.6). */
+function kitchenKitFor(room: RoomRec, ctx: FurnishCtx, big: boolean): KitId {
+  if (ctx.accessible) return 'kitchen-accessible';
+  if (room.cell.type === 'shared-kitchen') return 'shared-kitchen';
+  if (room.cell.type === 'living-kitchen') return 'living-kitchen';
+  const inner = insetLocal(room.local, CLEARANCE.wall);
+  const across = Math.min(inner.w, inner.h);
+  return big && across >= KIT['kitchen-island'].min.d ? 'kitchen-island' : 'kitchen-galley';
+}
+
+/** local direction → the local side it names (kits.ts owns the mapping) */
+function sideOfLocalDir(d: LDir): Side {
+  return d === 'v+' ? 'rear' : d === 'v-' ? 'front' : d === 'u+' ? 'right' : 'left';
+}
+
+/** Commit a kit fit through the room's `place` callback (which mints ids and maps to world coordinates). */
+function placeKit(items: readonly Placement[], place: PlaceFn): Placement[] {
+  const out: Placement[] = [];
+  for (const it of items) {
+    if (place(it.type, it.aabb, it.face, { w: it.w, d: it.d })) out.push(it);
+  }
   return out;
 }
 
-function furnishBathroom(room: RoomRec, ctx: FurnishCtx, place: PlaceFn, probe: (r: Rect) => boolean, inner: Rect, wetEdge: LDir): void {
-  const wetSide: Side = wetEdge === 'v+' ? 'rear' : wetEdge === 'v-' ? 'front' : wetEdge === 'u+' ? 'right' : 'left';
-  const setback = SIZES.wetWallT / 2;
-  const type = room.cell.type;
-  const area = room.local.w * room.local.h;
-  const wc = FURNITURE_CATALOG.wc;
-  const lav = FURNITURE_CATALOG.lavatory;
-  const van = FURNITURE_CATALOG.vanity;
-  const sh = FURNITURE_CATALOG.shower;
-  const tub = FURNITURE_CATALOG.bathtub;
-
-  /** the run wall, pulled back by half the wet wall so no fixture sits inside the wall */
-  const baseFor = (side: Side): Rect => (side === 'rear' ? { ...inner, h: inner.h - setback }
-    : side === 'front' ? { ...inner, y: inner.y + setback, h: inner.h - setback }
-    : side === 'right' ? { ...inner, w: inner.w - setback }
-    : { ...inner, x: inner.x + setback, w: inner.w - setback });
-
-  interface Fix { type: FurnitureType; w: number; d: number }
-  const fixturesFor = (along: number): Fix[] => {
-    const out: Fix[] = [];
-    if (type === 'powder' || type === 'wc') {
-      out.push({ type: 'wc', w: wc.w, d: wc.d }, { type: 'lavatory', w: lav.w, d: lav.d });
-      return out;
-    }
-    if (ctx.accessible) {
-      // ADA 2010 §604/§608: 0.45 m to the WC centreline, roll-in shower 1.5 × 0.9
-      out.push({ type: 'wc', w: 0.45, d: wc.d }, { type: 'vanity', w: van.w, d: van.d }, { type: 'shower', w: 1.5, d: 0.9 });
-      return out;
-    }
-    out.push({ type: 'wc', w: wc.w, d: wc.d });
-    out.push(along > 2.4 || area > 5 ? { type: 'vanity', w: van.w, d: van.d } : { type: 'lavatory', w: lav.w, d: lav.d });
-    const rest = along - sum(out.map(i => i.w)) - 0.1;
-    if (rest >= tub.w && area >= 5.4 && type !== 'ensuite') out.push({ type: 'bathtub', w: tub.w, d: tub.d });
-    else if (rest >= sh.w) out.push({ type: 'shower', w: sh.w, d: sh.d });
-    return out;
-  };
-
-  const runFrom = (base: Rect, side: Side, items: Fix[], off: number): Rect[] => {
-    const start = side === 'front' || side === 'rear' ? base.x : base.y;
-    const out: Rect[] = [];
-    let c = start + off;
-    for (const it of items) {
-      out.push(againstSide(base, side, it.w, it.d, c + it.w / 2).aabb);
-      c += it.w;
-    }
-    return out;
-  };
-
-  // Choose the wall for the fixture run: the wet wall first (one stack, ARC-14/21), then the wall
-  // opposite it, then the lateral walls — whichever keeps every fixture clear of the door swing.
-  // A lateral run still corners into the wet wall, so it keeps the branch short; the wall opposite
-  // the wet wall is the last resort.
-  const lateral: Side[] = wetSide === 'front' || wetSide === 'rear' ? ['left', 'right'] : ['front', 'rear'];
-  const candidates: Side[] = [wetSide, ...lateral, oppSide(wetSide)];
-  for (const side of candidates) {
-    // always measured on the wet-wall-setback rect so nothing lands inside the 0.2 m wall
-    const base = baseFor(wetSide);
-    const along = sideLength(base, side);
-    const items = fixturesFor(along);
-    const run = sum(items.map(i => i.w));
-    if (run > along + 1e-6) continue;
-    const spare = along - run;
-    // walk the run along the wall in 100 mm steps: in a small room the only clear stretch is the
-    // one past the door swing, and the centred position is never it (ARC-28)
-    for (const off of offsets(spare)) {
-      const boxes = runFrom(base, side, items, off);
-      if (!boxes.every(b => probe(b))) continue;
-      items.forEach((it, k) => {
-        const face: LDir = side === 'front' ? 'v+' : side === 'rear' ? 'v-' : side === 'left' ? 'u+' : 'u-';
-        place(it.type, boxes[k], face, { w: it.w, d: it.d });
-      });
-      if (side === oppSide(wetSide)) {
-        ctx.warnings.push(`${room.def.name}: fixtures run on the wall opposite the wet wall because the door swing covers it — branch length ${(sideLength(base, side) > 0 ? Math.min(room.local.w, room.local.h) : 0).toFixed(2)} m (XD-01 allows 3 m)`);
-      }
-      furnishGrabRails(room, ctx, place, baseFor(wetSide), wetSide);
-      return;
-    }
-  }
-
-  // Nothing fits in one run: keep the WC and basin on the wet wall and turn the shower/tub
-  // onto a lateral wall (two-wall bathroom).
-  const base = baseFor(wetSide);
-  const along = sideLength(base, wetSide);
-  const items = fixturesFor(along);
-  const last = items[items.length - 1];
-  if (items.length > 2 && (last.type === 'shower' || last.type === 'bathtub')) {
-    for (const ls of lateral) {
-      if (sideLength(base, ls) < last.w + 0.1) continue;
-      const c0 = (ls === 'front' || ls === 'rear' ? base.x : base.y) + last.w / 2;
-      const far = (ls === 'front' || ls === 'rear' ? base.x + base.w : base.y + base.h) - last.w / 2;
-      let done = false;
-      for (const cAt of wetSide === 'rear' || wetSide === 'right' ? [c0, c0 + 0.1, far, far - 0.1] : [far, far - 0.1, c0, c0 + 0.1]) {
-        const p = againstSide(base, ls, last.w, last.d, cAt);
-        if (place(last.type, p.aabb, p.face, { w: last.w, d: last.d })) { items.pop(); done = true; break; }
-      }
-      if (done) break;
-    }
-  }
-  while (items.length > 1 && sum(items.map(i => i.w)) > along) items.pop();
-  // the shorter run (WC + basin) now only needs a clear stretch on ANY wall of the room
-  for (const side of candidates) {
-    const alongS = sideLength(base, side);
-    const runS = sum(items.map(i => i.w));
-    if (runS > alongS + 1e-6) continue;
-    for (const off of offsets(alongS - runS)) {
-      const boxes2 = runFrom(base, side, items, off);
-      if (!boxes2.every(b => probe(b))) continue;
-      const face: LDir = side === 'front' ? 'v+' : side === 'rear' ? 'v-' : side === 'left' ? 'u+' : 'u-';
-      items.forEach((it, k) => place(it.type, boxes2[k], face, { w: it.w, d: it.d }));
-      furnishGrabRails(room, ctx, place, base, wetSide);
-      return;
-    }
-  }
-  const spare = Math.max(0, along - sum(items.map(i => i.w)));
-  const boxes = runFrom(base, wetSide, items, spare / 2);
-  items.forEach((it, k) => {
-    const face: LDir = wetSide === 'front' ? 'v+' : wetSide === 'rear' ? 'v-' : wetSide === 'left' ? 'u+' : 'u-';
-    if (!place(it.type, boxes[k], face, { w: it.w, d: it.d })) {
-      ctx.warnings.push(`${room.def.name}: no clear position for the ${it.type} in a ${room.local.w.toFixed(2)} × ${room.local.h.toFixed(2)} m room`);
-    }
+/**
+ * Bathroom fixtures: the kit library runs wc · basin · (tub | shower) along the wet wall (XD-01 / ARC-14, one stack),
+ * sweeping the run in 100 mm steps past the door swing and turning the tub or shower onto a lateral wall when the
+ * single run will not fit. `fitKit` guarantees a wc and a basin, so plumbing never has to synthesise one.
+ */
+function furnishBathroom(room: RoomRec, ctx: FurnishCtx, place: PlaceFn, inner: Rect, wetEdge: LDir): void {
+  const wetSide = sideOfLocalDir(wetEdge);
+  const kit = bathKitFor(room, ctx);
+  const fit = fitKit({
+    room: room.local,
+    kit,
+    swings: ctx.swings,
+    wetEdge,
+    setback: SIZES.wetWallT / 2,
+    opts: {
+      accessible: ctx.accessible, occupants: ctx.occupants, detail: ctx.detail,
+      area: room.local.w * room.local.h, ensuite: room.cell.type === 'ensuite', rules: ctx.rules,
+    },
   });
-  furnishGrabRails(room, ctx, place, base, wetSide);
+  placeKit(fit.items, place);
+  if (fit.oppositeWetWall) {
+    ctx.warnings.push(`${room.def.name}: fixtures run on the wall opposite the wet wall because the door swing covers it — branch length ${Math.min(room.local.w, room.local.h).toFixed(2)} m (XD-01 allows 3 m)`);
+  }
+  for (const m of fit.missing) {
+    ctx.warnings.push(`${room.def.name}: no clear position for the ${m} in a ${room.local.w.toFixed(2)} × ${room.local.h.toFixed(2)} m room`);
+  }
+  furnishGrabRails(room, ctx, place, insetLocal(room.local, CLEARANCE.wall), wetSide);
+  void inner;
+}
+
+/** wc/powder → two-piece, accessible → ADA, otherwise a three-piece with a tub where the area allows (§3.6) */
+function bathKitFor(room: RoomRec, ctx: FurnishCtx): KitId {
+  const t = room.cell.type;
+  if (ctx.accessible) return 'bath-accessible';
+  if (t === 'powder' || t === 'wc') return 'wc-2pc';
+  const area = room.local.w * room.local.h;
+  return area >= 5.4 && t !== 'ensuite' ? 'bath-3pc-tub' : 'bath-3pc-shower';
 }
 
 /** ADA 2010 §604.5 / §608.3 grab rails beside the WC and in the shower. */
@@ -3070,8 +1956,8 @@ function buildPatternApplications(c: PatCtx): PatternApplication[] {
   }
   add('ARC-28', {
     doors: c.doors.length,
-    swingDoors: c.doors.filter(d => d.operation.includes('SWING')).length,
-    casedOpenings: c.doors.filter(d => d.operation === 'NOTDEFINED').length,
+    swingDoors: c.doors.filter(d => d.motion === 'swing' || d.motion === 'double-swing').length,
+    casedOpenings: c.doors.filter(d => d.motion === 'opening').length,
     minFromCorner: 0.15,
   }, 'every opening allocated a clear interval on its host wall');
   const dining = c.furniture.filter(f => f.type === 'dining-table-4' || f.type === 'dining-table-6');
