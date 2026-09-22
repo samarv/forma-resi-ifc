@@ -224,6 +224,13 @@ export function warn(st: PlumbState, key: string, message: string): void {
   st.ctx.warnings.push(`[plumbing] ${message}`);
 }
 
+/** v2: a resolution applied by construction — recorded as an info issue, never projected into warnings */
+export function noteInfo(st: PlumbState, key: string, ruleId: string, message: string, resolution: 'vent-branch' | 'none' = 'vent-branch'): void {
+  if (st.warnedKeys.has(key)) return;
+  st.warnedKeys.add(key);
+  st.ctx.issues?.add({ severity: 'info', ruleId, discipline: 'plumbing', message, resolution: { id: resolution } });
+}
+
 export function bump(st: PlumbState, key: string, by = 1): void {
   st.counts[key] = (st.counts[key] ?? 0) + by;
 }

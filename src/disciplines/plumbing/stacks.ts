@@ -14,7 +14,9 @@
 import type { PipeSystemType, PlumbingStack, Vec2 } from '../../core/types.ts';
 import { add, dist, projectOnSegment, round, scale, segDir, segPointAt } from '../../core/geometry.ts';
 import { maxTrapArm, stackSystems, SYSTEM_NAME } from './tables.ts';
-import { emitAxis, warn, bump, type PlumbState, type StackInfo, STACK_PIPE_SPACING, info } from './state.ts';
+import { emitAxis, warn, noteInfo, bump, type PlumbState, type StackInfo, STACK_PIPE_SPACING, info } from './state.ts';
+import type { StackPort } from '../architecture/program/types.ts';
+import type { WallDef } from '../../core/types.ts';
 import type { PlacedFixture } from './fixtures.ts';
 
 const ALIGN_TOL = 0.3;
@@ -174,7 +176,11 @@ function stationsForGroup(
     pending = pool;
   }
 
-  // one candidate per (station, storey) that actually has fixtures
+  return candidatesFrom(sorted, stations, assigned);
+}
+
+/** One candidate per (station, storey) that actually has fixtures */
+function candidatesFrom(sorted: PlacedFixture[], stations: Station[], assigned: Map<string, number>): Candidate[] {
   const out: Candidate[] = [];
   const byKey = new Map<string, Candidate>();
   for (const f of sorted) {
@@ -191,6 +197,36 @@ function stationsForGroup(
     f.stackIdx = -1; // resolved after clustering
   }
   return out;
+}
+
+/**
+ * v2 (XD-01 as a contract): a dwelling's stack stations are ARCHITECTURE's decision — the module's wet-wall ports
+ * (UnitInstance.stackPorts), every fixture within its port's trap arm by construction. Plumbing assigns each fixture
+ * to the nearest port; a fixture the IPC unvented limit does not reach is drained as an individually vented branch
+ * (IPC 912) and recorded as an info issue — never a new stack, never a warning.
+ */
+function stationsFromPorts(st: PlumbState, group: PlacedFixture[], ports: readonly StackPort[], wallById: Map<string, WallDef>): Candidate[] {
+  const stations: Station[] = ports.map((p, i) => {
+    const w = wallById.get(p.wallId);
+    const dir: Vec2 = w ? segDir({ a: w.start, b: w.end }) : [1, 0];
+    return { xy: [p.xy[0], p.xy[1]], dir, wallId: p.wallId, secondary: i > 0 };
+  });
+  const sorted = [...group].sort((a, b) =>
+    a.center[0] - b.center[0] || a.center[1] - b.center[1] || a.fixture.id.localeCompare(b.fixture.id));
+  const assigned = new Map<string, number>();
+  for (const f of sorted) {
+    const within = nearestStation(stations, f, limitFor(f));
+    if (within >= 0) { assigned.set(f.fixture.id, within); continue; }
+    const idx = Math.max(0, nearestStation(stations, f, Infinity));
+    assigned.set(f.fixture.id, idx);
+    if (f.spec.wasteD > 0) {
+      f.vented = true;
+      bump(st, 'ventedFixtures');
+      noteInfo(st, `vent:${f.fixture.type}`, 'PLB-02.trapArm',
+        `${f.fixture.type} is ${round(routedLength(f, stations[idx].xy), 2)} m from its stack port (${limitFor(f)} m unvented limit, IPC Table 1002.2); drained as an individually vented branch (IPC 912)`);
+    }
+  }
+  return candidatesFrom(sorted, stations, assigned);
 }
 
 /**
@@ -334,8 +370,15 @@ export function buildStacks(st: PlumbState, placed: PlacedFixture[]): StackInfo[
   }
   const candidates: Candidate[] = [];
   let multiWallDwellings = 0;
+  const wallById = new Map<string, WallDef>((st.ctx.arch?.walls ?? []).map(w => [w.id, w] as const));
+  const unitById = new Map((st.ctx.arch?.units ?? []).map(u => [u.id, u] as const));
   for (const key of [...dwellings.keys()].sort()) {
     const group = dwellings.get(key)!;
+    const ports = unitById.get(key)?.stackPorts;
+    if (ports && ports.length > 0) {
+      candidates.push(...stationsFromPorts(st, group, ports, wallById));
+      continue;
+    }
     const primary = primaryWall(group);
     if (primary.lines > 1) multiWallDwellings++;
     candidates.push(...stationsForGroup(st, group, primary));

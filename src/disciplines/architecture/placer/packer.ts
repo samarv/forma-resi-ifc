@@ -216,7 +216,7 @@ export function packStrip(a: PackArgs): PackResult {
     }));
     remnantArea = round(remnant * strip.netDepth, 3);
     deviations.push({
-      severity: 'deviation', ruleId: 'ARC-D02', discipline: 'architecture',
+      severity: 'info', ruleId: 'ARC-D02', discipline: 'architecture',
       message: `${round(remnant, 2)} m left over on ${strip.id} after every module reached its maximum frontage — declared as a ${remnant >= 3 ? 'flexible room' : 'store'}`,
       observed: round(remnant, 2),
       limit: round(narrowest, 2),

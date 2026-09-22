@@ -9,7 +9,7 @@ import type { PipeSystemType, Vec2, Vec3 } from '../../core/types.ts';
 import { add, projectOnSegment, round, scale, segDir, segPointAt } from '../../core/geometry.ts';
 import { maxTrapArm } from './tables.ts';
 import {
-  emitRun, warn, bump, BRANCH_VENT_Z, DCW_BRANCH_Z, DHW_BRANCH_Z, WASTE_Z,
+  emitRun, warn, noteInfo, bump, BRANCH_VENT_Z, DCW_BRANCH_Z, DHW_BRANCH_Z, WASTE_Z,
   type PlumbState, type StackInfo,
 } from './state.ts';
 import type { PlacedFixture } from './fixtures.ts';
@@ -78,7 +78,8 @@ export function buildBranches(st: PlumbState, placed: PlacedFixture[]): void {
       });
       worstByStack.set(f.stackIdx, Math.max(worstByStack.get(f.stackIdx) ?? 0, armLen));
       if (armLen > limit + 1e-3) {
-        warn(st, `arm:${f.fixture.type}`,
+        // v2: an individually vented branch is the IPC 912 resolution for a fixture past the unvented limit — recorded, not warned
+        noteInfo(st, `arm:${f.fixture.type}`, 'PLB-02.trapArm',
           `trap arm ${round(armLen, 2)} m on Ø${Math.round(spec.wasteD * 1000)} exceeds the ${limit} m unvented limit (IPC Table 1002.2) at ${f.roomId ?? f.storey}; drained as an individually vented Ø${Math.round(diameter * 1000)} branch (IPC 912)`);
       }
       bump(st, 'wasteBranches');

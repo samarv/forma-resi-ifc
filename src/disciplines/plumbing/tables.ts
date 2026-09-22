@@ -254,7 +254,10 @@ export function stackSystems(storeys: number, central: boolean): { system: PipeS
 
 /** Max developed trap-arm length for a drain diameter (IPC 2021 Table 1002.2) */
 export function maxTrapArm(diameter: number): number {
-  if (diameter >= 0.1 - 1e-9) return 3.0;
-  if (diameter >= 0.075 - 1e-9) return 1.8;
-  return 1.5;
+  // IPC 2021 Table 1002.2 — maximum distance of fixture trap from vent (unvented trap arm)
+  if (diameter >= 0.1 - 1e-9) return 3.66;   // 4 in → 12 ft
+  if (diameter >= 0.075 - 1e-9) return 3.05; // 3 in → 10 ft
+  if (diameter >= 0.05 - 1e-9) return 1.83;  // 2 in → 6 ft
+  if (diameter >= 0.04 - 1e-9) return 1.52;  // 1½ in → 5 ft
+  return 1.07;                                // 1¼ in → 3 ft 6 in
 }

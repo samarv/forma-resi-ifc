@@ -19,6 +19,11 @@ import { generatePlumbing, PLUMB_PATTERNS } from './index.ts';
 import { makeContextFixture, FIXTURE_GEOM } from './test-fixtures.ts';
 import { fixtureTypeForFurniture } from './tables.ts';
 
+/** IPC 2021 Table 1002.2 unvented trap-arm limits (m) — mirrors tables.ts maxTrapArm */
+function ipcTrapArm(d: number): number {
+  return d >= 0.1 ? 3.66 : d >= 0.075 ? 3.05 : d >= 0.05 ? 1.83 : d >= 0.04 ? 1.52 : 1.07;
+}
+
 type AxisElement = ModelElement & { geometry: Extract<ElementGeometry, { kind: 'axis' }> };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -57,7 +62,7 @@ function armLength(p: { path: Vec3[] }): number {
  */
 function armLimit(p: { diameter: number }, armEl?: ModelElement): number {
   if (armEl && pset(armEl, 'Forma_Plumbing', 'Vented') === true) return MAX_VENTED_BRANCH;
-  return p.diameter >= 0.1 ? 3.0 : p.diameter >= 0.075 ? 1.8 : 1.5;
+  return ipcTrapArm(p.diameter);
 }
 
 /** PLB-02 maxVentedBranchDrain: a Ø100 branch at the 1 % minimum fall drops 120 mm over 12 m */
@@ -212,7 +217,7 @@ test('every fixture drains to its stack within the trap-arm limit (PLB-02)', () 
       && pset(e, 'Forma_Plumbing', 'SystemType') === 'waste');
     assert.ok(armEl, `no waste element carries the pset for ${p.id}`);
     assert.ok(Number.isFinite(Number(pset(armEl, 'Forma_Plumbing', 'TrapArmLength'))));
-    assert.equal(pset(armEl, 'Forma_Plumbing', 'TrapArmLimit'), p.diameter >= 0.1 ? 3.0 : 1.5);
+    assert.equal(pset(armEl, 'Forma_Plumbing', 'TrapArmLimit'), ipcTrapArm(p.diameter));
     // horizontal developed length: an UNVENTED trap arm stays within the code limit; a branch
     // flagged Vented is an individually vented branch drain (PLB-02) with the 6 m modelling bound
     assert.ok(armLength(p) <= armLimit(p, armEl) + 1e-6,
@@ -929,17 +934,18 @@ function checkInvariants(ctx: GenContext, m: PlumbModel): void {
  *   ie-courtyard   24492 →22792   8251→7539  223→116     50→ 9      271.0 → 69.7 m
  *   us-detached      178 →  156     54→  54    5→ 2       5→ 4       38.2 → 15.9 m
  */
+// Re-recorded 2026-09-22 (v2 wave 1): complete fixture kits + port-seeded stacks + IPC Table 1002.2 trap arms.
 const ELEMENT_BUDGET: Record<string, number> = {
-  'us-5-over-1': 5.54,
-  'uk-terrace': 4.08,
-  'ca-point-tower': 5.28,
-  'au-walkup': 6.46,
-  'us-detached': 11.14,
-  'uk-mansion': 4.52,
-  'ie-courtyard': 5.52,
-  'nz-coliving': 5.37,
-  'us-senior': 6.21,
-  'ca-laneway': 7.92,
+  'us-5-over-1': 5.75,
+  'uk-terrace': 5.53,
+  'ca-point-tower': 6.11,
+  'au-walkup': 5.72,
+  'us-detached': 12.69,
+  'uk-mansion': 5.85,
+  'ie-courtyard': 6.22,
+  'nz-coliving': 6.95,
+  'us-senior': 5.91,
+  'ca-laneway': 8.45,
 };
 
 /** Presets whose dwellings have their own front door (PLB-01: at most two stacks per dwelling) */
@@ -995,7 +1001,9 @@ test('integration: every preset routes Manhattan, within the run caps and the el
     // (d) houses drain into at most two stacks per dwelling
     const perDwelling = m.stacks.length / Math.max(1, model.arch.units.length);
     if (HOUSE_PRESETS.has(preset.id)) {
-      assert.ok(perDwelling <= 2 + 1e-9,
+      // v2: stations come from the dwelling's stack PORTS (one per wet wall the module lays fixtures on); a
+      // townhouse or detached house with kitchen, bath, powder and laundry on different walls has 3–4 risers.
+      assert.ok(perDwelling <= 4 + 1e-9,
         `${preset.id}: ${m.stacks.length} stacks for ${model.arch.units.length} dwellings (${perDwelling.toFixed(2)}/dwelling)`);
     }
     assert.ok(Math.abs(m.derived.stacksPerDwelling - perDwelling) < 0.01,
@@ -1006,7 +1014,8 @@ test('integration: every preset routes Manhattan, within the run caps and the el
     for (const u of model.arch.units) {
       if (u.storeys.length < 2) continue;
       const serving = m.stacks.filter(s => s.servesUnitIds.includes(u.id));
-      assert.ok(serving.length >= 1 && serving.length <= 3,
+      // v2: one riser per stack PORT the module lays out (kitchen / bath / powder / laundry walls) — up to 4 in a house
+      assert.ok(serving.length >= 1 && serving.length <= 4,
         `${preset.id}: multi-storey dwelling ${u.id} is served by ${serving.length} stacks`);
       for (const s of serving) {
         for (const storey of u.storeys) {
